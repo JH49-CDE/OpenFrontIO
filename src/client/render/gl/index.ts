@@ -5,6 +5,7 @@ export type { AttackRingInput } from "../types";
 export type { GraphicsOverrides, GraphicsPresets } from "./GraphicsOverrides";
 export { GLUnavailableError, showGLGate, trackGLInit } from "./initGL";
 export { MapRenderer } from "./MapRenderer";
+export type { MapRendererLike } from "./MapRenderer";
 export { preloadAtlasData } from "./passes/name-pass/AtlasData";
 export type { SpawnCenter } from "./passes/SpawnOverlayPass";
 export { applyGraphicsOverrides } from "./RenderOverrides";

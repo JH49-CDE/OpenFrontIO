@@ -26,6 +26,22 @@ export class GoToUnitEvent implements GameEvent {
   constructor(public unit: UnitView) {}
 }
 
+/**
+ * Optional screen<->world mapping that replaces the orthographic 2D math, for
+ * renderers whose camera is not a plain scale+offset (the Three.js prototype
+ * tilts into a perspective view when zoomed in). Coordinates are canvas-
+ * relative CSS px and world tiles as floats (tile (x, y) covers [x, x+1)).
+ */
+export interface MapProjector {
+  /** World point under a canvas pixel, or null when the ray misses the map. */
+  canvasToWorld(
+    canvasX: number,
+    canvasY: number,
+  ): { x: number; y: number } | null;
+  /** Canvas pixel a world point projects to. */
+  worldToCanvas(worldX: number, worldY: number): { x: number; y: number };
+}
+
 export const GOTO_INTERVAL_MS = 16;
 export const CAMERA_MAX_SPEED = 15;
 export const CAMERA_SMOOTHING = 0.03;
@@ -41,6 +57,13 @@ export class TransformHandler {
   private targetScale: number | null = null;
   private intervalID: NodeJS.Timeout | null = null;
   private changed = false;
+
+  /**
+   * When set (by a renderer with a non-orthographic camera), the two base
+   * conversions below go through it, so every derived screen<->world method
+   * and their callers follow the rendered view. null = the 2D math.
+   */
+  public projector: MapProjector | null = null;
 
   constructor(
     private game: GameView,
@@ -90,6 +113,7 @@ export class TransformHandler {
   }
 
   worldToCanvasCoordinates(cell: Cell): { x: number; y: number } {
+    if (this.projector) return this.projector.worldToCanvas(cell.x, cell.y);
     // Step 1: Convert from Cell coordinates to game coordinates
     // (reverse of Math.floor operation - we'll use the exact values)
     const gameX = cell.x;
@@ -130,6 +154,16 @@ export class TransformHandler {
     screenY: number,
   ): { x: number; y: number } {
     const canvasCoords = this.screenToCanvasCoordinates(screenX, screenY);
+    if (this.projector) {
+      // A miss (off the map) is NaN: it floors to an invalid tile, which
+      // every picking caller already rejects.
+      return (
+        this.projector.canvasToWorld(canvasCoords.x, canvasCoords.y) ?? {
+          x: NaN,
+          y: NaN,
+        }
+      );
+    }
     const gameX =
       (canvasCoords.x - this.game.width() / 2) / this.scale +
       this.offsetX +
@@ -300,6 +334,17 @@ export class TransformHandler {
 
   onZoom(event: ZoomEvent) {
     this.clearTarget();
+    // With a projector the 2D pivot below is only approximate (the view is
+    // tilted / in perspective), so remember the world point under the cursor
+    // and re-pin it after the 2D update.
+    const projector = this.projector;
+    const pivotCanvas = projector
+      ? this.screenToCanvasCoordinates(event.x, event.y)
+      : null;
+    const pivotBefore =
+      projector && pivotCanvas
+        ? projector.canvasToWorld(pivotCanvas.x, pivotCanvas.y)
+        : null;
     const oldScale = this.scale;
     const zoomFactor = 1 + event.delta / ZOOM_DELTA_DIVISOR;
     this.scale /= zoomFactor;
@@ -321,6 +366,31 @@ export class TransformHandler {
     this.offsetY =
       zoomPointY - (canvasCoords.y - this.game.height() / 2) / this.scale;
     this.clampOffsets();
+    if (
+      projector &&
+      pivotCanvas &&
+      pivotBefore &&
+      Number.isFinite(pivotBefore.x + pivotBefore.y)
+    ) {
+      // Shifting the offset shifts the camera target by the same world
+      // amount, so this moves the old point back under the cursor (exactly
+      // over flat ground; relief needs a couple of fixed-point iterations).
+      for (let i = 0; i < 3; i++) {
+        const pivotAfter = projector.canvasToWorld(
+          pivotCanvas.x,
+          pivotCanvas.y,
+        );
+        if (!pivotAfter || !Number.isFinite(pivotAfter.x + pivotAfter.y)) {
+          break;
+        }
+        const dx = pivotBefore.x - pivotAfter.x;
+        const dy = pivotBefore.y - pivotAfter.y;
+        if (Math.abs(dx) + Math.abs(dy) < 1e-3) break;
+        this.offsetX += dx;
+        this.offsetY += dy;
+        this.clampOffsets();
+      }
+    }
     this.changed = true;
   }
 

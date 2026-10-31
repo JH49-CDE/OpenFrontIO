@@ -59,12 +59,15 @@ import {
   deepAssign,
   GLUnavailableError,
   MapRenderer,
+  type MapRendererLike,
   preloadAtlasData,
   renderDpr,
   type RenderSettings,
   showGLGate,
   trackGLInit,
 } from "./render/gl";
+import { isThreeRendererRequested } from "./render/three/RendererSelection";
+import type { CameraInputs } from "./render/three/types";
 import { ALL_UNIT_TYPES, UnitState } from "./render/types";
 import { versionedPathForMismatchedGame } from "./ServerList";
 import { audioMixer, initAudioMixer } from "./sound/AudioMixer";
@@ -454,14 +457,48 @@ export function joinLobby(
   };
 }
 
+/** The opt-in Three.js renderer module, loaded with import() when flagged. */
+type ThreeRendererModule = typeof import("./render/three/ThreeMapRenderer");
+
+/**
+ * Load the Three.js renderer when `?renderer=three` (or the remembered
+ * choice) asks for it; null otherwise, or when the chunk fails to load (the
+ * game then falls back to the default renderer).
+ */
+async function loadRequestedThreeRenderer(): Promise<ThreeRendererModule | null> {
+  if (!isThreeRendererRequested()) return null;
+  try {
+    return await import("./render/three/ThreeMapRenderer");
+  } catch (e) {
+    console.error("Three.js renderer failed to load, using the default", e);
+    return null;
+  }
+}
+
+/** A view that can supply TransformHandler with a non-orthographic projector. */
+interface ProjectorSource {
+  createProjector(
+    getInputs: () => CameraInputs,
+  ): import("./TransformHandler").MapProjector;
+}
+
+function hasProjector(
+  view: MapRendererLike,
+): view is MapRendererLike & ProjectorSource {
+  return (
+    typeof (view as Partial<ProjectorSource>).createProjector === "function"
+  );
+}
+
 // Build the WebGL view + its glCanvas. Must run before createRenderer so the
 // controllers can be wired directly to the view.
 function createWebGLView(
   terrainMap: TerrainMapData,
   config: Config,
   settings: RenderSettings,
+  threeModule: ThreeRendererModule | null = null,
 ): {
-  view: MapRenderer;
+  view: MapRendererLike;
   glCanvas: HTMLCanvasElement;
   cachedWebGLFrameCallback: { current: FrameRequestCallback | null };
 } {
@@ -511,28 +548,40 @@ function createWebGLView(
   // users on software/missing WebGL2. MapRenderer constructs the GL context;
   // a non-accelerated context throws GLUnavailableError (handled by the
   // game-start catch, which shows the gate).
-  let view: MapRenderer;
+  let view: MapRendererLike;
   try {
-    view = new MapRenderer(
-      glCanvas,
-      {
-        mapWidth,
-        mapHeight,
-        unitTypes: [...ALL_UNIT_TYPES],
-        players: [],
-        // Pre-allocate renderer textures for up to 1024 players. We add players
-        // dynamically via view.addPlayers() as they come in from the simulation,
-        // but the NamePass / palette / relation matrix all need a static upper
-        // bound at construction time.
-        maxPlayers: 1024,
-      },
-      terrainSource,
-      palette,
-      config,
-      settings,
-      captureRaf,
-      captureCaf,
-    );
+    const header = {
+      mapWidth,
+      mapHeight,
+      unitTypes: [...ALL_UNIT_TYPES],
+      players: [],
+      // Pre-allocate renderer textures for up to 1024 players. We add players
+      // dynamically via view.addPlayers() as they come in from the simulation,
+      // but the NamePass / palette / relation matrix all need a static upper
+      // bound at construction time.
+      maxPlayers: 1024,
+    };
+    view = threeModule
+      ? new threeModule.ThreeMapRenderer(
+          glCanvas,
+          header,
+          terrainSource,
+          palette,
+          config,
+          settings,
+          captureRaf,
+          captureCaf,
+        )
+      : new MapRenderer(
+          glCanvas,
+          header,
+          terrainSource,
+          palette,
+          config,
+          settings,
+          captureRaf,
+          captureCaf,
+        );
   } catch (e) {
     if (e instanceof GLUnavailableError) {
       trackGLInit(e.glStatus, e.renderer);
@@ -562,7 +611,7 @@ function createWebGLView(
 
 function mountWebGLFrameLoop(
   terrainMap: TerrainMapData,
-  view: MapRenderer,
+  view: MapRendererLike,
   glCanvas: HTMLCanvasElement,
   cachedWebGLFrameCallback: { current: FrameRequestCallback | null },
   transformHandler: import("./TransformHandler").TransformHandler,
@@ -590,18 +639,23 @@ function mountWebGLFrameLoop(
   });
   resizeObs.observe(glCanvas);
 
+  // World point (tiles) at the canvas centre, from TransformHandler's frame.
+  const cameraCenter = (scale: number): { x: number; y: number } => ({
+    x:
+      transformHandler.offsetX +
+      mapWidth / 2 +
+      (cachedCanvasW - mapWidth) / (2 * scale),
+    y:
+      transformHandler.offsetY +
+      mapHeight / 2 +
+      (cachedCanvasH - mapHeight) / (2 * scale),
+  });
+
   const syncCamera = (): void => {
     const scale = transformHandler.scale;
     const dpr = renderDpr();
-    const centerX =
-      transformHandler.offsetX +
-      mapWidth / 2 +
-      (cachedCanvasW - mapWidth) / (2 * scale);
-    const centerY =
-      transformHandler.offsetY +
-      mapHeight / 2 +
-      (cachedCanvasH - mapHeight) / (2 * scale);
-    view.setCameraState(centerX, centerY, scale * dpr);
+    const center = cameraCenter(scale);
+    view.setCameraState(center.x, center.y, scale * dpr);
     // Invoke the WebGL renderer's frame callback synchronously, with the just-
     // updated camera state. The callback re-arms itself via captureRaf, so
     // we'll get a fresh callback ready for the next canvas2D frame.
@@ -636,6 +690,23 @@ function mountWebGLFrameLoop(
   };
   rafId = requestAnimationFrame(driveFrame);
 
+  // A renderer with a perspective / tilted camera (the Three.js prototype)
+  // takes over TransformHandler's screen<->world math so picking matches the
+  // rendered view. Inputs are read live on every call.
+  if (hasProjector(view)) {
+    transformHandler.projector = view.createProjector(() => {
+      const scale = transformHandler.scale;
+      const center = cameraCenter(scale);
+      return {
+        centerX: center.x,
+        centerY: center.y,
+        cssPxPerTile: scale,
+        cssWidth: cachedCanvasW,
+        cssHeight: cachedCanvasH,
+      };
+    });
+  }
+
   // Tear down the per-frame loop so a stopped game stops driving WebGL and
   // releases the view for disposal. Left running, the RAF keeps the WebGL
   // context referenced (and alive) forever — each new game would then stack
@@ -646,6 +717,7 @@ function mountWebGLFrameLoop(
       rafId = null;
     }
     resizeObs.disconnect();
+    transformHandler.projector = null;
   };
 
   const builder = new WebGLFrameBuilder(view);
@@ -712,6 +784,8 @@ async function createClientGame(
   // Kick off the font-atlas fetch so it overlaps with worker init; the
   // render passes need it parsed before createWebGLView runs.
   const atlasDataLoad = preloadAtlasData();
+  // Same for the opt-in Three.js renderer chunk (null unless flagged).
+  const threeRendererLoad = loadRequestedThreeRenderer();
   const worker = new WorkerClient(
     lobbyConfig.gameStartInfo,
     clientID,
@@ -765,6 +839,7 @@ async function createClientGame(
       gameMap,
       config,
       resolveRenderSettings(),
+      await threeRendererLoad,
     );
 
     const graphicsListenerAbort = new AbortController();

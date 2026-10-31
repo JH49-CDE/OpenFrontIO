@@ -10,12 +10,12 @@
 import { EventBus } from "@openfront/shared/EventBus";
 import { Controller } from "../Controller";
 import { AlternateViewEvent, ToggleCoordinateGridEvent } from "../InputHandler";
-import { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 
 export class ViewModeController implements Controller {
   constructor(
     private eventBus: EventBus,
-    private view: MapRenderer,
+    private view: MapRendererLike,
   ) {}
 
   init() {

@@ -26,7 +26,7 @@ import {
   MouseMoveEvent,
   MouseUpEvent,
 } from "../InputHandler";
-import type { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 import {
   buildNukeTrajectory,
   type SAMInfo,
@@ -277,7 +277,7 @@ export class BuildPreviewController implements Controller {
     private eventBus: EventBus,
     public uiState: UIState,
     private transformHandler: TransformHandler,
-    private view: MapRenderer,
+    private view: MapRendererLike,
     private userSettings: UserSettings,
   ) {}
 

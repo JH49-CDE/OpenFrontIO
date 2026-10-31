@@ -420,3 +420,12 @@ export class MapRenderer {
     );
   }
 }
+
+/**
+ * The public surface of {@link MapRenderer} as a structural type, so an
+ * alternative renderer (the opt-in Three.js prototype in `render/three/`) can
+ * stand in for it on the live-game path. `keyof` on a class keeps only public
+ * members, so this covers every method plus `glLimited` and
+ * `onContextRestored`.
+ */
+export type MapRendererLike = Pick<MapRenderer, keyof MapRenderer>;

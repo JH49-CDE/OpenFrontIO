@@ -14,7 +14,7 @@ import { buildTerrainRowSpans } from "./render/frame/derive/TerrainRowSpans";
 import { uploadFrameData } from "./render/frame/Upload";
 // Type-only: a value import would pull GPURenderer and its `.glsl?raw` shader
 // imports into any non-Vite consumer (e.g. the Node perf harness).
-import type { MapRenderer, PlayerStatic, SpawnCenter } from "./render/gl";
+import type { MapRendererLike, PlayerStatic, SpawnCenter } from "./render/gl";
 import {
   DEFAULT_NUKE_EXPLOSION_COLOR,
   MAX_NUKE_EXPLOSION_COLORS,
@@ -160,7 +160,7 @@ export class WebGLFrameBuilder {
   // player's update arrives (may take several ticks during join).
   private localPlayerSmallID = 0;
 
-  constructor(private readonly view: MapRenderer) {
+  constructor(private readonly view: MapRendererLike) {
     this.palette = new Float32Array(PALETTE_SIZE * 2 * 4);
     this.effectPalette = new Float32Array(
       PALETTE_SIZE * MAX_TRAIL_COLORS * EFFECT_PALETTE_BLOCKS * 4,

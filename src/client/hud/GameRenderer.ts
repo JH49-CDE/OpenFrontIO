@@ -12,7 +12,7 @@ import { ViewModeController } from "../controllers/ViewModeController";
 import { WarshipSelectionController } from "../controllers/WarshipSelectionController";
 import { GameStartingModal } from "../GameStartingModal";
 import { migrateLegacyGraphicsSettings } from "../GraphicsPresets";
-import { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 import { TransformHandler } from "../TransformHandler";
 import { UIState } from "../UIState";
 // The homepage loads it on demand, but the in-game instance (#game-settings)
@@ -56,7 +56,7 @@ export function createRenderer(
   game: GameView,
   eventBus: EventBus,
   playerRole: string | null,
-  view: MapRenderer,
+  view: MapRendererLike,
   mapLayerController?: MapLayerController,
 ): GameRenderer {
   const transformHandler = new TransformHandler(game, eventBus, inputEl);

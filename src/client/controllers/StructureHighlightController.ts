@@ -12,12 +12,12 @@
 import { EventBus } from "@openfront/shared/EventBus";
 import { Controller } from "../Controller";
 import { ToggleStructureEvent } from "../InputHandler";
-import { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 
 export class StructureHighlightController implements Controller {
   constructor(
     private eventBus: EventBus,
-    private view: MapRenderer,
+    private view: MapRendererLike,
   ) {}
 
   init() {

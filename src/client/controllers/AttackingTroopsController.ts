@@ -13,7 +13,7 @@ import { renderTroops } from "@openfront/engine-lib/Format";
 import { EventBus } from "@openfront/shared/EventBus";
 import { Controller } from "../Controller";
 import { AlternateViewEvent } from "../InputHandler";
-import { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 import type { AttackTroopLabel } from "../render/gl/passes/WorldTextPass";
 import { UserSettings } from "../UserSettings";
 import { GameView } from "../view";
@@ -76,7 +76,7 @@ export class AttackingTroopsController implements Controller {
     private readonly game: GameView,
     private readonly eventBus: EventBus,
     private readonly userSettings: UserSettings,
-    private readonly view: MapRenderer,
+    private readonly view: MapRendererLike,
   ) {}
 
   init() {

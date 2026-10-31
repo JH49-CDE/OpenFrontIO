@@ -12,7 +12,7 @@ import { UnitType } from "@openfront/engine-api/game/GameTypes";
 import { EventBus } from "@openfront/shared/EventBus";
 import { Controller } from "../Controller";
 import { MouseMoveEvent } from "../InputHandler";
-import { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 import { OWNER_MASK } from "../render/gl/utils/TileCodec";
 import { TransformHandler } from "../TransformHandler";
 import { GameView, UnitView } from "../view";
@@ -24,7 +24,7 @@ export class HoverHighlightController implements Controller {
     private game: GameView,
     private eventBus: EventBus,
     private transformHandler: TransformHandler,
-    private view: MapRenderer,
+    private view: MapRendererLike,
   ) {}
 
   init() {

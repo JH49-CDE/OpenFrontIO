@@ -13,7 +13,7 @@ import {
   WarshipSelectionBoxCompleteEvent,
   WarshipSelectionBoxUpdateEvent,
 } from "../InputHandler";
-import { MapRenderer } from "../render/gl";
+import type { MapRendererLike } from "../render/gl";
 import { TransformHandler } from "../TransformHandler";
 import { MoveWarshipIntentEvent } from "../Transport";
 import { GameView, UnitView } from "../view";
@@ -47,7 +47,7 @@ export class WarshipSelectionController implements Controller {
     private game: GameView,
     private eventBus: EventBus,
     private transformHandler: TransformHandler,
-    private view: MapRenderer,
+    private view: MapRendererLike,
   ) {}
 
   tick() {
