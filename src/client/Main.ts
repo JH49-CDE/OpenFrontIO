@@ -2341,11 +2341,15 @@ const bootstrap = () => {
 
   // Remember an opt-in `?renderer=three` (experimental 3D map) before any
   // history write rewrites the address bar. import(), not a static import:
-  // render/ is game-client code the homepage only loads on demand.
+  // render/ is game-client code the homepage only loads on demand, and only
+  // when the URL names a renderer (RENDERER_URL_PARAM), so other visits
+  // fetch nothing extra.
   const rendererSearch = window.location.search;
-  void import("./render/three/RendererSelection")
-    .then((m) => m.syncRendererPreferenceFromUrl(rendererSearch))
-    .catch(() => {});
+  if (new URLSearchParams(rendererSearch).has("renderer")) {
+    void import("./render/three/RendererSelection")
+      .then((m) => m.syncRendererPreferenceFromUrl(rendererSearch))
+      .catch(() => {});
+  }
 
   // Prevent Safari's page-level pinch-zoom, which ignores `user-scalable=no`
   // on iOS and can softlock the HUD. See issue #2330.

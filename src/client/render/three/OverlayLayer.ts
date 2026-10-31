@@ -6,9 +6,12 @@
  * Three kinds of drawables, all readable top-down and under tilt:
  * - Draped discs (`DrapedDiscs`): polar grids whose vertices follow the
  *   visible surface (+ a small lift), shaded by one shader — filled inner
- *   disc, outer ring (optionally dashed and rotating), pulse. Used for the
- *   nuke telegraphs and the ghost's range ring. Ring widths are in screen
- *   pixels (`uTilesPerPx`), so they stay crisp at every zoom.
+ *   disc, outer ring (optionally dashed and rotating), pulse. Strokes are a
+ *   coloured core framed by a dark outline so they read on any terrain or
+ *   territory colour. Used for the nuke telegraphs (the default renderer's
+ *   self / ally / enemy colours from render-settings `nukeTelegraph`) and
+ *   the ghost's range ring. Stroke widths are in screen pixels
+ *   (`uTilesPerPx`), so they stay crisp at every zoom.
  * - Screen-size markers (`MarkerPool`): flat quads lying on the surface,
  *   sized in CSS px and drawn on top of everything (depth test off), with an
  *   SDF shader per marker kind (attack ring, chevrons, blocked X, reticle,
@@ -23,6 +26,7 @@ import * as THREE from "three";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
+import type { RenderSettings } from "../gl/RenderSettings";
 import {
   STRUCTURE_TYPES,
   UT_MIRV,
@@ -44,12 +48,25 @@ import { minScreenScale, nukeAltitude, NukeFlight } from "./UnitLayer";
 
 type Rgb = readonly [number, number, number];
 
-/** Telegraph colours by launcher relation: 0 self, 1 ally, 2 enemy. */
-const RELATION_COLORS: readonly Rgb[] = [
-  [0.25, 0.6, 1.0],
-  [1.0, 0.88, 0.1],
-  [1.0, 0.12, 0.1],
-];
+/**
+ * Telegraph colours by launcher relation (0 self, 1 ally, 2 enemy): the
+ * default renderer's sRGB settings, as linear rgb for the shaders.
+ */
+export function telegraphColors(
+  t: RenderSettings["nukeTelegraph"],
+): readonly Rgb[] {
+  const lin = (r: number, g: number, b: number): Rgb => {
+    const c = new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace);
+    return [c.r, c.g, c.b];
+  };
+  return [
+    lin(t.selfColorR, t.selfColorG, t.selfColorB),
+    lin(t.allyColorR, t.allyColorG, t.allyColorB),
+    lin(t.colorR, t.colorG, t.colorB),
+  ];
+}
+/** HDR gain of the move-indicator chevrons: a soft bloom glow. */
+const MOVE_GLOW = 2;
 const OK_COLOR: Rgb = [0.25, 0.95, 0.35];
 const BAD_COLOR: Rgb = [1.0, 0.2, 0.18];
 const WHITE: Rgb = [0.95, 0.95, 0.95];
@@ -106,21 +123,33 @@ void main() {
   float outer = vStyle.y;
   float px = uTilesPerPx;
   float pulse = 0.85 + 0.15 * sin(uTime * 3.0);
-  // Outer ring: a ~2.5 px band just inside the edge.
-  float ring = 1.0 - smoothstep(2.5 * px, 3.5 * px, outer - r);
+  float dash = 1.0;
   if (vStyle.w > 0.5) {
     // An integer number of ~18 px dashes around the circle, rotating.
     float n = max(8.0, floor(6.2831853 * outer / (18.0 * px) + 0.5));
     float f = fract(vDisc.y / 6.2831853 * n - uTime * 0.35);
-    ring *= smoothstep(0.0, 0.06, f) * (1.0 - smoothstep(0.6, 0.66, f));
+    dash = smoothstep(0.0, 0.06, f) * (1.0 - smoothstep(0.6, 0.66, f));
   }
-  float innerLine = inner > 0.0
-    ? 1.0 - smoothstep(0.75 * px, 1.75 * px, abs(r - inner))
-    : 0.0;
+  // Strokes (widths in px): a coloured core inside a dark outline.
+  // Outer ring: 5.5 px band at the edge, core 1..4 px in from it.
+  float e = outer - r;
+  float ringHalo = (1.0 - smoothstep(5.0 * px, 6.0 * px, e)) * dash;
+  float ringCore = smoothstep(0.8 * px, 1.6 * px, e)
+                 * (1.0 - smoothstep(3.6 * px, 4.4 * px, e)) * dash;
+  // Inner circle line: core ±1 px, outline ±2.6 px.
+  float di = abs(r - inner);
+  float innerHalo = inner > 0.0 ? 1.0 - smoothstep(2.2 * px, 3.0 * px, di) : 0.0;
+  float innerCore = inner > 0.0 ? 1.0 - smoothstep(0.8 * px, 1.4 * px, di) : 0.0;
+  float halo = max(ringHalo, innerHalo);
+  float core = max(ringCore, innerCore);
+  float strokeA = halo * 0.92 * pulse;
+  vec3 strokeCol = mix(vec3(0.03), vColor, core / max(halo, 1e-3));
   float fill = r < inner ? vStyle.z * pulse : vStyle.z * 0.33;
-  float a = max(max(ring * 0.95 * pulse, innerLine * 0.8), fill);
+  // Stroke over fill ("over" compositing).
+  float a = strokeA + fill * (1.0 - strokeA);
   if (a < 0.003) discard;
-  gl_FragColor = vec4(vColor, a);
+  vec3 col = (strokeCol * strokeA + vColor * fill * (1.0 - strokeA)) / a;
+  gl_FragColor = vec4(col, a);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -377,6 +406,7 @@ void main() {
  */
 const MARKER_FRAG = /* glsl */ `
 uniform vec3 uColor;
+uniform float uGain;
 uniform float uAlpha;
 uniform float uKind;
 uniform float uTime;
@@ -471,7 +501,7 @@ void main() {
   }
   a *= uAlpha;
   if (a < 0.01) discard;
-  gl_FragColor = vec4(col, a);
+  gl_FragColor = vec4(col * uGain, a);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -489,6 +519,8 @@ interface MarkerDraw {
   alpha: number;
   progress?: number;
   param?: number;
+  /** HDR colour gain (> 1 glows under bloom); default 1. */
+  gain?: number;
 }
 
 /**
@@ -505,6 +537,7 @@ class MarkerPool {
     fragmentShader: MARKER_FRAG,
     uniforms: {
       uColor: { value: new THREE.Color(1, 1, 1) },
+      uGain: { value: 1 },
       uAlpha: { value: 1 },
       uKind: { value: 0 },
       uTime: { value: 0 },
@@ -546,6 +579,7 @@ class MarkerPool {
     this.used++;
     const u = mesh.material.uniforms;
     (u.uColor.value as THREE.Color).setRGB(m.color[0], m.color[1], m.color[2]);
+    u.uGain.value = m.gain ?? 1;
     u.uAlpha.value = m.alpha;
     u.uKind.value = m.kind;
     u.uTime.value = this.timeSec;
@@ -722,6 +756,7 @@ export class OverlayLayer {
   private readonly ghostMaterial: THREE.MeshStandardMaterial;
   private readonly ghostMesh: THREE.Mesh;
 
+  private readonly relationColors: readonly Rgb[];
   private readonly attackRings = new Map<number, AttackRingState>();
   private moveIndicators: TimedMarker[] = [];
   private blockedFlashes: TimedMarker[] = [];
@@ -729,6 +764,7 @@ export class OverlayLayer {
 
   constructor(private readonly ctx: ThreeLayerContext) {
     this.hf = ctx.heightField;
+    this.relationColors = telegraphColors(ctx.renderSettings.nukeTelegraph);
     this.group.name = "overlays";
     ctx.scene.add(this.group);
     this.telegraphs = new DrapedDiscs(
@@ -847,8 +883,8 @@ export class OverlayLayer {
         y: t.y,
         inner: t.innerRadius,
         outer: t.outerRadius,
-        color: RELATION_COLORS[t.relation] ?? RELATION_COLORS[2],
-        fillAlpha: 0.22,
+        color: this.relationColors[t.relation] ?? this.relationColors[2],
+        fillAlpha: 0.25,
         dashed: true,
       })),
     );
@@ -951,6 +987,7 @@ export class OverlayLayer {
         alpha: 1,
         progress: (now - mi.startMs) / MOVE_INDICATOR_MS,
         param: sc,
+        gain: MOVE_GLOW,
       });
     }
 

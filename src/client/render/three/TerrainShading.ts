@@ -3,7 +3,8 @@
  * so they are unit-testable and cheap to load):
  * - colour conversions and the water palette derived from the game's terrain
  *   colours,
- * - the border-width / edge-coverage math the terrain shader implements,
+ * - the border-width / edge-coverage / contrast math and the close-up zone
+ *   blend the terrain shader implements,
  * - the view-distance fog range,
  * - per-row texel spans for partial texture uploads,
  * - the "coast lift" of the relief mesh (cells holding land never dip below
@@ -84,6 +85,70 @@ export function borderWidthTiles(
 export function edgeCoverage(dist: number, width: number, aa: number): number {
   if (width >= 0.999) return 1;
   return Math.min(1, Math.max(0, (width - dist) / Math.max(aa, 1e-6) + 0.5));
+}
+
+function smoothstep(e0: number, e1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Weight (0..1) of the terrain shader's close-up look for `tilesPerPx`
+ * (fwidth of the world coordinate): 0 at strategy zoom (a tile under
+ * ~2.5 px), 1 once a tile spans ~7 px or more.
+ */
+export function closeUpAmount(tilesPerPx: number): number {
+  return 1 - smoothstep(0.15, 0.4, tilesPerPx);
+}
+
+/**
+ * Sharpness `k` of the close-up zone blend. Between two zones the 12-88%
+ * transition of `sharpenZoneWeights` spans ~4 / (4 + 2k) tiles; k is chosen
+ * so that this is ~2 px (never under 0.12 tile), scaled by `close`.
+ */
+export function zoneSharpness(tilesPerPx: number, close: number): number {
+  return close * Math.max(0, 2 / Math.max(2 * tilesPerPx, 0.12) - 2);
+}
+
+/**
+ * The terrain shader's close-up zone blend: bilinear corner weights `bw`
+ * (corners that are not passable land already at 0) sharpened towards the
+ * dominant zone, w_i · exp(k (W_i − 1)) normalised, where W_i is the total
+ * bilinear weight of corner i's zone. k = 0 is the plain bilinear blend.
+ * Returns all zeros when no corner has weight.
+ */
+export function sharpenZoneWeights(
+  bw: readonly [number, number, number, number],
+  zones: readonly [number, number, number, number],
+  k: number,
+): [number, number, number, number] {
+  const out: [number, number, number, number] = [0, 0, 0, 0];
+  let total = 0;
+  for (let i = 0; i < 4; i++) {
+    let classWeight = 0;
+    for (let j = 0; j < 4; j++) if (zones[j] === zones[i]) classWeight += bw[j];
+    out[i] = bw[i] * Math.exp(k * (classWeight - 1));
+    total += out[i];
+  }
+  if (!(total > 1e-5)) return [0, 0, 0, 0];
+  for (let i = 0; i < 4; i++) out[i] /= total;
+  return out;
+}
+
+/**
+ * How much a border band needs extra contrast (0..1) against a surface:
+ * 1 when their perceptual brightness (sqrt of linear luminance) is within
+ * ~0.06, 0 beyond ~0.22. The terrain shader darkens the band's edge lines
+ * (close up) or the band itself (zoomed out) by this amount.
+ */
+export function borderContrastNeed(
+  bandLuma: number,
+  groundLuma: number,
+): number {
+  const d = Math.abs(
+    Math.sqrt(Math.max(0, bandLuma)) - Math.sqrt(Math.max(0, groundLuma)),
+  );
+  return 1 - smoothstep(0.06, 0.22, d);
 }
 
 /**

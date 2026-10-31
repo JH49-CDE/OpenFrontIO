@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   getUserMe: vi.fn(async (): Promise<unknown> => false),
   invalidateUserMe: vi.fn(),
   joinLobby: vi.fn(),
+  rendererSelectionLoaded: false,
 }));
 
 // Auth is imported by half the component tree; keep the real module and only
@@ -104,6 +105,12 @@ vi.mock("../../src/client/AdGatekeeper", () => ({
 vi.mock("../../src/client/ClientGameRunner", () => ({
   joinLobby: mocks.joinLobby,
 }));
+
+// Records whether bootstrap fetched the renderer-selection chunk at all.
+vi.mock("../../src/client/render/three/RendererSelection", () => {
+  mocks.rendererSelectionLoaded = true;
+  return { syncRendererPreferenceFromUrl: vi.fn() };
+});
 
 // The viewer pulls in the WebGL renderer. A bare element is enough to see
 // that Main opened it, and for which game.
@@ -320,6 +327,12 @@ describe("Client.initialize() booted from Main.ts module scope", () => {
     // userAuth() === false → onUserMe(false) (line 735), which flips the ad
     // entitlement on for a signed-out web player.
     expect(window.adsEnabled).toBe(true);
+  });
+
+  // The opt-in 3D renderer's URL sync is its own chunk; a visit whose URL
+  // names no renderer (the jsdom URL has no query) must not fetch it.
+  it("does not load the renderer-selection chunk without ?renderer", () => {
+    expect(mocks.rendererSelectionLoaded).toBe(false);
   });
 
   it("clears the stale achievements.pushed record", () => {

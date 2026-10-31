@@ -1,6 +1,7 @@
 /**
  * StructureLayer — instanced structures (City, Port, Factory, Defense Post,
- * SAM Launcher, Missile Silo) standing on the relief.
+ * SAM Launcher, Missile Silo) standing on the relief, with the default
+ * renderer's status information.
  *
  * One `InstancedBatch` per model variant (cities, SAM launchers and silos
  * change shape with level — see `structureVariant`). Instance data (position,
@@ -9,30 +10,52 @@
  * rewrites matrices when something visual moves: the zoom-dependent minimum
  * size, the build-menu highlight, structures under construction (grey,
  * small, slowly growing / pulsing) and structures marked for deletion (red,
- * blinking).
+ * blinking). Every structure stands on a soft contact shadow.
+ *
+ * Status (parity with BarPass / StructureLevelPass):
+ * - a progress bar above the model (`StatusBars`): deletion countdown,
+ *   construction progress or missile readiness (silo / SAM), from
+ *   `structureProgress`, refreshed every tick by `updateStatus`;
+ * - the level number (level > 1) as a small DOM badge above the model in
+ *   `ctx.overlayRoot` (Overpass bold like the names, white on a dark pill
+ *   so it reads on any terrain), shown from the default renderer's icon
+ *   zoom (1.2) on.
  *
  * Contract notes:
  * - `updateStructures` gets the FULL unit map, only on ticks where a
  *   structure changed (new, owner, level, isActive, construction finished).
- *   A change of `markedForDeletion` alone does not trigger it upstream, so
- *   the red tint can lag until the next structure change (same as the
- *   default renderer).
+ * - `updateStatus` gets the full unit map and the tick EVERY tick (the
+ *   facade's `updateUnits`): progress bars advance and a change of
+ *   `markedForDeletion` (which does not trigger `updateStructures`) is
+ *   picked up there.
  * - `setHighlightTypes(null)` clears the build-menu type highlight.
  */
 
+import { UnitType } from "@openfront/engine-api/game/GameTypes";
+import type { Config } from "@openfront/engine-lib/configuration/Config";
 import * as THREE from "three";
-import { STRUCTURE_TYPES, UT_PORT, type UnitState } from "../types";
-import type { HeightField } from "./HeightField";
 import {
+  STRUCTURE_TYPES,
+  UT_MISSILE_SILO,
+  UT_PORT,
+  UT_SAM_LAUNCHER,
+  type UnitState,
+} from "../types";
+import type { HeightField } from "./HeightField";
+import { ensureOverpassFont, LABEL_FONT_FAMILY } from "./NameLayer";
+import {
+  BlobShadows,
   createPartMaterial,
   createStructureGeometry,
   InstancedBatch,
   levelChangesModel,
   MAX_VISUAL_LEVEL,
   setOwnerColor,
+  shadowOffset,
   STRUCTURE_FOOTPRINT,
   structureVariant,
 } from "./ProceduralMeshes";
+import { barSize, StatusBars } from "./StatusBars";
 import { isLand } from "./TerrainCodec";
 import type { FrameInfo, ThreeLayerContext } from "./types";
 import { minScreenScale } from "./UnitLayer";
@@ -41,6 +64,17 @@ import { minScreenScale } from "./UnitLayer";
 const CONSTRUCTION_GROW_MS = 6000;
 /** Relative zoom change that triggers a rewrite of the min-size scale. */
 const ZOOM_EPSILON = 0.002;
+/** Level labels / bars appear above this zoom (default `dotsZoomThreshold`). */
+export const STATUS_MIN_ZOOM = 1.2;
+/** Contact shadow: diameter / footprint, opacity, lift above the ground. */
+const SHADOW_SIZE = 1.18;
+const SHADOW_ALPHA = 0.4;
+const SHADOW_LIFT = 0.08;
+
+/** Level label font size (CSS px): 12 px zoomed out, up to 22 px close up. */
+export function levelLabelPx(cssPxPerTile: number): number {
+  return Math.round(Math.min(22, Math.max(12, 10 + 0.8 * cssPxPerTile)));
+}
 
 /**
  * Stretch of models whose shape does not encode the level: (horizontal,
@@ -87,6 +121,76 @@ export function waterHeading(hf: HeightField, x: number, y: number): number {
   return sx * sx + sy * sy > 1e-6 ? Math.atan2(sy, sx) : 0;
 }
 
+/** Rules config values the structure progress bars depend on. */
+export interface StructureProgressRules {
+  deletionMarkDuration: number;
+  samCooldown: number;
+  siloCooldown: number;
+  constructionDuration(type: string): number;
+}
+
+/** Reads `StructureProgressRules` from the game config (BarPass defaults). */
+export function structureProgressRules(config: Config): StructureProgressRules {
+  const num = (f: () => number, fallback: number): number => {
+    try {
+      const v = f();
+      return Number.isFinite(v) ? v : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  return {
+    deletionMarkDuration: num(() => config.deletionMarkDuration(), 300),
+    samCooldown: num(() => config.SAMCooldown(), 90),
+    siloCooldown: num(() => config.SiloCooldown(), 90),
+    constructionDuration: (type) =>
+      num(
+        () => config.unitInfo(type as UnitType).constructionDuration ?? 50,
+        50,
+      ),
+  };
+}
+
+/**
+ * Progress bar value of a structure at `tick`, or null for no bar — the
+ * same rules as the default renderer's BarPass, in priority order:
+ * deletion countdown (remaining / deletionMarkDuration), construction
+ * progress, then missile readiness of silos / SAM launchers (ready missiles
+ * plus the reload progress of the others, over `level` slots; no bar when
+ * fully ready).
+ */
+export function structureProgress(
+  u: UnitState,
+  tick: number,
+  rules: StructureProgressRules,
+): number | null {
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  if (u.markedForDeletion !== false) {
+    return clamp01(
+      (u.markedForDeletion - tick) / Math.max(1, rules.deletionMarkDuration),
+    );
+  }
+  if (u.underConstruction && u.constructionStartTick !== null) {
+    const duration = rules.constructionDuration(u.unitType);
+    if (!(duration > 0)) return null;
+    return clamp01((tick - u.constructionStartTick) / duration);
+  }
+  if (u.unitType === UT_MISSILE_SILO || u.unitType === UT_SAM_LAUNCHER) {
+    const slots = Math.max(1, u.level);
+    const reloading = u.missileTimerQueue.length;
+    if (reloading === 0) return null;
+    const cooldown =
+      u.unitType === UT_SAM_LAUNCHER ? rules.samCooldown : rules.siloCooldown;
+    let readiness = (slots - reloading) / slots;
+    for (const start of u.missileTimerQueue) {
+      readiness += (tick - start) / Math.max(1, cooldown) / slots;
+    }
+    const r = clamp01(readiness);
+    return r < 1 ? r : null;
+  }
+  return null;
+}
+
 interface StructureInst {
   id: number;
   type: string;
@@ -95,6 +199,8 @@ interface StructureInst {
   variant: number;
   underConstruction: boolean;
   marked: boolean;
+  /** Progress bar value (null = no bar), refreshed every tick. */
+  progress: number | null;
   /** Tile centre. */
   x: number;
   y: number;
@@ -107,6 +213,19 @@ interface StructureInst {
   stamp: number;
   batch: InstancedBatch | null;
   index: number;
+  /** Model height (tiles) at scale 1, for anchoring labels and bars. */
+  top: number;
+  label: LevelLabel | null;
+}
+
+/** A pooled DOM level label and what was last written to it. */
+interface LevelLabel {
+  el: HTMLDivElement;
+  text: string;
+  fontPx: number;
+  x: number;
+  y: number;
+  shown: boolean;
 }
 
 /** Deterministic 32-bit hash of a unit id. */
@@ -116,13 +235,21 @@ function hash(id: number): number {
 
 export class StructureLayer {
   private readonly group = new THREE.Group();
-  private readonly glow = { value: 1.5 };
+  private readonly glow = { value: 1 };
   private readonly material: THREE.MeshStandardMaterial;
   private readonly templates = new Map<string, THREE.BufferGeometry>();
+  private readonly tops = new Map<string, number>();
   private readonly batches = new Map<string, InstancedBatch>();
   private readonly insts = new Map<number, StructureInst>();
   /** Instances that animate every frame (under construction / marked). */
   private animated: StructureInst[] = [];
+  private readonly shadows: BlobShadows;
+  private readonly bars: StatusBars;
+  private readonly rules: StructureProgressRules;
+  /** Instances with a progress bar this tick. */
+  private barred: StructureInst[] = [];
+  private readonly labelRoot: HTMLDivElement;
+  private readonly labelPool: LevelLabel[] = [];
 
   private highlight: ReadonlySet<string> | null = null;
   private highlightDirty = false;
@@ -139,6 +266,7 @@ export class StructureLayer {
   private readonly p = new THREE.Vector3();
   private readonly s = new THREE.Vector3();
   private readonly c = new THREE.Color();
+  private readonly v = new THREE.Vector3();
   private readonly up = new THREE.Vector3(0, 1, 0);
 
   constructor(private readonly ctx: ThreeLayerContext) {
@@ -149,6 +277,22 @@ export class StructureLayer {
       roughness: 0.75,
       metalness: 0.04,
     });
+    this.shadows = new BlobShadows(this.group, "structure-shadows");
+    this.bars = new StatusBars(
+      this.group,
+      ctx.renderSettings.bar,
+      "structure-status-bars",
+    );
+    this.rules = structureProgressRules(ctx.config);
+    ensureOverpassFont();
+    this.labelRoot = document.createElement("div");
+    this.labelRoot.className = "three-structure-levels";
+    const st = this.labelRoot.style;
+    st.position = "absolute";
+    st.inset = "0";
+    st.pointerEvents = "none";
+    st.overflow = "hidden";
+    ctx.overlayRoot.appendChild(this.labelRoot);
   }
 
   updateStructures(units: ReadonlyMap<number, UnitState>): void {
@@ -170,6 +314,7 @@ export class StructureLayer {
           variant: 1,
           underConstruction: false,
           marked: false,
+          progress: null,
           x,
           y,
           ground: 0,
@@ -178,6 +323,8 @@ export class StructureLayer {
           stamp,
           batch: null,
           index: -1,
+          top: 1,
+          label: null,
         };
         this.place(inst, hf);
         this.insts.set(u.id, inst);
@@ -191,9 +338,38 @@ export class StructureLayer {
       inst.stamp = stamp;
     }
     for (const [id, inst] of this.insts) {
-      if (inst.stamp !== stamp) this.insts.delete(id);
+      if (inst.stamp !== stamp) {
+        this.releaseLabel(inst);
+        this.insts.delete(id);
+      }
     }
+    this.barred = this.barred.filter((i) => this.insts.get(i.id) === i);
     this.rebuild(now);
+  }
+
+  /**
+   * Per-tick status: progress bar values, and the deletion mark (which
+   * changes without an `updateStructures`).
+   */
+  updateStatus(units: ReadonlyMap<number, UnitState>, gameTick: number): void {
+    const barred: StructureInst[] = [];
+    let markChanged = false;
+    for (const inst of this.insts.values()) {
+      const u = units.get(inst.id);
+      if (u === undefined || !u.isActive) {
+        inst.progress = null;
+        continue;
+      }
+      const marked = u.markedForDeletion !== false;
+      if (marked !== inst.marked) {
+        inst.marked = marked;
+        markChanged = true;
+      }
+      inst.progress = structureProgress(u, gameTick, this.rules);
+      if (inst.progress !== null) barred.push(inst);
+    }
+    this.barred = barred;
+    if (markChanged) this.rebuild(performance.now());
   }
 
   setHighlightTypes(types: string[] | null): void {
@@ -205,6 +381,31 @@ export class StructureLayer {
     const now = frame.nowMs;
     this.lastNowMs = now;
     this.lastZoom = frame.cssPxPerTile;
+    this.updateModels(frame);
+    this.updateStatusViews(frame);
+  }
+
+  dispose(): void {
+    for (const b of this.batches.values()) b.dispose();
+    this.batches.clear();
+    for (const g of this.templates.values()) g.dispose();
+    this.templates.clear();
+    this.shadows.dispose();
+    this.bars.dispose();
+    this.material.dispose();
+    this.insts.clear();
+    this.animated = [];
+    this.barred = [];
+    this.labelRoot.remove();
+    this.labelPool.length = 0;
+    this.ctx.scene.remove(this.group);
+  }
+
+  // ---- Internals ----
+
+  /** Per-frame model updates (terrain / palette / zoom / animation). */
+  private updateModels(frame: FrameInfo): void {
+    const now = frame.nowMs;
     const hf = this.ctx.heightField;
 
     if (hf.version !== this.heightVersion) {
@@ -235,6 +436,7 @@ export class StructureLayer {
       this.matrixZoom = frame.cssPxPerTile;
       for (const inst of this.insts.values()) this.writeInstance(inst, now);
       for (const b of this.batches.values()) b.markDirty();
+      this.writeShadows();
       return;
     }
     if (zoomChanged) this.matrixZoom = frame.cssPxPerTile;
@@ -249,18 +451,121 @@ export class StructureLayer {
     }
   }
 
-  dispose(): void {
-    for (const b of this.batches.values()) b.dispose();
-    this.batches.clear();
-    for (const g of this.templates.values()) g.dispose();
-    this.templates.clear();
-    this.material.dispose();
-    this.insts.clear();
-    this.animated = [];
-    this.ctx.scene.remove(this.group);
+  /** Progress bars and level labels for this frame's camera. */
+  private updateStatusViews(frame: FrameInfo): void {
+    const zoom = frame.cssPxPerTile;
+    const show = zoom >= STATUS_MIN_ZOOM;
+    this.bars.begin(frame, show ? 1 : 0);
+    if (show) {
+      for (const inst of this.barred) {
+        if (inst.progress === null) continue;
+        const [k, top] = this.anchor(inst);
+        const fpPx = (STRUCTURE_FOOTPRINT[inst.type] ?? 6) * k * zoom;
+        const { w, h } = barSize(fpPx, 0.6, 20, 80);
+        this.bars.bar(inst.x, top, inst.y, 0, h / 2 + 4, w, h, inst.progress);
+      }
+    }
+    this.bars.end();
+
+    const cam = frame.camera;
+    const cw = frame.cssWidth;
+    const ch = frame.cssHeight;
+    const fontPx = levelLabelPx(zoom);
+    for (const inst of this.insts.values()) {
+      const label = inst.label;
+      if (inst.level <= 1 || !show) {
+        if (label !== null) this.setLabelShown(label, false);
+        continue;
+      }
+      const [, top] = this.anchor(inst);
+      const ndc = this.v.set(inst.x, top, inst.y).project(cam);
+      const visible =
+        ndc.z < 1 && Math.abs(ndc.x) < 1.05 && Math.abs(ndc.y) < 1.05;
+      if (!visible) {
+        if (label !== null) this.setLabelShown(label, false);
+        continue;
+      }
+      const l = label ?? this.acquireLabel(inst);
+      const text = String(inst.level);
+      if (l.text !== text) {
+        l.text = text;
+        l.el.textContent = text;
+      }
+      if (l.fontPx !== fontPx) {
+        l.fontPx = fontPx;
+        l.el.style.fontSize = `${fontPx}px`;
+      }
+      // Above the model, above the bar when there is one.
+      const lift = inst.progress !== null ? Math.round(fontPx * 0.5) + 8 : 3;
+      const x = Math.round(((ndc.x + 1) / 2) * cw);
+      const y = Math.round(((1 - ndc.y) / 2) * ch) - lift;
+      if (x !== l.x || y !== l.y) {
+        l.x = x;
+        l.y = y;
+        l.el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -100%)`;
+      }
+      this.setLabelShown(l, true);
+    }
   }
 
-  // ---- Internals ----
+  /** Scale and world Y of the top of `inst`'s model this frame. */
+  private anchor(inst: StructureInst): [number, number] {
+    const base = minScreenScale(
+      this.ctx.settings.structureMinScreenPx,
+      this.lastZoom,
+      STRUCTURE_FOOTPRINT[inst.type] ?? 6,
+    );
+    let k = base;
+    if (inst.underConstruction) {
+      k *= constructionScale(
+        this.lastNowMs - inst.ucSinceMs,
+        this.lastNowMs / 1000,
+      );
+    }
+    const [, ly] = structureLevelScale(inst.type, inst.level);
+    return [k, inst.ground + inst.top * k * ly];
+  }
+
+  private acquireLabel(inst: StructureInst): LevelLabel {
+    let l = this.labelPool.pop();
+    if (l === undefined) {
+      const el = document.createElement("div");
+      const st = el.style;
+      st.position = "absolute";
+      st.left = "0";
+      st.top = "0";
+      st.fontFamily = LABEL_FONT_FAMILY;
+      st.fontWeight = "700";
+      st.lineHeight = "1.1";
+      st.color = "#fff";
+      st.background = "rgba(14, 16, 22, 0.78)";
+      st.borderRadius = "0.4em";
+      st.padding = "0.1em 0.35em 0.02em";
+      st.boxShadow = "0 1px 3px rgba(0, 0, 0, 0.45)";
+      st.whiteSpace = "nowrap";
+      st.pointerEvents = "none";
+      st.userSelect = "none";
+      st.willChange = "transform";
+      st.display = "none";
+      this.labelRoot.appendChild(el);
+      l = { el, text: "", fontPx: 0, x: NaN, y: NaN, shown: false };
+    }
+    inst.label = l;
+    return l;
+  }
+
+  private releaseLabel(inst: StructureInst): void {
+    if (inst.label === null) return;
+    this.setLabelShown(inst.label, false);
+    this.labelPool.push(inst.label);
+    inst.label = null;
+  }
+
+  private setLabelShown(l: LevelLabel, on: boolean): void {
+    if (l.shown === on) return;
+    l.shown = on;
+    l.el.style.display = on ? "block" : "none";
+  }
 
   /** Ground height (highest point under the footprint) and orientation. */
   private place(inst: StructureInst, hf: HeightField): void {
@@ -293,12 +598,14 @@ export class StructureLayer {
     for (const b of this.batches.values()) b.begin();
     this.animated = [];
     for (const inst of this.insts.values()) {
-      const batch = this.batchFor(inst.type, inst.variant);
+      const key = `${inst.type}#${inst.variant}`;
+      const batch = this.batchFor(key, inst.type, inst.variant);
       inst.batch = batch;
       if (batch === null) {
         inst.index = -1;
         continue;
       }
+      inst.top = this.tops.get(key) ?? 1;
       this.computeMatrix(inst, now);
       inst.index = batch.push(
         this.m,
@@ -308,6 +615,33 @@ export class StructureLayer {
       if (inst.underConstruction || inst.marked) this.animated.push(inst);
     }
     for (const b of this.batches.values()) b.end();
+    this.writeShadows();
+  }
+
+  /** One soft shadow per structure, shifted away from the sun. */
+  private writeShadows(): void {
+    const sh = this.shadows;
+    sh.begin();
+    for (const inst of this.insts.values()) {
+      if (inst.batch === null) continue;
+      const base = minScreenScale(
+        this.ctx.settings.structureMinScreenPx,
+        this.matrixZoom,
+        STRUCTURE_FOOTPRINT[inst.type] ?? 6,
+      );
+      const size = (STRUCTURE_FOOTPRINT[inst.type] ?? 6) * base * SHADOW_SIZE;
+      const [ox, oz] = shadowOffset(0.3 * inst.top * base);
+      sh.push(
+        inst.x + ox,
+        inst.ground + SHADOW_LIFT,
+        inst.y + oz,
+        size,
+        size,
+        inst.rotY,
+        SHADOW_ALPHA,
+      );
+    }
+    sh.end();
   }
 
   private writeInstance(inst: StructureInst, now: number): void {
@@ -374,8 +708,11 @@ export class StructureLayer {
     return shade;
   }
 
-  private batchFor(type: string, variant: number): InstancedBatch | null {
-    const key = `${type}#${variant}`;
+  private batchFor(
+    key: string,
+    type: string,
+    variant: number,
+  ): InstancedBatch | null {
     let batch = this.batches.get(key);
     if (batch !== undefined) return batch;
     let template = this.templates.get(key);
@@ -384,6 +721,8 @@ export class StructureLayer {
       if (g === null) return null;
       template = g;
       this.templates.set(key, template);
+      g.computeBoundingBox();
+      this.tops.set(key, Math.max(0.5, g.boundingBox?.max.y ?? 1));
     }
     batch = new InstancedBatch(
       this.group,

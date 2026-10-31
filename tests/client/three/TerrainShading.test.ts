@@ -1,15 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   addTexelSpan,
+  borderContrastNeed,
   borderWidthTiles,
+  closeUpAmount,
   computeCellLand,
   edgeCoverage,
   fogRangeForView,
   hexToSrgb01,
   RowSpans,
+  sharpenZoneWeights,
   srgbToLinear,
   vertexTouchesLand,
   waterColors,
+  zoneSharpness,
 } from "../../../src/client/render/three/TerrainShading";
 
 describe("colour helpers", () => {
@@ -84,6 +88,75 @@ describe("border width / coverage (mirrors the terrain shader)", () => {
       expect(c).toBeLessThanOrEqual(prev + 1e-12);
       prev = c;
     }
+  });
+});
+
+describe("close-up zone blend (mirrors the terrain shader)", () => {
+  it("keeps strategy zoom on the 2D-like look and goes fully close-up from ~7 px per tile", () => {
+    expect(closeUpAmount(1 / 1.8)).toBe(0); // default zoom, dpr 1
+    expect(closeUpAmount(1 / 8)).toBe(1);
+    expect(closeUpAmount(1 / 4)).toBeGreaterThan(0);
+    expect(closeUpAmount(1 / 4)).toBeLessThan(1);
+    expect(zoneSharpness(1 / 1.8, closeUpAmount(1 / 1.8))).toBe(0);
+    expect(zoneSharpness(1 / 8, 1)).toBeCloseTo(6, 12);
+  });
+
+  it("is the plain (normalised) bilinear blend at k = 0", () => {
+    const w = sharpenZoneWeights([0.1, 0.2, 0.3, 0.2], [0, 1, 1, 2], 0);
+    const expected = [0.125, 0.25, 0.375, 0.25];
+    for (let i = 0; i < 4; i++) expect(w[i]).toBeCloseTo(expected[i], 12);
+  });
+
+  it("turns a two-zone edge into a ~2 px transition", () => {
+    // Zone 0 on the west corners, zone 1 on the east ones, x across the edge.
+    const k = zoneSharpness(1 / 8, 1); // 8 px per tile
+    const west = (x: number) => {
+      const w = sharpenZoneWeights(
+        [(1 - x) / 2, x / 2, (1 - x) / 2, x / 2],
+        [0, 1, 0, 1],
+        k,
+      );
+      return w[0] + w[2];
+    };
+    expect(west(0.5)).toBeCloseTo(0.5, 12);
+    // Bisect the 88% and 12% crossings.
+    const cross = (level: number) => {
+      let lo = 0;
+      let hi = 1;
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        if (west(mid) > level) lo = mid;
+        else hi = mid;
+      }
+      return lo;
+    };
+    const span = cross(0.12) - cross(0.88);
+    expect(span).toBeCloseTo(4 / (4 + 2 * k), 1);
+    expect(span * 8).toBeGreaterThan(1.5); // pixels: anti-aliased
+    expect(span * 8).toBeLessThan(2.6); // and crisp
+    // Sharper with a larger k; bilinear (span 0.76) with none.
+    expect(west(0.3)).toBeGreaterThan(0.95);
+  });
+
+  it("ignores corners without weight (water / void)", () => {
+    const w = sharpenZoneWeights([0.5, 0, 0.5, 0], [1, 0, 2, 0], 10);
+    expect(w[1]).toBe(0);
+    expect(w[3]).toBe(0);
+    expect(w[0] + w[2]).toBeCloseTo(1, 12);
+    expect(sharpenZoneWeights([0, 0, 0, 0], [0, 1, 2, 0], 4)).toEqual([
+      0, 0, 0, 0,
+    ]);
+  });
+});
+
+describe("border contrast need", () => {
+  const lin = (s: number) => srgbToLinear(s);
+  it("is high for the local player's light grey band on snow", () => {
+    expect(borderContrastNeed(lin(0.9), lin(0.98))).toBeGreaterThan(0.85);
+  });
+  it("is zero for a light band on a darker territory fill", () => {
+    expect(borderContrastNeed(lin(0.9), lin(0.45))).toBe(0);
+    expect(borderContrastNeed(lin(0.2), lin(0.9))).toBe(0);
   });
 });
 

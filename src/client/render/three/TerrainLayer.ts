@@ -15,7 +15,10 @@
  * terrain bytes (R8UI, shared with WaterLayer), tile state (R16UI, the live
  * engine buffer referenced directly), the relation matrix (R8UI) and the
  * palette (RGBA32F). Partial tile uploads are per-row texel spans; nothing
- * loops over tiles per frame.
+ * loops over tiles per frame. Close up (a tile over ~3-7 px) the shader
+ * switches to a procedural diorama look: organic terrain zones, rock / snow
+ * lines and micro detail (`closeUpAmount` and friends in TerrainShading.ts
+ * mirror its math); land / water and ownership stay exact per tile.
  *
  * Contract notes:
  * - `setTiles(tileState, changed)`: `tileState` is the live engine-mirror

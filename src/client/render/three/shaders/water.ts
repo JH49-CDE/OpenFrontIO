@@ -131,21 +131,30 @@ vec2 waveSlope(vec2 p, float t, float tpp) {
   return g * (swell * uWaveStrength);
 }
 
-// Foam: lace bands running towards the coast plus a wash line on the
-// waterline. Zoomed out the bands average into a light rim (like the default
-// renderer's lighter shoreline water) instead of aliasing.
+// Foam. Zoomed out: a crisp light band over the shoreline water tiles
+// (bilinear mag up to ~0.45), like the default renderer's lighter shore
+// tiles. Close up (a tile over ~3-8 px): a thin wash line on the waterline
+// plus lace bands running towards the coast, broken up by large-scale noise
+// so they do not echo the tile staircase of the coastline.
 float foamAmount(vec2 p, float mag, float t, float tpp) {
   if (mag > 2.2) return 0.0;
-  float detail = 1.0 - smoothstep(0.3, 1.0, tpp);
-  float n = valueNoise(p * 0.8 + vec2(t * 0.11, -t * 0.07));
-  float bands = 0.5 + 0.5 * sin((mag * 2.2 + t * 0.55) * 3.1415927 + n * 3.0);
-  float lace = smoothstep(0.62, 0.9, bands) * (0.55 + 0.45 * n);
-  float nearCoast = 1.0 - smoothstep(-0.3, 1.6, mag);
-  // Wash line: at least ~1.5 px wide (mag changes ~1 per tile at the coast).
-  float rimW = min(0.12 + 1.5 * tpp, 1.2);
-  float rim = 1.0 - smoothstep(-0.5 + 0.5 * rimW, -0.5 + rimW, mag);
-  float f = nearCoast * mix(0.15, lace, detail) + rim * mix(0.3, 0.85, detail);
-  return clamp(f, 0.0, 1.0);
+  float detail = 1.0 - smoothstep(0.12, 0.3, tpp);
+  // Rim edge in mag units (~tiles near the coast): the wash line is at
+  // least ~1.5 px wide; anti-aliased over ~1 px.
+  float edge = mix(0.45, -0.5 + min(0.12 + 1.5 * tpp, 0.95), detail);
+  float aa = 0.6 * tpp + 0.02;
+  float rim = 1.0 - smoothstep(edge - aa, edge + aa, mag);
+  float lace = 0.0;
+  if (detail > 0.0) {
+    float n = valueNoise(p * 0.8 + vec2(t * 0.11, -t * 0.07));
+    // Slow large-scale breakup of the bands (cheap trig instead of noise).
+    float n2 = 0.5 + 0.5 * sin(dot(p, vec2(0.29, 0.21))
+      + 2.0 * sin(dot(p, vec2(-0.17, 0.26)) + t * 0.05));
+    float bands = 0.5 + 0.5 * sin((mag * 2.2 + t * 0.55) * 3.1415927 + n * 3.0 + n2 * 8.0);
+    lace = smoothstep(0.62, 0.9, bands) * (0.55 + 0.45 * n)
+      * (1.0 - smoothstep(-0.3, 1.6, mag)) * smoothstep(0.25, 0.6, n2) * detail;
+  }
+  return clamp(lace + rim * mix(0.65, 0.85, detail), 0.0, 1.0);
 }
 
 // Water surface colour (linear) and opacity at p. V = unit vector from the
@@ -164,11 +173,11 @@ vec4 shadeWater(vec2 p, float mag, vec3 V, float tpp, float t) {
   vec3 col = mix(body, skyColor(reflect(-V, n)), fres);
 
   // Sun glints (tight lobe) and a soft sheen (wide lobe), Blinn-Phong.
-  // Kept small and only at close zoom (faded out from ~30 down to ~4 px per
-  // tile): further out the sun's reflection turns whole seas into glitter.
+  // Kept faint and only at close zoom (faded out from ~30 down to ~4 px per
+  // tile): brighter sparkles read as noise on the sea.
   vec3 h = normalize(V + uSunDir);
   float ndh = max(dot(n, h), 0.0);
-  float glint = (0.6 * pow(ndh, 700.0) + 0.04 * pow(ndh, 60.0))
+  float glint = (0.05 * pow(ndh, 700.0) + 0.04 * pow(ndh, 60.0))
     * (1.0 - smoothstep(0.03, 0.25, tpp));
   col += uSunIrradiance * (glint * INV_PI);
 

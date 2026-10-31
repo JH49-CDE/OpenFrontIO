@@ -13,8 +13,10 @@
  * - `color` (linear rgb): the part's own colour;
  * - `aTint` (0..1): how much the instance (owner) colour multiplies it —
  *   0 = neutral stone / steel / flame, 1 = owner-coloured roof / hull;
- * - `aGlow` (≥ 0): emissive strength (exhaust flames, shells), which the
- *   bloom pass turns into a glow.
+ * - `aGlow` (≥ 0): emissive strength (exhaust flames, shells). The bloom
+ *   threshold is luminance 1, so a part glows when aGlow × its colour's
+ *   luminance × the layer's glow uniform (≈ 1) exceeds 1: flames (luminance
+ *   ~0.47) use ~4.5 for a soft halo, shells ~2, the gold load stays below.
  */
 
 import * as THREE from "three";
@@ -263,6 +265,128 @@ export class InstancedBatch {
 }
 
 // ---------------------------------------------------------------------------
+// Blob shadows
+// ---------------------------------------------------------------------------
+
+/**
+ * Horizontal shift (tiles, +x east / +z south) of the shadow of a point
+ * `h` tiles up, for the sun towards (−0.5, 0.8, −0.35): h·(0.5, 0.35)/0.8.
+ */
+export function shadowOffset(h: number): [number, number] {
+  return [h * 0.625, h * 0.4375];
+}
+
+/** `iShade` is InstancedBatch's per-instance scalar: here the opacity. */
+const SHADOW_VERT = /* glsl */ `
+attribute float iShade;
+varying vec2 vLocal;
+varying float vAlpha;
+void main() {
+  vLocal = uv * 2.0 - 1.0;
+  vAlpha = iShade;
+  vec4 p = vec4(position, 1.0);
+  #ifdef USE_INSTANCING
+  p = instanceMatrix * p;
+  #endif
+  gl_Position = projectionMatrix * modelViewMatrix * p;
+}
+`;
+
+/** Soft elliptical contact shadow: dark core, smooth falloff to the rim. */
+const SHADOW_FRAG = /* glsl */ `
+varying vec2 vLocal;
+varying float vAlpha;
+void main() {
+  float d = length(vLocal);
+  float a = vAlpha * (1.0 - smoothstep(0.25, 1.0, d));
+  if (a < 0.004) discard;
+  gl_FragColor = vec4(0.015, 0.02, 0.04, a);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}
+`;
+
+/**
+ * Soft dark ellipses lying flat under units and structures (one instanced
+ * draw call), so models read as standing on the ground / floating on the
+ * water instead of hovering. Depth-tested against the relief (drawn just
+ * above it with a polygon offset); never written to depth.
+ * Usage per rebuild: `begin()`, `push(...)`, `end()`.
+ */
+export class BlobShadows {
+  private readonly geometry = new THREE.PlaneGeometry(2, 2).rotateX(
+    -Math.PI / 2,
+  );
+  private readonly material = new THREE.ShaderMaterial({
+    name: "blob-shadow",
+    vertexShader: SHADOW_VERT,
+    fragmentShader: SHADOW_FRAG,
+    transparent: true,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -2,
+  });
+  private readonly batch: InstancedBatch;
+  private readonly m = new THREE.Matrix4();
+  private readonly q = new THREE.Quaternion();
+  private readonly p = new THREE.Vector3();
+  private readonly s = new THREE.Vector3();
+  private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly white = new THREE.Color(1, 1, 1);
+
+  constructor(parent: THREE.Object3D, name: string, renderOrder = 1) {
+    this.geometry.deleteAttribute("normal");
+    this.batch = new InstancedBatch(
+      parent,
+      this.geometry,
+      this.material,
+      name,
+      32,
+      renderOrder,
+    );
+  }
+
+  get count(): number {
+    return this.batch.count;
+  }
+
+  begin(): void {
+    this.batch.begin();
+  }
+
+  /**
+   * An ellipse centred at world (x, y, z), `length` × `width` tiles across,
+   * its length along heading `yaw` (three Y rotation), with opacity `alpha`.
+   */
+  push(
+    x: number,
+    y: number,
+    z: number,
+    length: number,
+    width: number,
+    yaw: number,
+    alpha: number,
+  ): void {
+    this.p.set(x, y, z);
+    this.q.setFromAxisAngle(this.up, yaw);
+    this.s.set(length / 2, 1, width / 2);
+    this.m.compose(this.p, this.q, this.s);
+    this.batch.push(this.m, this.white, alpha);
+  }
+
+  end(): void {
+    this.batch.end();
+  }
+
+  dispose(): void {
+    this.batch.dispose();
+    this.geometry.dispose();
+    this.material.dispose();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Part helpers
 // ---------------------------------------------------------------------------
 
@@ -478,6 +602,8 @@ const C = {
   concrete: 0xa9a9a4,
   wood: 0x8a6440,
   wall: 0xe7dcc6,
+  paving: 0xd9d5cc,
+  ballast: 0x8f877b,
   brick: 0x8e3d2f,
   glass: 0x6f8fa8,
   flame: 0xffa040,
@@ -673,15 +799,33 @@ function trainCarriageGeometry(loaded: boolean): THREE.BufferGeometry {
   if (loaded) {
     parts.push(
       part(box(1.7, 0.42, 0.76, 0, 0.2, 0), C.tintBase, { tint: 1 }),
-      part(box(1.5, 0.2, 0.6, 0, 0.55, 0), C.gold, { glow: 0.12 }),
-      part(cyl(0.18, 0.3, 0.22, 6, -0.35, 0.7, 0), C.gold, { glow: 0.12 }),
-      part(cyl(0.16, 0.28, 0.2, 6, 0.4, 0.7, 0.05), C.gold, { glow: 0.12 }),
+      part(box(1.5, 0.2, 0.6, 0, 0.55, 0), C.gold, { glow: 0.3 }),
+      part(cyl(0.18, 0.3, 0.22, 6, -0.35, 0.7, 0), C.gold, { glow: 0.3 }),
+      part(cyl(0.16, 0.28, 0.2, 6, 0.4, 0.7, 0.05), C.gold, { glow: 0.3 }),
     );
   } else {
     parts.push(
       part(box(1.7, 0.62, 0.76, 0, 0.2, 0), C.tintBase, { tint: 1 }),
       part(box(1.75, 0.07, 0.8, 0, 0.82, 0), C.tintShade, { tint: 1 }),
     );
+  }
+  return assemble(parts);
+}
+
+/**
+ * Half a tile of railway, from the tile centre (x = 0) to its edge
+ * (x = 0.5) along +X: gravel ballast, two sleepers and two steel rails at
+ * the gauge the train models straddle. A straight rail tile is two halves
+ * (east + west or north + south), a curve the two halves towards the
+ * edges it connects.
+ */
+export function createRailPieceGeometry(): THREE.BufferGeometry {
+  const parts = [part(box(0.5, 0.05, 0.56, 0.25, -0.02, 0), C.ballast)];
+  for (const x of [0.12, 0.37]) {
+    parts.push(part(box(0.09, 0.03, 0.46, x, 0.03, 0), C.wood));
+  }
+  for (const z of [-0.15, 0.15]) {
+    parts.push(part(box(0.52, 0.05, 0.05, 0.25, 0.05, z), C.steelDark));
   }
   return assemble(parts);
 }
@@ -694,7 +838,7 @@ function atomBombGeometry(): THREE.BufferGeometry {
     part(cylX(r * 1.04, r * 1.04, 0.3, 10, 1.6), C.hazard),
     part(coneX(r, 1.6, 10, 2.8), C.white),
     ...fins(1.1, 0.7, r, -2.0, C.tintShade, { tint: 1 }),
-    part(coneX(r * 0.8, 1.3, 8, -3.05, true), C.flame, { glow: 1.6 }),
+    part(coneX(r * 0.8, 1.3, 8, -3.05, true), C.flame, { glow: 4.5 }),
   ]);
 }
 
@@ -703,11 +847,11 @@ function hydrogenBombGeometry(): THREE.BufferGeometry {
   const r = 0.62;
   return assemble([
     part(cylX(r * 0.88, r, 5.6, 12, -0.3), C.tintBase, { tint: 1 }),
-    part(cylX(r * 1.06, r * 1.06, 0.35, 12, 1.4), C.flameHot, { glow: 1.1 }),
+    part(cylX(r * 1.06, r * 1.06, 0.35, 12, 1.4), C.flameHot, { glow: 1.7 }),
     part(cylX(r * 1.06, r * 1.06, 0.2, 12, -1.6), C.hazard),
     part(coneX(r, 1.9, 12, 3.4), C.white),
     ...fins(1.6, 1.15, r, -2.5, C.tintShade, { tint: 1 }),
-    part(coneX(r * 0.85, 1.5, 8, -3.85, true), C.flame, { glow: 1.8 }),
+    part(coneX(r * 0.85, 1.5, 8, -3.85, true), C.flame, { glow: 4.8 }),
   ]);
 }
 
@@ -719,7 +863,7 @@ function mirvGeometry(): THREE.BufferGeometry {
     part(coneX(r, 2.6, 12, 4.8), C.white),
     part(cylX(r * 1.04, r * 1.04, 0.3, 12, 2.6), C.hazard),
     ...fins(2.0, 1.4, r, -3.8, C.tintShade, { tint: 1 }),
-    part(coneX(r * 0.85, 1.8, 8, -5.6, true), C.flame, { glow: 1.8 }),
+    part(coneX(r * 0.85, 1.8, 8, -5.6, true), C.flame, { glow: 4.8 }),
   ];
   for (let k = 0; k < 4; k++) {
     const a = Math.PI / 4 + (k * Math.PI) / 2;
@@ -740,14 +884,14 @@ function warheadGeometry(): THREE.BufferGeometry {
     part(cylX(r * 0.85, r, 1.3, 8, -0.2), C.tintBase, { tint: 1 }),
     part(coneX(r, 0.9, 8, 0.9), C.white),
     ...fins(0.4, 0.25, r, -0.7, C.tintShade, { tint: 1 }),
-    part(coneX(r * 0.8, 0.7, 6, -1.2, true), C.flame, { glow: 2.0 }),
+    part(coneX(r * 0.8, 0.7, 6, -1.2, true), C.flame, { glow: 4.5 }),
   ]);
 }
 
 /** Shell: a small glowing slug (stretched along its heading by the layer). */
 function shellGeometry(): THREE.BufferGeometry {
   return assemble([
-    part(new THREE.SphereGeometry(0.42, 8, 6), C.flameHot, { glow: 2.4 }),
+    part(new THREE.SphereGeometry(0.42, 8, 6), C.flameHot, { glow: 2.1 }),
   ]);
 }
 
@@ -759,7 +903,7 @@ function samMissileGeometry(): THREE.BufferGeometry {
     part(cylX(r * 1.1, r * 1.1, 0.35, 6, 0.3), C.tintBase, { tint: 1 }),
     part(coneX(r, 0.6, 6, 1.2), C.red),
     ...fins(0.35, 0.22, r, -0.95, C.white),
-    part(coneX(r * 0.9, 0.7, 6, -1.45, true), C.flame, { glow: 2.4 }),
+    part(coneX(r * 0.9, 0.7, 6, -1.45, true), C.flame, { glow: 3.6 }),
   ]);
 }
 
@@ -838,9 +982,21 @@ export function createStructureGeometry(
   }
 }
 
-/** Stone plaza with a foundation that reaches below the ground. */
-function plaza(w: number, d: number, color: number = C.stone) {
-  return part(box(w, 1.5, d, 0, -1.2, 0), color);
+/**
+ * Plaza: a foundation reaching below the ground (slopes never show a gap)
+ * under a paved top lightly tinted with the owner colour, so the whole
+ * footprint reads as the owner's from above, not as a grey slab.
+ */
+function plaza(
+  w: number,
+  d: number,
+  color: number = C.stone,
+  x = 0,
+): THREE.BufferGeometry[] {
+  return [
+    part(box(w, 1.38, d, x, -1.2, 0), color),
+    part(box(w * 0.97, 0.12, d * 0.97, x, 0.18, 0), C.paving, { tint: 0.45 }),
+  ];
 }
 
 /**
@@ -849,7 +1005,7 @@ function plaza(w: number, d: number, color: number = C.stone) {
  * colour, so the top-down view reads like the default renderer's icon.
  */
 function cityGeometry(level: number): THREE.BufferGeometry {
-  const parts = [plaza(6.2, 6.2)];
+  const parts = plaza(6.2, 6.2);
   const slots: [number, number][] = [
     [0, 0],
     [-1, -1],
@@ -899,7 +1055,7 @@ function cityGeometry(level: number): THREE.BufferGeometry {
 /** Port: quay, warehouse with owner roof, a pier towards +X and a crane. */
 function portGeometry(): THREE.BufferGeometry {
   const parts = [
-    part(box(4.2, 1.5, 5.4, -1.1, -1.2, 0), C.stone),
+    ...plaza(4.2, 5.4, C.stone, -1.1),
     // Warehouse.
     part(box(2.6, 1.0, 2.4, -1.4, 0.3, -1.1), C.wall),
     part(box(2.8, 0.25, 2.6, -1.4, 1.3, -1.1), C.tintBase, { tint: 1 }),
@@ -927,7 +1083,7 @@ function portGeometry(): THREE.BufferGeometry {
 /** Factory: hall with an owner-coloured sawtooth roof and a brick chimney. */
 function factoryGeometry(): THREE.BufferGeometry {
   const parts = [
-    plaza(6.2, 4.8, C.stoneDark),
+    ...plaza(6.2, 4.8, C.stoneDark),
     part(box(4.6, 1.3, 3.4, -0.5, 0.3, 0), C.wall),
   ];
   // Sawtooth roof: right-triangle prisms (vertical glazed face towards +X).
@@ -1016,7 +1172,7 @@ function samLauncherGeometry(variant: number): THREE.BufferGeometry {
  * ringed with hazard paint) and a small control building.
  */
 function missileSiloGeometry(variant: number): THREE.BufferGeometry {
-  const parts = [part(box(5.6, 1.5, 5.6, 0, -1.2, 0), C.concrete)];
+  const parts = plaza(5.6, 5.6, C.concrete);
   const n = Math.max(1, Math.min(4, variant));
   const corners: [number, number][] = [
     [-1.15, -1.15],

@@ -299,11 +299,13 @@ const round1 = (v: number) => Math.round(v * 10) / 10;
 // Styles and font
 // ---------------------------------------------------------------------------
 
-const FONT_FAMILY = `Overpass, "Helvetica Neue", Arial, sans-serif`;
+/** Label font stack (Overpass bold, as the default renderer's MSDF font). */
+export const LABEL_FONT_FAMILY = `Overpass, "Helvetica Neue", Arial, sans-serif`;
+const FONT_FAMILY = LABEL_FONT_FAMILY;
 let fontRequested = false;
 
 /** Register and start loading the Overpass bold face once per page. */
-function ensureOverpassFont(): void {
+export function ensureOverpassFont(): void {
   if (fontRequested) return;
   fontRequested = true;
   try {

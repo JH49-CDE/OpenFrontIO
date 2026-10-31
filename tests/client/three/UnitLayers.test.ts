@@ -7,18 +7,28 @@ import type { Config } from "@openfront/engine-lib/configuration/Config";
 import * as THREE from "three";
 import type { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { afterEach, describe, expect, it } from "vitest";
-import type { RenderSettings } from "../../../src/client/render/gl/RenderSettings";
+import { createRenderSettings } from "../../../src/client/render/gl/RenderSettings";
 import { HeightField } from "../../../src/client/render/three/HeightField";
-import { OverlayLayer } from "../../../src/client/render/three/OverlayLayer";
+import {
+  OverlayLayer,
+  telegraphColors,
+} from "../../../src/client/render/three/OverlayLayer";
 import { PaletteView } from "../../../src/client/render/three/PaletteView";
-import { StructureLayer } from "../../../src/client/render/three/StructureLayer";
+import {
+  levelLabelPx,
+  StructureLayer,
+  structureProgress,
+  type StructureProgressRules,
+} from "../../../src/client/render/three/StructureLayer";
 import { defaultThreeSettings } from "../../../src/client/render/three/ThreeSettings";
 import type {
   FrameInfo,
   ThreeLayerContext,
 } from "../../../src/client/render/three/types";
 import {
+  healthBarValue,
   nukeArcHeight,
+  railHalfDirections,
   UnitLayer,
 } from "../../../src/client/render/three/UnitLayer";
 import type { UnitState } from "../../../src/client/render/types";
@@ -26,8 +36,21 @@ import type { UnitState } from "../../../src/client/render/types";
 const W = 64;
 const H = 64;
 
+/** The rules the status bars read (Config's warship / structure values). */
+const rulesConfig = {
+  msPerTick: () => 100,
+  unitInfo: (type: string) =>
+    type === "Warship"
+      ? { maxHealth: 1000, constructionDuration: 50 }
+      : { constructionDuration: 50 },
+  warshipVeterancyHealthBonus: () => 10,
+  deletionMarkDuration: () => 300,
+  SAMCooldown: () => 90,
+  SiloCooldown: () => 90,
+} as unknown as Config;
+
 /** West half sea, east half low land (magnitude 4). */
-function makeContext(): ThreeLayerContext {
+function makeContext(config?: Config): ThreeLayerContext {
   const terrain = new Uint8Array(W * H);
   for (let y = 0; y < H; y++) {
     for (let x = W / 2; x < W; x++) terrain[y * W + x] = 0x80 | 4;
@@ -47,8 +70,8 @@ function makeContext(): ThreeLayerContext {
     }),
     palette: new PaletteView(palette),
     settings: defaultThreeSettings(),
-    renderSettings: {} as RenderSettings,
-    config: { msPerTick: () => 100 } as unknown as Config,
+    renderSettings: createRenderSettings(),
+    config: config ?? ({ msPerTick: () => 100 } as unknown as Config),
     overlayRoot: document.createElement("div"),
   };
 }
@@ -129,6 +152,23 @@ function instanceScale(mesh: THREE.InstancedMesh, i = 0): THREE.Vector3 {
   const s = new THREE.Vector3();
   m.decompose(p, q, s);
   return s;
+}
+
+/** Instances drawn by a StatusBars mesh (an InstancedBufferGeometry). */
+function barInstances(ctx: ThreeLayerContext, name: string): number {
+  const mesh = ctx.scene.getObjectByName(name) as THREE.Mesh | undefined;
+  if (mesh === undefined || !mesh.visible) return 0;
+  return (mesh.geometry as THREE.InstancedBufferGeometry).instanceCount;
+}
+
+/** A camera looking straight down at the whole 64×64 test map. */
+function topDownFrame(nowMs: number, cssPxPerTile: number): FrameInfo {
+  const f = frame(nowMs, 1, cssPxPerTile);
+  const cam = new THREE.PerspectiveCamera(60, 800 / 600, 1, 500);
+  cam.position.set(W / 2, 80, H / 2);
+  cam.lookAt(W / 2, 0, H / 2);
+  cam.updateMatrixWorld(true);
+  return { ...f, camera: cam };
 }
 
 const disposers: (() => void)[] = [];
@@ -279,6 +319,68 @@ describe("UnitLayer", () => {
   });
 });
 
+describe("UnitLayer status, shadows and rails", () => {
+  it("shows damaged warships' health and veterancy like BarPass", () => {
+    const rules = { baseMaxHealth: 1000, veterancyBonusPercent: 10 };
+    expect(healthBarValue(null, 0, rules)).toBeNull();
+    expect(healthBarValue(1000, 0, rules)).toBeNull(); // full: no bar
+    expect(healthBarValue(500, 0, rules)).toBeCloseTo(0.5, 12);
+    // Veterancy raises the max (1000 + 20%): 1100 is no longer full.
+    expect(healthBarValue(1100, 2, rules)).toBeCloseTo(1100 / 1200, 12);
+    expect(healthBarValue(500, 0, { ...rules, baseMaxHealth: 0 })).toBeNull();
+  });
+
+  it("draws bars, pips, contact shadows and rails", () => {
+    const ctx = makeContext(rulesConfig);
+    const layer = new UnitLayer(ctx);
+    disposers.push(() => layer.dispose());
+    layer.updateUnits(
+      unitMap(
+        unit({ id: 1, pos: ref(10, 10), health: 500, veterancy: 2 }),
+        unit({ id: 2, pos: ref(10, 30), health: 1000 }),
+        unit({ id: 3, unitType: "Transport", pos: ref(20, 20) }),
+        unit({ id: 4, unitType: "Train", trainType: 0, pos: ref(40, 20) }),
+        unit({ id: 5, unitType: "Atom Bomb", pos: ref(45, 40) }),
+      ),
+      1,
+    );
+    layer.update(frame(0, 1, 4));
+    // One health bar + two veterancy pips; the healthy warship has none.
+    expect(barInstances(ctx, "unit-status-bars")).toBe(3);
+    // Boats and trains stand on shadows; the airborne nuke has none.
+    expect(instanced(ctx, "unit-shadows").count).toBe(4);
+    // Zoomed far out the bars fade away.
+    layer.update(frame(16, 1, 0.5));
+    expect(barInstances(ctx, "unit-status-bars")).toBe(0);
+
+    // Rails: a straight N-S tile and a curve, two half-tracks each.
+    const rails = new Uint8Array(W * H);
+    rails[ref(40, 20)] = 1;
+    rails[ref(41, 20)] = 6;
+    layer.setRailroads(rails);
+    layer.update(frame(2000, 1, 4));
+    expect(instanced(ctx, "rails").count).toBe(4);
+    // Trains ride on top of the rails, above the ground.
+    const train = instanced(ctx, "units-trainEngine");
+    expect(instancePosition(train).y).toBeGreaterThan(
+      ctx.heightField.surfaceAt(40.5, 20.5),
+    );
+  });
+
+  it("maps railroad codes to the edges they join", () => {
+    const deg = (code: number) =>
+      railHalfDirections(code).map((a) => Math.round((a * 180) / Math.PI));
+    expect(deg(1)).toEqual([-90, 90]); // vertical: north + south
+    expect(deg(2)).toEqual([0, 180]); // horizontal: east + west
+    expect(deg(3)).toEqual([-90, 180]); // top-left: north + west
+    expect(deg(4)).toEqual([-90, 0]);
+    expect(deg(5)).toEqual([90, 180]);
+    expect(deg(6)).toEqual([90, 0]);
+    expect(railHalfDirections(0)).toEqual([]);
+    expect(railHalfDirections(7)).toEqual([]);
+  });
+});
+
 describe("StructureLayer", () => {
   it("instances structures per model with state-dependent scale", () => {
     const ctx = makeContext();
@@ -334,7 +436,136 @@ describe("StructureLayer", () => {
   });
 });
 
+describe("StructureLayer status", () => {
+  const rules: StructureProgressRules = {
+    deletionMarkDuration: 300,
+    samCooldown: 90,
+    siloCooldown: 90,
+    constructionDuration: () => 50,
+  };
+
+  it("computes BarPass's progress values", () => {
+    const tick = 1000;
+    expect(
+      structureProgress(unit({ id: 1, unitType: "City" }), tick, rules),
+    ).toBeNull();
+    // Deletion countdown wins over everything else.
+    expect(
+      structureProgress(
+        unit({ id: 1, unitType: "City", markedForDeletion: 1150 }),
+        tick,
+        rules,
+      ),
+    ).toBeCloseTo(0.5, 12);
+    expect(
+      structureProgress(
+        unit({
+          id: 1,
+          unitType: "City",
+          underConstruction: true,
+          constructionStartTick: 980,
+        }),
+        tick,
+        rules,
+      ),
+    ).toBeCloseTo(0.4, 12);
+    // Silo with 2 slots, one reloading for 45 of 90 ticks: (1 + 0.5) / 2.
+    expect(
+      structureProgress(
+        unit({
+          id: 1,
+          unitType: "Missile Silo",
+          level: 2,
+          missileTimerQueue: [955],
+        }),
+        tick,
+        rules,
+      ),
+    ).toBeCloseTo(0.75, 12);
+    // Fully reloaded → no bar.
+    expect(
+      structureProgress(
+        unit({ id: 1, unitType: "SAM Launcher", missileTimerQueue: [800] }),
+        tick,
+        rules,
+      ),
+    ).toBeNull();
+  });
+
+  it("draws progress bars, level labels and shadows", () => {
+    const ctx = makeContext(rulesConfig);
+    const layer = new StructureLayer(ctx);
+    disposers.push(() => layer.dispose());
+    const units = unitMap(
+      unit({ id: 1, unitType: "City", pos: ref(45, 20), level: 3 }),
+      unit({
+        id: 2,
+        unitType: "Factory",
+        pos: ref(50, 40),
+        markedForDeletion: 1100,
+      }),
+      unit({
+        id: 3,
+        unitType: "Missile Silo",
+        pos: ref(40, 50),
+        level: 2,
+        missileTimerQueue: [990],
+      }),
+      unit({ id: 4, unitType: "Defense Post", pos: ref(55, 10) }),
+    );
+    layer.updateStructures(units);
+    layer.updateStatus(units, 1000);
+    layer.update(topDownFrame(0, 8));
+    expect(barInstances(ctx, "structure-status-bars")).toBe(2);
+    expect(instanced(ctx, "structure-shadows").count).toBe(4);
+    const shown = () =>
+      [
+        ...ctx.overlayRoot.querySelectorAll<HTMLElement>(
+          ".three-structure-levels > div",
+        ),
+      ].filter((e) => e.style.display !== "none");
+    expect(
+      shown()
+        .map((e) => e.textContent)
+        .sort(),
+    ).toEqual(["2", "3"]);
+    expect(shown()[0].style.fontSize).toBe(`${levelLabelPx(8)}px`);
+
+    // A deletion mark set without updateStructures is picked up per tick.
+    const marked = new Map(units);
+    marked.set(1, { ...units.get(1)!, markedForDeletion: 1200 });
+    layer.updateStatus(marked, 1001);
+    layer.update(topDownFrame(16, 8));
+    expect(barInstances(ctx, "structure-status-bars")).toBe(3);
+
+    // Zoomed out below the icon threshold: no bars, no labels.
+    layer.update(topDownFrame(32, 1));
+    expect(barInstances(ctx, "structure-status-bars")).toBe(0);
+    expect(shown()).toHaveLength(0);
+
+    layer.dispose();
+    disposers.length = 0;
+    expect(ctx.overlayRoot.querySelector(".three-structure-levels")).toBeNull();
+  });
+
+  it("sizes level labels with the zoom", () => {
+    expect(levelLabelPx(1)).toBe(12);
+    expect(levelLabelPx(8)).toBeGreaterThan(levelLabelPx(3));
+    expect(levelLabelPx(40)).toBe(22);
+  });
+});
+
 describe("OverlayLayer", () => {
+  it("colours telegraphs like the default renderer (self / ally / enemy)", () => {
+    const [self, ally, enemy] = telegraphColors(
+      createRenderSettings().nukeTelegraph,
+    );
+    expect(self).toEqual([0, 1, 0]);
+    expect(ally[0]).toBeCloseTo(1, 6);
+    expect(ally[1]).toBeCloseTo(1, 6);
+    expect(enemy).toEqual([1, 0, 0]);
+  });
+
   it("builds telegraphs, trajectory, ghost and one-shot markers", () => {
     const ctx = makeContext();
     const layer = new OverlayLayer(ctx);

@@ -180,11 +180,16 @@ export class ThreeMapRenderer implements MapRendererLike {
         ? { renderer: gl.renderer, maxTextureSize: gl.maxTextureSize }
         : null;
 
-    this.renderer = new THREE.WebGLRenderer({
-      canvas,
-      context: gl.gl,
-      ...CONTEXT_ATTRIBUTES,
-    });
+    try {
+      this.renderer = new THREE.WebGLRenderer({
+        canvas,
+        context: gl.gl,
+        ...CONTEXT_ATTRIBUTES,
+      });
+    } catch (err) {
+      gl.gl.getExtension("WEBGL_lose_context")?.loseContext();
+      throw err;
+    }
     this.overlayRoot = createOverlayRoot(canvas);
 
     try {
@@ -248,6 +253,7 @@ export class ThreeMapRenderer implements MapRendererLike {
     } catch (err) {
       this.overlayRoot.remove();
       this.renderer.dispose();
+      this.renderer.forceContextLoss();
       throw err;
     }
 
@@ -429,6 +435,8 @@ export class ThreeMapRenderer implements MapRendererLike {
       this.lastTickMs = performance.now();
     }
     this.units.updateUnits(units, gameTick);
+    // Progress bars / deletion marks change every tick (BarPass parity).
+    this.structures.updateStatus(units, gameTick);
   }
 
   updateStructures(units: Map<number, UnitState>): void {
@@ -500,10 +508,13 @@ export class ThreeMapRenderer implements MapRendererLike {
   /** The small-player glow is not drawn by the prototype. */
   updateSmallPlayerGlow(set: Uint8Array | null): void {}
 
-  // ---- Railroads / spirals (not drawn by the prototype) ----
+  // ---- Railroads (tracks only) / spirals (not drawn by the prototype) ----
 
-  uploadRailroadState(data: Uint8Array): void {}
+  uploadRailroadState(data: Uint8Array): void {
+    this.units.setRailroads(data);
+  }
 
+  /** Construction dust and the rail colour effects are not drawn. */
   applyRailroadDust(tileRefs: number[]): void {}
 
   setLocalRailColor(r: number, g: number, b: number): void {}
@@ -544,7 +555,10 @@ export class ThreeMapRenderer implements MapRendererLike {
 
   // ---- Lifecycle ----
 
-  /** Releases GPU / DOM resources. Leaves the canvas to its owner. */
+  /**
+   * Releases GPU / DOM resources and the WebGL context itself. Leaves the
+   * canvas to its owner.
+   */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -578,7 +592,13 @@ export class ThreeMapRenderer implements MapRendererLike {
     }
     this.disposePost();
     this.palette.dispose();
+    // WebGLRenderer.dispose() only clears three's caches: the context keeps
+    // counting against the browser's WebGL context limit until it is GC'd,
+    // and the game's event listeners keep this facade reachable. Drop it
+    // explicitly, like GPURenderer.dispose(). An already-lost context is left
+    // alone (loseContext() on it is an INVALID_OPERATION).
     this.renderer.dispose();
+    if (!this.contextLost) this.renderer.forceContextLoss();
     this.overlayRoot.remove();
   }
 

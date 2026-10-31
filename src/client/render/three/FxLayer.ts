@@ -5,8 +5,9 @@
  * Triggers (same as the default FxPass, units.md §4):
  * | event                                         | effect                                        |
  * |-----------------------------------------------|-----------------------------------------------|
- * | Atom / Hydrogen / MIRV Warhead, reachedTarget | fireball, shockwave ring, ground flash, light |
- * |                                               | flash, sparks, mushroom column, base surge    |
+ * | Atom / Hydrogen / MIRV Warhead, reachedTarget | short flash, ground flash, light flash,       |
+ * |                                               | shockwave ring, embers, rising fireball and   |
+ * |                                               | a lit mushroom cloud (stem + cap), base surge |
  * | same types without reachedTarget (SAM kill)   | airborne flash ~25 tiles up, ring, sparks     |
  * | any structure                                 | small explosion + smoke                       |
  * | Warship                                       | splash, ripple, small fire + smoke            |
@@ -39,10 +40,20 @@
  * part-way through and skip those older than their lifetime). At most
  * `SPAWN_BUDGET_PER_FRAME` effects spawn per frame (a MIRV lands hundreds of
  * warheads in one tick) and a long backlog spawns reduced variants.
- * Particle colours are linear HDR: values above ~1 feed the bloom pass.
+ *
+ * Sizes: a nuke's cloud, flash and fireball scale with its visual radius
+ * (`nukeVisualRadius`: the default renderer's per-type radii, so a hydrogen
+ * bomb is ~2.3× an atom bomb and a MIRV warhead matches an atom bomb); its
+ * shockwave ring keeps the gameplay outer radius × 1.5.
+ *
+ * Particle colours are linear HDR. The bloom threshold is 1.0 (luminance),
+ * so only values above that glow: flashes and fire peak around 3-4, the
+ * young cloud and embers sit just above 1, cooled smoke stays below.
  */
 
 import * as THREE from "three";
+import { nukeExplosionRadius } from "../gl/passes/fx-pass/FxSettings";
+import type { RenderSettings } from "../gl/RenderSettings";
 import type {
   BonusEvent,
   ConquestFx,
@@ -98,6 +109,12 @@ export const SHOCKWAVE_RADIUS_FACTOR = 1.5;
 const SHOCKWAVE_MS = 1500;
 /** Height (tiles above the surface) of SAM interceptions. */
 export const INTERCEPT_ALTITUDE = 25;
+/** Mushroom-cap height as a multiple of the nuke's visual radius. */
+const NUKE_CLOUD_HEIGHT = 1.15;
+/** Mushroom-cap radius as a multiple of the nuke's visual radius. */
+const NUKE_CAP_RADIUS = 0.5;
+/** Drag (1/s) of the rising cloud: 53% of the climb after 1 s, 95% after 4. */
+const CLOUD_K = 0.75;
 
 const MAX_PENDING = 1024;
 const SPAWN_BUDGET_PER_FRAME = 12;
@@ -139,6 +156,24 @@ export function fxKindForDeadUnit(d: DeadUnitFx): FxKind | null {
 /** Gameplay outer blast radius of a nuke type (tiles), 0 if not a nuke. */
 export function nukeOuterRadius(unitType: string): number {
   return NUKE_MAGNITUDES[unitType]?.outer ?? 0;
+}
+
+/**
+ * Converts the default renderer's nuke FX radii (render-settings `fx`,
+ * 70 / 160 / 70) to the 3D effect scale: an atom bomb's visual radius then
+ * equals its gameplay outer blast radius (30 tiles).
+ */
+export const NUKE_VISUAL_SCALE = 30 / 70;
+
+/**
+ * Visual radius (tiles) of a nuke's flash / fireball / cloud, from the
+ * default renderer's per-type radii; 0 if not a nuke.
+ */
+export function nukeVisualRadius(
+  unitType: string,
+  fx: RenderSettings["fx"],
+): number {
+  return (nukeExplosionRadius(fx, unitType) ?? 0) * NUKE_VISUAL_SCALE;
 }
 
 /** When an event that happened `tickAge` ticks ago started, in frame time. */
@@ -184,7 +219,7 @@ export function shockwaveParams(
   return {
     radius: outerRadius * SHOCKWAVE_RADIUS_FACTOR,
     durationMs: SHOCKWAVE_MS,
-    color: [3.0, 2.3, 1.5],
+    color: [2.4, 1.9, 1.4],
   };
 }
 
@@ -219,12 +254,15 @@ export function dragDisplacement(t: number, k: number): number {
 
 /**
  * Alpha envelope of a particle: linear fade-in over `fadeIn` of its life,
- * then an ease-out fade (1 − v)^1.4 to zero at the end.
+ * full opacity for a further `hold` of it, then an ease-out fade
+ * (1 − v)^1.4 to zero at the end.
  */
-export function particleEnvelope(u: number, fadeIn: number): number {
+export function particleEnvelope(u: number, fadeIn: number, hold = 0): number {
   if (u <= 0 || u >= 1) return 0;
   if (fadeIn > 0 && u < fadeIn) return u / fadeIn;
-  const v = (u - fadeIn) / (1 - fadeIn);
+  const start = Math.min(0.999, fadeIn + Math.max(0, hold));
+  if (u <= start) return 1;
+  const v = (u - start) / (1 - start);
   return Math.pow(1 - v, 1.4);
 }
 
@@ -532,6 +570,8 @@ export interface ParticleSpec {
   colorTime: number;
   alpha: number;
   fadeIn: number;
+  /** Fraction of the life held at full alpha after the fade-in. */
+  hold: number;
   rot: number;
   spin: number;
   /** 0..1 flicker depth (sparkles). */
@@ -557,6 +597,7 @@ function defaultSpec(): ParticleSpec {
     colorTime: 1,
     alpha: 1,
     fadeIn: 0.05,
+    hold: 0,
     rot: 0,
     spin: 0,
     twinkle: 0,
@@ -581,7 +622,8 @@ const P_ROT = 21;
 const P_SPIN = 22;
 const P_TWINKLE = 23;
 const P_PHASE = 24;
-const P_STRIDE = 25;
+const P_HOLD = 25;
+const P_STRIDE = 26;
 
 function dynamicInstanced(
   capacity: number,
@@ -672,6 +714,7 @@ class ParticlePool {
     d[o + P_SPIN] = s.spin;
     d[o + P_TWINKLE] = s.twinkle;
     d[o + P_PHASE] = this.phase = (this.phase + 2.399) % 6.2832;
+    d[o + P_HOLD] = clamp(s.hold, 0, 0.95);
     return true;
   }
 
@@ -699,7 +742,8 @@ class ParticlePool {
       const t = age / 1000;
       const disp = dragDisplacement(t, d[o + P_DRAG]);
       const fall = 0.5 * d[o + P_GRAV] * t * t;
-      let a = d[o + P_ALPHA] * particleEnvelope(u, d[o + P_FADEIN]);
+      let a =
+        d[o + P_ALPHA] * particleEnvelope(u, d[o + P_FADEIN], d[o + P_HOLD]);
       const tw = d[o + P_TWINKLE];
       if (tw > 0) {
         a *= 1 - tw * 0.5 * (1 + Math.sin(age * 0.025 + d[o + P_PHASE]));
@@ -745,8 +789,15 @@ interface Fireball {
   radius: number;
   lifeMs: number;
   startMs: number;
-  /** Rise speed of the centre, tiles/s. */
+  /** Rise speed of the centre, tiles/s (when `riseK` is 0). */
   rise: number;
+  /**
+   * With `riseK` > 0 the centre instead climbs `riseTo` tiles with drag
+   * riseK (1/s): riseTo · (1 − e^(−riseK·t)), the same law as the cloud
+   * puffs, so a nuke's fireball stays inside its rising cap.
+   */
+  riseTo?: number;
+  riseK?: number;
   /** Centre height above `y` as a fraction of the current radius. */
   lift: number;
   intensity: number;
@@ -801,7 +852,12 @@ class FireballPool {
       if (age < 0) continue;
       const u = age / f.lifeMs;
       const r = Math.max(1e-3, f.radius * fireballRadiusFactor(u));
-      const y = f.y + r * f.lift + (f.rise * age) / 1000;
+      const rk = f.riseK ?? 0;
+      const climb =
+        rk > 0
+          ? (f.riseTo ?? 0) * rk * dragDisplacement(age / 1000, rk)
+          : (f.rise * age) / 1000;
+      const y = f.y + r * f.lift + climb;
       // Slightly squashed: a hot dome rather than a ball.
       this.matrix.makeScale(r, r * 0.85, r).setPosition(f.x, y, f.z);
       this.mesh.setMatrixAt(n, this.matrix);
@@ -1070,15 +1126,28 @@ class FlashLights {
 // Effect recipes' building blocks
 // ---------------------------------------------------------------------------
 
-/** Linear HDR colours shared by the recipes. */
-const FIRE_LIT: Rgb = [2.2, 1.0, 0.35];
-const SMOKE_GREY: Rgb = [0.13, 0.12, 0.115];
-const SPARK_HOT: Rgb = [9, 4.5, 1.2];
-const SPARK_COOL: Rgb = [2, 0.35, 0.05];
-const FLASH_WHITE: Rgb = [6, 5.5, 4.5];
-const FLASH_ORANGE: Rgb = [3, 1.2, 0.3];
-const GOLD_HOT: Rgb = [5, 3.6, 1.1];
-const GOLD_COOL: Rgb = [2.4, 1.3, 0.25];
+/**
+ * Linear HDR colours shared by the recipes. Bloom starts at luminance 1
+ * (0.21 R + 0.72 G + 0.07 B): flashes peak around 3-4, sparks / embers ~2,
+ * the young fire-lit cloud just above 1, cooled smoke and cloud below.
+ */
+const SPARK_HOT: Rgb = [3.6, 1.7, 0.5];
+const SPARK_COOL: Rgb = [1.3, 0.3, 0.05];
+const FLASH_WHITE: Rgb = [4, 3.75, 3.3];
+const FLASH_ORANGE: Rgb = [2.6, 1.3, 0.45];
+const GOLD_HOT: Rgb = [2.8, 2.0, 0.65];
+const GOLD_COOL: Rgb = [1.5, 0.85, 0.2];
+/**
+ * Mushroom cloud once the fire light has faded: sunlit cap top, shaded cap
+ * underside and stem, dusty base surge (the puff texture multiplies these
+ * by its own 0.62..1 top-lit shading).
+ */
+const CLOUD_TOP: Rgb = [0.95, 0.9, 0.82];
+const CLOUD_UNDER: Rgb = [0.52, 0.45, 0.4];
+const CLOUD_STEM: Rgb = [0.64, 0.56, 0.48];
+const CLOUD_FIRE: Rgb = [2.5, 0.85, 0.2];
+const DUST_HOT: Rgb = [1.15, 0.85, 0.55];
+const DUST: Rgb = [0.5, 0.45, 0.38];
 
 /** One camera-facing glow flash (sizes in tiles). */
 interface GlowFlashOptions {
@@ -1091,6 +1160,9 @@ interface GlowFlashOptions {
   lifeMs: number;
   color0: Rgb;
   color1: Rgb;
+  /** Peak alpha (default 1) and fade-in fraction (default 0.02). */
+  alpha?: number;
+  fadeIn?: number;
 }
 
 /** Hot sparks thrown out on ballistic arcs from one point. */
@@ -1136,6 +1208,8 @@ interface PendingFx {
   z: number;
   /** Gameplay outer blast radius for nukes. */
   outer: number;
+  /** Visual radius for nukes (`nukeVisualRadius`). */
+  visual: number;
   cosmetic: NukeExplosionRenderParams | undefined;
   tickAge: number;
   /** Assigned on the first `update` after the event arrived. */
@@ -1162,6 +1236,12 @@ export class FxLayer {
   private readonly spec = defaultSpec();
   /** Particle-count multiplier (quality × backlog). */
   private density = 1;
+  /**
+   * Flash brightness for the nukes spawning this frame: 1/√n for n
+   * simultaneous detonations, so a MIRV salvo's overlapping additive
+   * flashes do not saturate into a white-out.
+   */
+  private flashGain = 1;
   private readonly baseDensity: number;
 
   constructor(private readonly ctx: ThreeLayerContext) {
@@ -1250,6 +1330,7 @@ export class FxLayer {
       const y = (u.pos - x) / W;
       this.enqueue(kind, x + 0.5, y + 0.5, u.tickAge ?? 0, {
         outer: nukeOuterRadius(u.unitType),
+        visual: nukeVisualRadius(u.unitType, this.ctx.renderSettings.fx),
         cosmetic: u.explosion,
       });
     }
@@ -1323,7 +1404,11 @@ export class FxLayer {
     x: number,
     z: number,
     tickAge: number,
-    nuke?: { outer: number; cosmetic: NukeExplosionRenderParams | undefined },
+    nuke?: {
+      outer: number;
+      visual: number;
+      cosmetic: NukeExplosionRenderParams | undefined;
+    },
   ): void {
     if (this.pending.length >= MAX_PENDING) return;
     this.pending.push({
@@ -1331,6 +1416,7 @@ export class FxLayer {
       x,
       z,
       outer: nuke?.outer ?? 0,
+      visual: nuke?.visual ?? 0,
       cosmetic: nuke?.cosmetic,
       tickAge,
       startMs: NaN,
@@ -1355,6 +1441,9 @@ export class FxLayer {
     const pending = this.pending;
     const lite = pending.length > LITE_BACKLOG;
     this.density = this.baseDensity * (lite ? 0.35 : 1);
+    let nukes = 0;
+    for (const e of pending) if (e.kind === FxKind.Nuke) nukes++;
+    this.flashGain = 1 / Math.sqrt(clamp(nukes, 1, SPAWN_BUDGET_PER_FRAME));
     let budget = SPAWN_BUDGET_PER_FRAME;
     let w = 0;
     for (let i = 0; i < pending.length; i++) {
@@ -1430,6 +1519,7 @@ export class FxLayer {
     s.colorTime = 1;
     s.alpha = 1;
     s.fadeIn = 0.05;
+    s.hold = 0;
     s.rot = this.rnd(0, Math.PI * 2);
     s.spin = 0;
     s.twinkle = 0;
@@ -1446,7 +1536,8 @@ export class FxLayer {
     s.size1 = o.size1;
     s.color0 = o.color0;
     s.color1 = o.color1;
-    s.fadeIn = 0.02;
+    s.alpha = o.alpha ?? 1;
+    s.fadeIn = o.fadeIn ?? 0.02;
     this.glow.spawn(s, o.startMs);
   }
 
@@ -1501,176 +1592,297 @@ export class FxLayer {
   // ---- Recipes ----
 
   /**
-   * Nuke detonation, scaled by the gameplay outer radius O (atom 30,
-   * hydrogen 100, warhead 18): fireball (peak 0.42·O), shockwave ring,
-   * ground flash (1.3·O), light flash, white flash billboard, sparks and the
-   * mushroom cloud.
+   * Nuke detonation, sized by its visual radius V (atom bomb / warhead 30,
+   * hydrogen bomb ~69 tiles):
+   * - a short white-hot core flash (~0.6·V across, < 0.2 s) inside a dimmer
+   *   orange halo, a ground-flash disc (0.6·V) and a point-light flash;
+   * - the shockwave ring (gameplay outer radius × 1.5, or the cosmetic's);
+   * - embers thrown out on ballistic arcs;
+   * - a fireball (0.24·V) climbing inside the cap as it cools;
+   * - the mushroom cloud (`mushroom`).
+   * Durations stretch with √(V / 30): a hydrogen bomb lingers a little.
    */
   private spawnNuke(e: PendingFx, now: number, lite: boolean): void {
-    const O = Math.max(6, e.outer);
+    const V = Math.max(8, e.visual > 0 ? e.visual : e.outer);
     const { x, z } = e;
     const t0 = e.startMs;
     const ground = this.ctx.heightField.surfaceAt(x, z);
-    const ring = shockwaveParams(O, e.cosmetic);
+    const ring = shockwaveParams(Math.max(6, e.outer), e.cosmetic);
+    const slow = clamp(Math.sqrt(V / 30), 0.75, 1.6);
+    const flashY = ground + 0.12 * V;
 
-    this.fireballs.spawn({
+    this.glowFlash({
       x,
-      y: ground,
+      y: flashY,
       z,
-      radius: 0.42 * O,
-      lifeMs: 1200 + 8 * O,
       startMs: t0,
-      rise: 0.04 * O,
-      lift: 0.35,
-      intensity: 1,
+      size0: 0.55 * V,
+      size1: 0.75 * V,
+      lifeMs: 180 * slow,
+      color0: FLASH_WHITE,
+      color1: FLASH_ORANGE,
+      alpha: this.flashGain,
+      fadeIn: 0.1,
     });
-    this.decals.spawn({
+    this.glowFlash({
       x,
+      y: flashY,
       z,
-      y: NaN,
-      mode: DecalMode.Ring,
-      radius: ring.radius,
-      width: 0.18,
-      lifeMs: ring.durationMs,
       startMs: t0,
-      color: ring.color,
-      alpha: 1,
+      size0: 0.95 * V,
+      size1: 1.35 * V,
+      lifeMs: 340 * slow,
+      color0: [1.6, 1.2, 0.75],
+      color1: [0.9, 0.4, 0.12],
+      alpha: 0.5 * this.flashGain,
+      fadeIn: 0.08,
     });
     this.decals.spawn({
       x,
       z,
       y: NaN,
       mode: DecalMode.Disc,
-      radius: 1.3 * O,
+      radius: 0.6 * V,
       width: 0,
-      lifeMs: 700,
+      lifeMs: 450 * slow,
       startMs: t0,
-      color: [5, 3.6, 2.2],
-      alpha: 1,
+      color: [2.2, 1.6, 1.0],
+      alpha: 0.8 * this.flashGain,
     });
-    const flashY = ground + 0.3 * O;
-    // Peak candela so the irradiance ~O/2 away is a few times the sun's.
+    // Peak candela: the irradiance V/3 away is about the sun's.
     this.lights.flash(
       {
         x,
         y: flashY,
         z,
-        peak: 1.5 * O * O,
-        range: 2.5 * O,
-        lifeMs: 900,
+        peak: 0.35 * V * V,
+        range: 1.8 * V,
+        lifeMs: 650 * slow,
         startMs: t0,
       },
       now,
     );
-    this.glowFlash({
+    // Band ~7 tiles wide (16% of an atom's ring), and dimmer on very
+    // large rings (hydrogen: 150 tiles) so they do not wash out the view.
+    this.decals.spawn({
       x,
-      y: flashY,
       z,
+      y: NaN,
+      mode: DecalMode.Ring,
+      radius: ring.radius,
+      width: clamp(7 / ring.radius, 0.05, 0.16),
+      lifeMs: ring.durationMs,
       startMs: t0,
-      size0: 2.2 * O,
-      size1: 3 * O,
-      lifeMs: 450,
-      color0: FLASH_WHITE,
-      color1: FLASH_ORANGE,
+      color: ring.color,
+      alpha: 0.85 * clamp(60 / ring.radius, 0.55, 1),
     });
-    this.sparks({
-      n: this.count(clamp(Math.round(0.5 * O), 8, 32)),
+    this.fireballs.spawn({
       x,
-      y: ground + 0.1 * O,
+      y: ground,
       z,
+      radius: 0.24 * V,
+      lifeMs: 1700 * slow,
       startMs: t0,
-      speed: O,
-      size: Math.max(0.6, 0.05 * O),
-      lifeMs: 1500,
+      rise: 0,
+      riseTo: 0.85 * NUKE_CLOUD_HEIGHT * V,
+      riseK: CLOUD_K,
+      lift: 0.5,
+      intensity: 0.5,
     });
-    this.mushroom(x, ground, z, O, t0, lite);
+    this.embers(x, ground + 0.1 * V, z, V, t0, slow);
+    this.mushroom(x, ground, z, V, t0, lite);
+  }
+
+  /** Glowing embers thrown out and up from a nuke, falling back. */
+  private embers(
+    x: number,
+    y: number,
+    z: number,
+    V: number,
+    t0: number,
+    slow: number,
+  ): void {
+    const n = this.count(clamp(Math.round(0.6 * V), 10, 40));
+    const size = Math.max(0.5, 0.04 * V);
+    for (let i = 0; i < n; i++) {
+      const s = this.resetSpec();
+      const ang = this.rnd(0, Math.PI * 2);
+      const elev = this.rnd(0.6, 1.35); // launch elevation, radians
+      const v = 0.9 * V * this.rnd(0.5, 1.1);
+      s.delayMs = this.rnd(0, 120);
+      s.lifeMs = this.rnd(1300, 2300) * slow;
+      s.x = x;
+      s.y = y;
+      s.z = z;
+      s.vx = Math.cos(ang) * Math.cos(elev) * v;
+      s.vz = Math.sin(ang) * Math.cos(elev) * v;
+      s.vy = Math.sin(elev) * v;
+      s.drag = 0.9;
+      s.grav = 0.55 * V;
+      s.size0 = size;
+      s.size1 = size * 0.4;
+      s.color0 = SPARK_HOT;
+      s.color1 = SPARK_COOL;
+      s.colorTime = 0.6;
+      s.twinkle = 0.4;
+      this.glow.spawn(s, t0);
+    }
   }
 
   /**
-   * Mushroom cloud: a stem of puffs rising to ≤ 0.9·O, a cap of puffs that
-   * rise with it and spread outwards (with drag k a puff's final offset is
-   * v / k), and a ground-level base surge riding out with the shockwave.
-   * Puffs start fire-lit (HDR orange, blooms) and cool to grey.
+   * Mushroom cloud of visual radius V. Every puff leaves the burst point
+   * with velocity (target − start)·k under drag k, so it settles exactly on
+   * its target (a velocity v travels v / k) and all puffs share the same
+   * time course: the cloud grows as a whole, 53% of the way after 1 s.
+   * - stem: puffs settling at evenly spread heights up to under the cap,
+   *   flaring out near the ground;
+   * - cap: a torus of puffs at height H = 1.15·V, 0.5·V in radius — a
+   *   shaded underside ring drawn first, then a sunlit upper ring — plus a
+   *   dome on top;
+   * - base surge: dusty puffs riding out along the ground.
+   * Puffs start fire-lit (above the bloom threshold) and cool to their
+   * daylight colour within ~1.3 s, hold full opacity for ~40% of their
+   * life, then fade. `lite` (MIRV backlog) drops the dome and the surge.
    */
   private mushroom(
     x: number,
     ground: number,
     z: number,
-    O: number,
+    V: number,
     t0: number,
     lite: boolean,
   ): void {
-    const H = 0.9 * O;
-    const k = 0.8;
+    const H = NUKE_CLOUD_HEIGHT * V;
+    const k = CLOUD_K;
+    const capR = NUKE_CAP_RADIUS * V;
+    const TAU = Math.PI * 2;
+    const launch = (
+      s: ParticleSpec,
+      ang: number,
+      r0: number,
+      y0: number,
+      r1: number,
+      y1: number,
+      drag = k,
+    ) => {
+      const c = Math.cos(ang);
+      const sn = Math.sin(ang);
+      s.x = x + c * r0;
+      s.y = y0;
+      s.z = z + sn * r0;
+      s.vx = c * (r1 - r0) * drag;
+      s.vz = sn * (r1 - r0) * drag;
+      s.vy = (y1 - y0) * drag;
+      s.drag = drag;
+    };
 
-    const stem = this.count(clamp(Math.round(0.45 * O), 6, 24));
+    const stem = this.count(clamp(Math.round(0.5 * V), 8, 26));
     for (let i = 0; i < stem; i++) {
       const s = this.resetSpec();
-      s.delayMs = (i / stem) * 500;
-      s.lifeMs = this.rnd(5200, 6400);
-      s.x = x + this.rnd(-0.06, 0.06) * O;
-      s.y = ground;
-      s.z = z + this.rnd(-0.06, 0.06) * O;
-      s.vy = H * k * this.rnd(0.15, 1); // settles at 0.15..1 × H
-      s.drag = k;
-      s.size0 = 0.12 * O;
-      s.size1 = 0.28 * O;
-      s.color0 = FIRE_LIT;
-      s.color1 = SMOKE_GREY;
-      s.colorTime = 0.25;
-      s.alpha = 0.85;
-      s.spin = this.rnd(-0.2, 0.2);
+      const f = (i + 0.5) / stem; // 0 at the ground .. 1 under the cap
+      const flare = 1 + 1.6 * Math.pow(1 - f, 3);
+      launch(
+        s,
+        this.rnd(0, TAU),
+        0.02 * V,
+        ground + 0.02 * V,
+        0.07 * V * flare * this.rnd(0.3, 1),
+        ground + 0.86 * H * f,
+      );
+      s.delayMs = this.rnd(0, 120);
+      s.lifeMs = this.rnd(5200, 6200);
+      s.size0 = 0.11 * V;
+      s.size1 = (0.17 + 0.09 * flare) * V;
+      s.color0 = CLOUD_FIRE;
+      s.color1 = CLOUD_STEM;
+      s.colorTime = 0.2;
+      s.alpha = 0.92;
+      s.fadeIn = 0.04;
+      s.hold = 0.4;
+      s.spin = this.rnd(-0.15, 0.15);
       this.smoke.spawn(s, t0);
     }
 
-    const cap = this.count(clamp(Math.round(0.55 * O), 8, 28));
-    const kc = 0.75;
-    for (let i = 0; i < cap; i++) {
-      const s = this.resetSpec();
-      const ang = (i / cap) * Math.PI * 2 + this.rnd(-0.3, 0.3);
-      const out = this.rnd(0.25, 0.5) * O * kc; // settles 0.25..0.5·O out
-      s.delayMs = this.rnd(150, 450);
-      s.lifeMs = this.rnd(5400, 6500);
-      s.x = x + Math.cos(ang) * 0.1 * O;
-      s.y = ground + 0.15 * O;
-      s.z = z + Math.sin(ang) * 0.1 * O;
-      s.vx = Math.cos(ang) * out;
-      s.vz = Math.sin(ang) * out;
-      s.vy = H * kc * this.rnd(0.95, 1.1);
-      s.drag = kc;
-      s.size0 = 0.2 * O;
-      s.size1 = 0.45 * O;
-      s.color0 = FIRE_LIT;
-      s.color1 = SMOKE_GREY;
-      s.colorTime = 0.35;
-      s.alpha = 0.85;
-      s.spin = this.rnd(-0.2, 0.2);
-      this.smoke.spawn(s, t0);
+    const cap = this.count(clamp(Math.round(0.9 * V), 12, 44));
+    for (const upper of [false, true]) {
+      const n = Math.max(4, Math.round(cap / 2));
+      for (let i = 0; i < n; i++) {
+        const s = this.resetSpec();
+        const ang = ((i + (upper ? 0.5 : 0)) / n) * TAU + this.rnd(-0.2, 0.2);
+        const y1 = upper
+          ? H + 0.06 * V * this.rnd(0.5, 1.4)
+          : H - 0.06 * V * this.rnd(0.3, 1.2);
+        launch(
+          s,
+          ang,
+          0.05 * V,
+          ground + 0.08 * V,
+          capR * this.rnd(upper ? 0.45 : 0.6, 1),
+          ground + y1,
+        );
+        s.delayMs = this.rnd(60, 220);
+        s.lifeMs = this.rnd(5600, 6600);
+        s.size0 = 0.16 * V;
+        s.size1 = 0.4 * V * this.rnd(0.85, 1.15);
+        s.color0 = CLOUD_FIRE;
+        s.color1 = upper ? CLOUD_TOP : CLOUD_UNDER;
+        s.colorTime = upper ? 0.16 : 0.24;
+        s.alpha = 0.92;
+        s.fadeIn = 0.04;
+        s.hold = 0.42;
+        s.spin = this.rnd(-0.15, 0.15);
+        this.smoke.spawn(s, t0);
+      }
     }
-
     if (lite) return;
-    const surge = this.count(clamp(Math.round(0.45 * O), 8, 22));
-    const kd = 1.2;
+
+    const dome = this.count(clamp(Math.round(0.25 * V), 4, 14));
+    for (let i = 0; i < dome; i++) {
+      const s = this.resetSpec();
+      launch(
+        s,
+        this.rnd(0, TAU),
+        0.03 * V,
+        ground + 0.1 * V,
+        capR * this.rnd(0, 0.45),
+        ground + H + 0.12 * V * this.rnd(0.6, 1.2),
+      );
+      s.delayMs = this.rnd(120, 260);
+      s.lifeMs = this.rnd(5600, 6600);
+      s.size0 = 0.18 * V;
+      s.size1 = 0.42 * V;
+      s.color0 = CLOUD_FIRE;
+      s.color1 = CLOUD_TOP;
+      s.colorTime = 0.16;
+      s.alpha = 0.92;
+      s.fadeIn = 0.04;
+      s.hold = 0.42;
+      s.spin = this.rnd(-0.15, 0.15);
+      this.smoke.spawn(s, t0);
+    }
+
+    const surge = this.count(clamp(Math.round(0.5 * V), 8, 24));
     for (let i = 0; i < surge; i++) {
       const s = this.resetSpec();
-      const ang = (i / surge) * Math.PI * 2 + this.rnd(-0.2, 0.2);
-      const out = 1.1 * O * kd * this.rnd(0.8, 1.05); // settles ~1.1·O out
+      launch(
+        s,
+        (i / surge) * TAU + this.rnd(-0.2, 0.2),
+        0.15 * V,
+        ground + 0.03 * V,
+        0.95 * V * this.rnd(0.8, 1.05),
+        ground + 0.07 * V,
+        1.3,
+      );
       s.delayMs = this.rnd(0, 120);
       s.lifeMs = this.rnd(3200, 4200);
-      s.x = x + Math.cos(ang) * 0.2 * O;
-      s.y = ground + 0.03 * O;
-      s.z = z + Math.sin(ang) * 0.2 * O;
-      s.vx = Math.cos(ang) * out;
-      s.vz = Math.sin(ang) * out;
-      s.vy = 0.05 * O * kd;
-      s.drag = kd;
-      s.size0 = 0.15 * O;
-      s.size1 = 0.35 * O;
-      s.color0 = [1.2, 0.8, 0.5];
-      s.color1 = [0.28, 0.25, 0.22];
+      s.size0 = 0.14 * V;
+      s.size1 = 0.3 * V;
+      s.color0 = DUST_HOT;
+      s.color1 = DUST;
       s.colorTime = 0.3;
-      s.alpha = 0.55;
+      s.alpha = 0.45;
       s.fadeIn = 0.08;
+      s.hold = 0.2;
       s.spin = this.rnd(-0.3, 0.3);
       this.smoke.spawn(s, t0);
     }
@@ -1686,11 +1898,11 @@ export class FxLayer {
       y,
       z,
       startMs: t0,
-      size0: 10,
-      size1: 16,
-      lifeMs: 380,
-      color0: [6, 5, 4],
-      color1: [3, 1, 0.3],
+      size0: 8,
+      size1: 12,
+      lifeMs: 300,
+      color0: [3.6, 3.2, 2.6],
+      color1: [2.2, 0.9, 0.3],
     });
     this.fireballs.spawn({
       x,
@@ -1701,7 +1913,7 @@ export class FxLayer {
       startMs: t0,
       rise: 0,
       lift: 0,
-      intensity: 1,
+      intensity: 0.55,
     });
     this.decals.spawn({
       x,
@@ -1712,11 +1924,11 @@ export class FxLayer {
       width: 0.25,
       lifeMs: 700,
       startMs: t0,
-      color: [2.2, 1.8, 1.3],
+      color: [1.8, 1.5, 1.15],
       alpha: 0.9,
     });
     this.lights.flash(
-      { x, y, z, peak: 300, range: 40, lifeMs: 500, startMs: t0 },
+      { x, y, z, peak: 160, range: 36, lifeMs: 450, startMs: t0 },
       now,
     );
     this.sparks({
@@ -1765,18 +1977,18 @@ export class FxLayer {
       startMs: t0,
       rise: radius * 0.3,
       lift: 0.35,
-      intensity: 1,
+      intensity: 0.6,
     });
     this.glowFlash({
       x,
       y: ground + radius * 0.5,
       z,
       startMs: t0,
-      size0: radius * 2,
-      size1: radius * 3,
-      lifeMs: 280,
-      color0: [5, 3.5, 2],
-      color1: [2.5, 0.8, 0.2],
+      size0: radius * 1.6,
+      size1: radius * 2.4,
+      lifeMs: 260,
+      color0: [3.2, 2.3, 1.3],
+      color1: [2.0, 0.7, 0.2],
     });
     this.decals.spawn({
       x,
@@ -1787,8 +1999,8 @@ export class FxLayer {
       width: 0,
       lifeMs: 350,
       startMs: t0,
-      color: [3, 2, 1.2],
-      alpha: 0.9,
+      color: [2.0, 1.4, 0.8],
+      alpha: 0.85,
     });
     this.lights.flash(
       {
@@ -1850,8 +2062,8 @@ export class FxLayer {
       s.grav = 16;
       s.size0 = 1;
       s.size1 = 2.4;
-      s.color0 = [1.4, 1.5, 1.6];
-      s.color1 = [0.9, 0.95, 1];
+      s.color0 = [1.15, 1.2, 1.25];
+      s.color1 = [0.85, 0.9, 0.95];
       s.alpha = 0.85;
       this.smoke.spawn(s, t0);
     }
@@ -1876,7 +2088,7 @@ export class FxLayer {
       startMs: t0,
       rise: 0.5,
       lift: 0.3,
-      intensity: 0.8,
+      intensity: 0.5,
     });
     this.lights.flash(
       { x, y: ground + 2, z, peak: 40, range: 14, lifeMs: 350, startMs: t0 },
@@ -1908,11 +2120,11 @@ export class FxLayer {
       y,
       z,
       startMs: t0,
-      size0: 2.2,
-      size1: 3.2,
+      size0: 2.0,
+      size1: 3.0,
       lifeMs: 220,
-      color0: [6, 4, 1.6],
-      color1: [2.5, 0.8, 0.2],
+      color0: [3.2, 2.2, 0.9],
+      color1: [1.8, 0.6, 0.15],
     });
     this.sparks({
       n: this.count(3),
@@ -1968,8 +2180,8 @@ export class FxLayer {
         width: 0,
         lifeMs: 700,
         startMs: t0,
-        color: [2.2, 1.6, 0.5],
-        alpha: 0.8,
+        color: [1.8, 1.3, 0.45],
+        alpha: 0.75,
       });
     }
   }

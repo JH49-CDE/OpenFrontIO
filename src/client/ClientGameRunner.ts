@@ -668,7 +668,9 @@ function mountWebGLFrameLoop(
   // animated chevron pass at the target tile. The renderer needs the target's
   // tile x/y and the warship's owner smallID (so the chevrons use the right
   // color).
-  eventBus.on(MoveWarshipIntentEvent, (e) => {
+  // Named so stopFrameLoop can unregister it: the bus outlives the game, and
+  // a stale listener would keep firing into this game's disposed view.
+  const onMoveWarship = (e: MoveWarshipIntentEvent): void => {
     const tile = e.tile;
     const tx = gameView.x(tile);
     const ty = gameView.y(tile);
@@ -676,7 +678,8 @@ function mountWebGLFrameLoop(
     const firstUnit = gameView.unit(e.unitIds[0]);
     if (firstUnit === undefined) return;
     view.showMoveIndicator(tx, ty, firstUnit.owner().smallID());
-  });
+  };
+  eventBus.on(MoveWarshipIntentEvent, onMoveWarship);
 
   // Self-driving RAF: syncCamera reads the latest camera state from
   // TransformHandler, pushes it to WebGL, and synchronously invokes the
@@ -717,6 +720,7 @@ function mountWebGLFrameLoop(
       rafId = null;
     }
     resizeObs.disconnect();
+    eventBus.off(MoveWarshipIntentEvent, onMoveWarship);
     transformHandler.projector = null;
   };
 
@@ -975,6 +979,9 @@ async function createClientGame(
       view.dispose();
       glCanvas.remove();
       inputOverlay.remove();
+      // Drop the debugging handle unless a newer game already replaced it.
+      const debugHandle = window as unknown as { __webglView?: unknown };
+      if (debugHandle.__webglView === view) delete debugHandle.__webglView;
     };
 
     console.log(

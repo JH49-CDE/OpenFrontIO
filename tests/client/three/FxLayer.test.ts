@@ -15,7 +15,9 @@ import {
   isEffectExpired,
   lightFlashFactor,
   mulberry32,
+  NUKE_VISUAL_SCALE,
   nukeOuterRadius,
+  nukeVisualRadius,
   particleEnvelope,
   shockwaveAlpha,
   shockwaveParams,
@@ -70,6 +72,25 @@ describe("dead unit → effect", () => {
     expect(shockwaveParams(30, undefined).radius).toBe(45);
     expect(shockwaveParams(100, undefined).radius).toBe(150);
     expect(shockwaveParams(18, undefined).durationMs).toBe(1500);
+  });
+
+  it("sizes the cloud like the default renderer's per-type radii", () => {
+    const fx = createRenderSettings().fx;
+    // Atom bomb: visual radius = its gameplay outer radius.
+    expect(nukeVisualRadius("Atom Bomb", fx)).toBeCloseTo(30, 9);
+    expect(nukeVisualRadius("Hydrogen Bomb", fx)).toBeCloseTo(
+      fx.nukeRadiusHydro * NUKE_VISUAL_SCALE,
+      9,
+    );
+    expect(
+      nukeVisualRadius("Hydrogen Bomb", fx) / nukeVisualRadius("Atom Bomb", fx),
+    ).toBeCloseTo(fx.nukeRadiusHydro / fx.nukeRadiusAtom, 9);
+    expect(nukeVisualRadius("MIRV Warhead", fx)).toBeCloseTo(
+      fx.nukeRadiusMirv * NUKE_VISUAL_SCALE,
+      9,
+    );
+    expect(nukeVisualRadius("MIRV", fx)).toBe(0);
+    expect(nukeVisualRadius("City", fx)).toBe(0);
   });
 
   it("lets a nuke-explosion cosmetic override the ring", () => {
@@ -142,6 +163,20 @@ describe("curves", () => {
       expect(v).toBeGreaterThanOrEqual(0);
       expect(v).toBeLessThanOrEqual(1);
     }
+  });
+
+  it("particle envelope holds full opacity for `hold` of the life", () => {
+    expect(particleEnvelope(0.02, 0.04, 0.4)).toBeCloseTo(0.5, 12);
+    for (const u of [0.04, 0.2, 0.44]) {
+      expect(particleEnvelope(u, 0.04, 0.4)).toBe(1);
+    }
+    expect(particleEnvelope(0.5, 0.04, 0.4)).toBeLessThan(1);
+    expect(particleEnvelope(0.5, 0.04, 0.4)).toBeGreaterThan(
+      particleEnvelope(0.5, 0.04),
+    );
+    expect(particleEnvelope(1, 0.04, 0.4)).toBe(0);
+    // hold = 0 is the plain envelope.
+    expect(particleEnvelope(0.6, 0.1, 0)).toBe(particleEnvelope(0.6, 0.1));
   });
 
   it("fireball expands fast, swells slowly and cools to black", () => {
@@ -281,6 +316,26 @@ describe("FxLayer", () => {
 
     fx.dispose();
     expect(ctx.scene.getObjectByName("fx")).toBeUndefined();
+  });
+
+  it("keeps a nuke's flash short and its cloud rising", () => {
+    const ctx = makeCtx();
+    const fx = new FxLayer(ctx);
+    fx.applyDeadUnits([dead("Hydrogen Bomb", true, 120 * MAP_W + 200)]);
+    fx.update(frame(1000));
+    const early = fx.stats();
+    // 400 ms in: both flash billboards are over, embers and cloud remain.
+    fx.update(frame(1400));
+    const later = fx.stats();
+    expect(later.glow).toBeLessThan(early.glow);
+    expect(later.glow).toBeGreaterThan(0);
+    expect(later.smoke).toBe(early.smoke);
+    // The cloud outlives the fireball and the shockwave.
+    fx.update(frame(1000 + 4500));
+    const late = fx.stats();
+    expect(late.fireballs).toBe(0);
+    expect(late.smoke).toBeGreaterThan(0);
+    fx.dispose();
   });
 
   it("skips events older than their lifetime and ignores silent units", () => {

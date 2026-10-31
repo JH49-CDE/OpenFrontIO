@@ -1,11 +1,14 @@
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
 import {
+  BlobShadows,
+  createRailPieceGeometry,
   createStructureGeometry,
   createUnitGeometry,
   InstancedBatch,
   nextCapacity,
   setOwnerColor,
+  shadowOffset,
   STRUCTURE_FOOTPRINT,
   structureVariant,
   UNIT_MESH_LENGTH,
@@ -163,5 +166,53 @@ describe("setOwnerColor", () => {
     const unknown = setOwnerColor(new THREE.Color(), palette, 99);
     expect(unknown.r).toBeGreaterThan(0.2);
     expect(unknown.r).toBeCloseTo(unknown.b);
+  });
+});
+
+describe("rail pieces and shadows", () => {
+  it("builds a half-track from the tile centre to its edge", () => {
+    const g = createRailPieceGeometry();
+    expectPartAttributes(g);
+    g.computeBoundingBox();
+    const box = g.boundingBox!;
+    expect(box.min.x).toBeCloseTo(0, 1);
+    expect(box.max.x).toBeCloseTo(0.5, 1);
+    // Flat on the ground, narrower than a tile.
+    expect(box.max.y).toBeLessThanOrEqual(0.1 + 1e-6);
+    expect(box.max.z - box.min.z).toBeLessThan(0.6);
+    g.dispose();
+  });
+
+  it("shifts shadows away from the north-west sun", () => {
+    const [x, z] = shadowOffset(2);
+    expect(x).toBeGreaterThan(0); // east
+    expect(z).toBeGreaterThan(0); // south
+    expect(x / 2).toBeCloseTo(0.5 / 0.8, 12);
+    expect(z / 2).toBeCloseTo(0.35 / 0.8, 12);
+  });
+
+  it("instances blob shadows with per-instance opacity", () => {
+    const parent = new THREE.Group();
+    const shadows = new BlobShadows(parent, "shadows");
+    shadows.begin();
+    shadows.push(1, 0, 2, 4, 2, 0, 0.4);
+    shadows.push(5, 1, 6, 3, 3, Math.PI / 2, 0.3);
+    shadows.end();
+    expect(shadows.count).toBe(2);
+    const mesh = parent.getObjectByName("shadows") as THREE.InstancedMesh;
+    expect(mesh.count).toBe(2);
+    expect(mesh.geometry.getAttribute("iShade").getX(1)).toBeCloseTo(0.3, 6);
+    const m = new THREE.Matrix4();
+    mesh.getMatrixAt(0, m);
+    const p = new THREE.Vector3();
+    const q = new THREE.Quaternion();
+    const sc = new THREE.Vector3();
+    m.decompose(p, q, sc);
+    // The template is 2×2: scale = half the requested size.
+    expect([p.x, p.y, p.z]).toEqual([1, 0, 2]);
+    expect(sc.x).toBeCloseTo(2, 6);
+    expect(sc.z).toBeCloseTo(1, 6);
+    shadows.dispose();
+    expect(parent.children).toHaveLength(0);
   });
 });

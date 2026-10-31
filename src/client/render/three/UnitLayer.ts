@@ -20,13 +20,24 @@
  *   `nukeAltitude`) pitched along their 3D velocity and leave a glowing
  *   additive ribbon trail.
  * - Every model is scaled up to at least `settings.unitMinScreenPx` CSS px.
+ * - Boats and trains get a soft contact shadow (`BlobShadows`), shifted
+ *   away from the sun.
+ * - Warships show the default renderer's health bar (when damaged) and
+ *   veterancy pips (`StatusBars`), selected ones a glowing owner ring.
+ * - Railways (`RailTracks`) are drawn from the railroad tile state so
+ *   trains run on visible tracks; trains ride on top of the rails.
  *
  * Contract notes:
  * - `updateUnits` runs once per sim tick with the FULL unit map (structures
  *   included; skip `!isActive` and `waitTicks > 0`).
+ * - `setRailroads` receives the long-lived per-tile railroad state (0 = no
+ *   rail, else rail type + 1, see RailroadCache) whenever it changed.
  * - `setSelectedUnits([])` clears the selection.
  */
 
+import { UnitType } from "@openfront/engine-api/game/GameTypes";
+import type { Config } from "@openfront/engine-lib/configuration/Config";
+import { maxHealthWithVeterancy } from "@openfront/engine-lib/game/Veterancy";
 import * as THREE from "three";
 import {
   TrainType,
@@ -43,15 +54,20 @@ import {
   type UnitState,
 } from "../types";
 import { smoothstep } from "./CameraRig";
+import type { HeightField } from "./HeightField";
 import {
+  BlobShadows,
   createPartMaterial,
+  createRailPieceGeometry,
   createUnitGeometry,
   InstancedBatch,
   nextCapacity,
   setOwnerColor,
+  shadowOffset,
   UNIT_MESH_LENGTH,
   type UnitMeshKind,
 } from "./ProceduralMeshes";
+import { barSize, StatusBars } from "./StatusBars";
 import type { FrameInfo, ThreeLayerContext } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -189,6 +205,71 @@ export function nukeAltitude(
   }
 }
 
+/** Warship max health and veterancy bonus (%) from the rules config. */
+export interface WarshipHealthRules {
+  baseMaxHealth: number;
+  veterancyBonusPercent: number;
+}
+
+/** Reads `WarshipHealthRules`; zeros (no health bars) if the config lacks them. */
+export function warshipHealthRules(config: Config): WarshipHealthRules {
+  try {
+    return {
+      baseMaxHealth: config.unitInfo(UnitType.Warship).maxHealth ?? 0,
+      veterancyBonusPercent: config.warshipVeterancyHealthBonus(),
+    };
+  } catch {
+    return { baseMaxHealth: 0, veterancyBonusPercent: 0 };
+  }
+}
+
+/**
+ * Health bar fill of a unit, or null when no bar is shown: like BarPass,
+ * only damaged units (health below the veterancy-adjusted max) get one.
+ */
+export function healthBarValue(
+  health: number | null,
+  veterancy: number,
+  rules: WarshipHealthRules,
+): number | null {
+  if (health === null || health <= 0 || rules.baseMaxHealth <= 0) return null;
+  const max = maxHealthWithVeterancy(
+    rules.baseMaxHealth,
+    veterancy,
+    rules.veterancyBonusPercent,
+  );
+  return health < max ? health / max : null;
+}
+
+/**
+ * Tile-space directions (radians: 0 east, π/2 south) of the half-tracks of
+ * a railroad tile code (RailroadCache: rail type + 1): 1 vertical, 2
+ * horizontal, 3 top-left, 4 top-right, 5 bottom-left, 6 bottom-right
+ * (a curve joins the two named edges). Unknown codes have none.
+ */
+export function railHalfDirections(code: number): readonly number[] {
+  const E = 0;
+  const S = Math.PI / 2;
+  const Wd = Math.PI;
+  const N = -Math.PI / 2;
+  switch (code) {
+    case 1:
+      return [N, S];
+    case 2:
+      return [E, Wd];
+    case 3:
+      return [N, Wd];
+    case 4:
+      return [N, E];
+    case 5:
+      return [S, Wd];
+    case 6:
+      return [S, E];
+    default:
+      return [];
+  }
+}
+
 /** Interpolation weight for a tick segment (see the file comment). */
 export function tickEase(alpha: number, continuous: boolean): number {
   const a = Math.min(1, Math.max(0, alpha));
@@ -220,17 +301,37 @@ interface KindInfo {
   trail?: TrailStyle;
   /** Boat bob amplitude (tiles), roll and pitch amplitudes (radians). */
   bob?: readonly [number, number, number];
+  /**
+   * Contact shadow: (length, width) as fractions of the model length, the
+   * casting height (fraction of the length) and the opacity.
+   */
+  shadow?: readonly [number, number, number, number];
 }
 
 const WARM_TRAIL = [1.7, 1.0, 0.45] as const;
 
 const KIND_INFO: Readonly<Record<UnitMeshKind, KindInfo>> = {
-  transport: { motion: "boat", tauMs: 160, bob: [0.05, 0.06, 0.025] },
-  tradeShip: { motion: "boat", tauMs: 200, bob: [0.04, 0.05, 0.02] },
-  warship: { motion: "boat", tauMs: 220, bob: [0.03, 0.03, 0.012] },
-  trainEngine: { motion: "train", tauMs: 90 },
-  trainCarriage: { motion: "train", tauMs: 90 },
-  trainLoaded: { motion: "train", tauMs: 90 },
+  transport: {
+    motion: "boat",
+    tauMs: 160,
+    bob: [0.05, 0.06, 0.025],
+    shadow: [1.08, 0.52, 0.12, 0.42],
+  },
+  tradeShip: {
+    motion: "boat",
+    tauMs: 200,
+    bob: [0.04, 0.05, 0.02],
+    shadow: [1.06, 0.44, 0.12, 0.42],
+  },
+  warship: {
+    motion: "boat",
+    tauMs: 220,
+    bob: [0.03, 0.03, 0.012],
+    shadow: [1.04, 0.32, 0.1, 0.45],
+  },
+  trainEngine: { motion: "train", tauMs: 90, shadow: [1.2, 0.6, 0.3, 0.5] },
+  trainCarriage: { motion: "train", tauMs: 90, shadow: [1.2, 0.6, 0.3, 0.5] },
+  trainLoaded: { motion: "train", tauMs: 90, shadow: [1.2, 0.6, 0.3, 0.5] },
   atomBomb: {
     motion: "nuke",
     tauMs: 110,
@@ -300,6 +401,19 @@ const TELEPORT_TILES = 60;
 const UNIT_LIGHTEN = 0.12;
 /** Lighten selection rings like the default renderer's selection boxes. */
 const SELECTION_LIGHTEN = 0.3;
+/**
+ * HDR gain of selection rings: lifts their luminance just over the bloom
+ * threshold (1) so they glow softly; pulses ±15%.
+ */
+const SELECTION_GLOW = 1.7;
+/** Shadows sit this far above the water / ground (tiles). */
+const SHADOW_LIFT = 0.06;
+/** Height of the rail heads above the ground; trains ride on them. */
+const RAIL_TOP = 0.1;
+/** Minimum time between two rebuilds of the railway instances. */
+const RAIL_REBUILD_MS = 750;
+/** Health bars / pips fade in between these zooms (CSS px per tile). */
+const BAR_FADE_ZOOM: readonly [number, number] = [0.8, 1.2];
 /** Height of shells above the surface, tiles. */
 const SHELL_ALTITUDE = 0.9;
 
@@ -335,6 +449,8 @@ interface UnitTrack {
   stamp: number;
   targetable: boolean;
   targetUnitId: number | null;
+  health: number | null;
+  veterancy: number;
   /** Nukes / SAMs: first-seen ground position (launch origin). */
   originX: number;
   originY: number;
@@ -607,13 +723,98 @@ class TrailRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// Railways
+// ---------------------------------------------------------------------------
+
+/**
+ * Every railroad tile as instanced half-tracks (one draw call), draped on
+ * the relief and pitched along its slope. Rebuilt from the full tile state
+ * when it changed (or the terrain did), at most every RAIL_REBUILD_MS: a
+ * scan of the W×H state plus two instances per rail tile.
+ */
+class RailTracks {
+  private readonly geometry = createRailPieceGeometry();
+  private readonly batch: InstancedBatch;
+  private state: Uint8Array | null = null;
+  private dirty = false;
+  private lastBuildMs = -Infinity;
+  private heightVersion = -1;
+  private readonly m = new THREE.Matrix4();
+  private readonly q = new THREE.Quaternion();
+  private readonly e = new THREE.Euler(0, 0, 0, "YZX");
+  private readonly p = new THREE.Vector3();
+  private readonly one = new THREE.Vector3(1, 1, 1);
+  private readonly white = new THREE.Color(1, 1, 1);
+
+  constructor(
+    parent: THREE.Object3D,
+    material: THREE.Material,
+    private readonly hf: HeightField,
+    private readonly mapW: number,
+  ) {
+    this.batch = new InstancedBatch(
+      parent,
+      this.geometry,
+      material,
+      "rails",
+      256,
+    );
+  }
+
+  get count(): number {
+    return this.batch.count;
+  }
+
+  set(state: Uint8Array): void {
+    this.state = state;
+    this.dirty = true;
+  }
+
+  update(nowMs: number): void {
+    if (this.hf.version !== this.heightVersion) {
+      this.heightVersion = this.hf.version;
+      this.dirty = this.state !== null;
+    }
+    if (!this.dirty || this.state === null) return;
+    if (nowMs - this.lastBuildMs < RAIL_REBUILD_MS) return;
+    this.dirty = false;
+    this.lastBuildMs = nowMs;
+    const st = this.state;
+    const W = this.mapW;
+    const hf = this.hf;
+    this.batch.begin();
+    for (let i = 0; i < st.length; i++) {
+      const code = st[i];
+      if (code === 0) continue;
+      const x = (i % W) + 0.5;
+      const z = Math.floor(i / W) + 0.5;
+      const h = hf.surfaceAt(x, z);
+      for (const a of railHalfDirections(code)) {
+        const he = hf.surfaceAt(x + 0.5 * Math.cos(a), z + 0.5 * Math.sin(a));
+        this.p.set(x, h, z);
+        this.e.set(0, -a, Math.atan2(he - h, 0.5), "YZX");
+        this.q.setFromEuler(this.e);
+        this.m.compose(this.p, this.q, this.one);
+        this.batch.push(this.m, this.white);
+      }
+    }
+    this.batch.end();
+  }
+
+  dispose(): void {
+    this.batch.dispose();
+    this.geometry.dispose();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Layer
 // ---------------------------------------------------------------------------
 
 export class UnitLayer {
   private readonly group = new THREE.Group();
   /** Shared emissive strength of all unit parts (flickers a little). */
-  private readonly glow = { value: 2.2 };
+  private readonly glow = { value: 1 };
   private readonly material: THREE.MeshStandardMaterial;
   private readonly templates = new Map<UnitMeshKind, THREE.BufferGeometry>();
   private readonly batches = new Map<UnitMeshKind, InstancedBatch>();
@@ -624,6 +825,10 @@ export class UnitLayer {
   private readonly ringMaterial: THREE.MeshBasicMaterial;
   private readonly rings: InstancedBatch;
   private selected: ReadonlySet<number> = new Set();
+  private readonly shadows: BlobShadows;
+  private readonly bars: StatusBars;
+  private readonly healthRules: WarshipHealthRules;
+  private readonly rails: RailTracks;
 
   private lastTick = Number.NaN;
   private stamp = 0;
@@ -643,9 +848,22 @@ export class UnitLayer {
     ctx.scene.add(this.group);
     this.material = createPartMaterial({ glow: this.glow });
     this.trails = new TrailRenderer(this.group);
+    this.shadows = new BlobShadows(this.group, "unit-shadows");
+    this.bars = new StatusBars(
+      this.group,
+      ctx.renderSettings.bar,
+      "unit-status-bars",
+    );
+    this.healthRules = warshipHealthRules(ctx.config);
+    this.rails = new RailTracks(
+      this.group,
+      this.material,
+      ctx.heightField,
+      ctx.mapWidth,
+    );
 
     // Selection ring: a flat annulus facing up, drawn over everything.
-    this.ringTemplate = new THREE.RingGeometry(0.86, 1, 48).rotateX(
+    this.ringTemplate = new THREE.RingGeometry(0.82, 1, 48).rotateX(
       -Math.PI / 2,
     );
     this.ringMaterial = new THREE.MeshBasicMaterial({
@@ -709,6 +927,8 @@ export class UnitLayer {
       tr.stamp = stamp;
       tr.targetable = u.targetable;
       tr.targetUnitId = u.targetUnitId;
+      tr.health = u.health;
+      tr.veterancy = u.veterancy;
       if (u.targetTile !== null) {
         tr.targetX = (u.targetTile % W) + 0.5;
         tr.targetY = Math.floor(u.targetTile / W) + 0.5;
@@ -726,6 +946,11 @@ export class UnitLayer {
     this.selected = new Set(ids);
   }
 
+  /** Railroad tile state changed (see the file comment). */
+  setRailroads(state: Uint8Array): void {
+    this.rails.set(state);
+  }
+
   update(frame: FrameInfo): void {
     const now = frame.nowMs;
     this.lastNowMs = now;
@@ -733,10 +958,14 @@ export class UnitLayer {
     const zoom = frame.cssPxPerTile;
     const minPx = this.ctx.settings.unitMinScreenPx;
     const hf = this.ctx.heightField;
-    this.glow.value = 2.2 + 0.25 * Math.sin(t * 23) + 0.15 * Math.sin(t * 37);
+    this.glow.value = 1 + 0.1 * Math.sin(t * 23) + 0.07 * Math.sin(t * 37);
+    const barFade = smoothstep(BAR_FADE_ZOOM[0], BAR_FADE_ZOOM[1], zoom);
+    const pulse = 1 + 0.15 * Math.sin(t * 4);
 
     for (const b of this.batches.values()) b.begin();
     this.rings.begin();
+    this.shadows.begin();
+    this.bars.begin(frame, barFade);
 
     for (const tr of this.tracks.values()) {
       const info = KIND_INFO[tr.kind];
@@ -782,7 +1011,7 @@ export class UnitLayer {
         case "train": {
           const ch = Math.cos(tr.heading) * 0.8;
           const sh = Math.sin(tr.heading) * 0.8;
-          wy = hf.surfaceAt(x, y);
+          wy = hf.surfaceAt(x, y) + RAIL_TOP;
           pitch = Math.atan2(
             hf.surfaceAt(x + ch, y + sh) - hf.surfaceAt(x - ch, y - sh),
             1.6,
@@ -859,6 +1088,25 @@ export class UnitLayer {
         );
       }
 
+      if (info.shadow !== undefined) {
+        const [sl, sw, sh, sa] = info.shadow;
+        const [ox, oz] = shadowOffset(sh * len * scale);
+        const base = info.motion === "boat" ? 0 : wy;
+        this.shadows.push(
+          x + ox,
+          base + SHADOW_LIFT,
+          y + oz,
+          sl * len * scale,
+          sw * len * scale,
+          yaw,
+          sa,
+        );
+      }
+
+      if (barFade > 0 && tr.kind === "warship") {
+        this.pushWarshipBars(tr, x, wy, y, len * scale * zoom);
+      }
+
       if (this.selected.has(tr.id)) {
         const r = 0.62 * len * scale * (1 + 0.04 * Math.sin(t * 4));
         this.p.set(x, Math.max(0, wy) + 0.15, y);
@@ -871,13 +1119,42 @@ export class UnitLayer {
           tr.owner,
           SELECTION_LIGHTEN,
         );
+        this.c.multiplyScalar(SELECTION_GLOW * pulse);
         this.rings.push(this.m, this.c);
       }
     }
 
     for (const b of this.batches.values()) b.end();
     this.rings.end();
+    this.shadows.end();
+    this.bars.end();
     this.trails.update(now);
+    this.rails.update(now);
+  }
+
+  /**
+   * Health bar (when damaged) and veterancy pips above a warship whose
+   * model is `lengthPx` CSS px long: the bar is half that (20..70 px), the
+   * gold pips stack upwards at its right end.
+   */
+  private pushWarshipBars(
+    tr: UnitTrack,
+    x: number,
+    wy: number,
+    y: number,
+    lengthPx: number,
+  ): void {
+    const value = healthBarValue(tr.health, tr.veterancy, this.healthRules);
+    if (value === null && tr.veterancy <= 0) return;
+    const { w, h } = barSize(lengthPx, 0.5, 20, 70);
+    const dy = Math.min(36, Math.max(10, 0.2 * lengthPx));
+    const top = wy + 0.6;
+    if (value !== null) this.bars.bar(x, top, y, 0, dy, w, h, value);
+    const pipH = Math.max(2, Math.round(h * 0.45));
+    for (let k = 0; k < Math.min(tr.veterancy, 5); k++) {
+      const py = dy - h / 2 + pipH / 2 + k * (pipH + 1);
+      this.bars.pip(x, top, y, w / 2 + 2 + h / 2, py, h + 1, pipH);
+    }
   }
 
   dispose(): void {
@@ -888,6 +1165,9 @@ export class UnitLayer {
     this.rings.dispose();
     this.ringTemplate.dispose();
     this.ringMaterial.dispose();
+    this.shadows.dispose();
+    this.bars.dispose();
+    this.rails.dispose();
     this.trails.dispose();
     this.material.dispose();
     this.tracks.clear();
@@ -941,6 +1221,8 @@ export class UnitLayer {
       stamp: 0,
       targetable: u.targetable,
       targetUnitId: u.targetUnitId,
+      health: u.health,
+      veterancy: u.veterancy,
       originX: fx,
       originY: fy,
       targetX: Number.NaN,
