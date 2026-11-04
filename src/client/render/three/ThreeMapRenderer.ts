@@ -12,6 +12,12 @@
  * frame is logged and the loop is still re-armed (otherwise the whole client
  * frame loop would stop).
  *
+ * Settings come from the page-load `three_*` URL parameters
+ * (`threeSettingsSearch()`: the address bar is rewritten when a game
+ * starts). Anti-aliasing follows `planAntialias()`, independent of bloom.
+ * With `three_perf=1` a `ThreePerfMonitor` times the frame; without it the
+ * loop only pays a few null checks.
+ *
  * Only loaded through `import()` when the flag is on, so three stays out of
  * the default bundle.
  */
@@ -20,7 +26,9 @@ import type { MapLayer } from "@openfront/engine-api/game/MapFiles";
 import type { Config } from "@openfront/engine-lib/configuration/Config";
 import * as THREE from "three";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { FXAAPass } from "three/examples/jsm/postprocessing/FXAAPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+import type { Pass } from "three/examples/jsm/postprocessing/Pass.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import type { MapProjector } from "../../TransformHandler";
@@ -53,10 +61,19 @@ import { HeightField } from "./HeightField";
 import { NameLayer } from "./NameLayer";
 import { OverlayLayer } from "./OverlayLayer";
 import { PaletteView } from "./PaletteView";
+import { threeSettingsSearch } from "./RendererSelection";
 import { SceneEnvironment } from "./SceneEnvironment";
 import { StructureLayer } from "./StructureLayer";
 import { TerrainLayer } from "./TerrainLayer";
 import {
+  type PerfLayer,
+  type PerfLayerName,
+  type ThreePerfConfig,
+  ThreePerfMonitor,
+} from "./ThreePerf";
+import {
+  type AntialiasPlan,
+  planAntialias,
   readThreeSettingsFromUrl,
   type ThreeRenderSettings,
 } from "./ThreeSettings";
@@ -69,7 +86,10 @@ import type {
 import { UnitLayer } from "./UnitLayer";
 import { WaterLayer } from "./WaterLayer";
 
-/** Context attributes for the shared WebGL2 context (three adopts it). */
+/**
+ * Context attributes for the shared WebGL2 context (three adopts it).
+ * `antialias` is decided per renderer (`AntialiasPlan.contextMsaa`).
+ */
 const CONTEXT_ATTRIBUTES: WebGLContextAttributes = {
   antialias: false,
   alpha: false,
@@ -84,18 +104,35 @@ const FRAME_ERROR_LOG_EVERY = 300;
 
 interface PostChain {
   composer: EffectComposer;
-  passes: { dispose(): void }[];
+  passes: Pass[];
 }
+
+/** A layer updated in the frame loop, before the scene is drawn. */
+interface FrameLayer {
+  update(frame: FrameInfo): void;
+}
+
+/**
+ * Index of the names layer in the perf tool's layer list: the constructor
+ * tracks the seven frame layers first (indexes 0-6, the order of
+ * `frameLayers`), then the names.
+ */
+const PERF_NAMES_INDEX = 7;
 
 export class ThreeMapRenderer implements MapRendererLike {
   /**
    * Called after a lost WebGL context comes back. The owner re-uploads all
-   * simulation state. (Rebuilding GPU resources is left to three's own
-   * restore handling in this prototype.)
+   * simulation state. GPU resources are left to three's own restore
+   * handling: it resets its GL state and re-uploads every geometry, texture
+   * and program from the CPU-side copies the layers keep, on first use.
    */
   onContextRestored: (() => void) | null = null;
 
   readonly threeSettings: ThreeRenderSettings;
+  /** How frames are anti-aliased and composed (fixed at construction). */
+  readonly antialias: AntialiasPlan;
+  /** Samples of the multisampled canvas (0 when it is not multisampled). */
+  readonly canvasMsaaSamples: number;
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
   readonly heightField: HeightField;
@@ -113,7 +150,11 @@ export class ThreeMapRenderer implements MapRendererLike {
   private readonly overlay: OverlayLayer;
   private readonly fx: FxLayer;
   private readonly names: NameLayer;
+  /** Updated in this order every frame (names come after the draw). */
+  private readonly frameLayers: readonly FrameLayer[];
   private post: PostChain | null = null;
+  /** Perf tool (`?three_perf=1`); null when off, which costs nothing. */
+  private perf: ThreePerfMonitor | null = null;
 
   private readonly raf: (cb: FrameRequestCallback) => number;
   private readonly caf: (id: number) => void;
@@ -161,10 +202,22 @@ export class ThreeMapRenderer implements MapRendererLike {
     private readonly settings: RenderSettings,
     raf?: typeof requestAnimationFrame,
     caf?: typeof cancelAnimationFrame,
+    threeSettings?: ThreeRenderSettings,
   ) {
     this.raf = raf ?? ((cb) => window.requestAnimationFrame(cb));
     this.caf = caf ?? ((id) => window.cancelAnimationFrame(id));
-    this.threeSettings = readThreeSettingsFromUrl();
+    // The page-load `three_*` parameters: the address bar was rewritten when
+    // the game started, so location.search no longer has them.
+    this.threeSettings =
+      threeSettings ?? readThreeSettingsFromUrl(threeSettingsSearch());
+    this.antialias = planAntialias(
+      this.threeSettings,
+      Math.min(renderDpr(), this.threeSettings.pixelRatioCap),
+    );
+    const contextAttributes: WebGLContextAttributes = {
+      ...CONTEXT_ATTRIBUTES,
+      antialias: this.antialias.contextMsaa,
+    };
     const W = header.mapWidth;
     const H = header.mapHeight;
     this.camX = W / 2;
@@ -173,18 +226,21 @@ export class ThreeMapRenderer implements MapRendererLike {
     // Same GPU gate as the default renderer: a software / missing context
     // throws GLUnavailableError, which the game-start path turns into the
     // WebGL gate. three adopts the context we acquired.
-    const gl = initGL(canvas, CONTEXT_ATTRIBUTES);
+    const gl = initGL(canvas, contextAttributes);
     if (gl.gl === null) throw new GLUnavailableError(gl.status, gl.renderer);
     this.limited =
       gl.status === "limited"
         ? { renderer: gl.renderer, maxTextureSize: gl.maxTextureSize }
         : null;
+    this.canvasMsaaSamples = this.antialias.contextMsaa
+      ? canvasSamples(gl.gl)
+      : 0;
 
     try {
       this.renderer = new THREE.WebGLRenderer({
         canvas,
         context: gl.gl,
-        ...CONTEXT_ATTRIBUTES,
+        ...contextAttributes,
       });
     } catch (err) {
       gl.gl.getExtension("WEBGL_lose_context")?.loseContext();
@@ -223,18 +279,43 @@ export class ThreeMapRenderer implements MapRendererLike {
         config,
         overlayRoot: this.overlayRoot,
       };
-      this.environment = new SceneEnvironment(this.ctx);
-      this.terrain = new TerrainLayer(this.ctx);
-      this.water = new WaterLayer(this.ctx);
-      this.structures = new StructureLayer(this.ctx);
-      this.units = new UnitLayer(this.ctx);
-      this.overlay = new OverlayLayer(this.ctx);
-      this.fx = new FxLayer(this.ctx);
-      this.names = new NameLayer(this.ctx);
+      // Each layer's scene roots (what it added to the scene), for the perf
+      // tool's per-layer triangle counts. Construction-time only.
+      const perfLayers: PerfLayer[] = [];
+      const track = <T extends object>(
+        name: PerfLayerName,
+        make: () => T,
+      ): T => {
+        const before = new Set(this.scene.children);
+        const layer = make();
+        const roots = this.scene.children.filter((c) => !before.has(c));
+        perfLayers.push({ name, roots, source: layer });
+        return layer;
+      };
+      this.environment = track(
+        "environment",
+        () => new SceneEnvironment(this.ctx),
+      );
+      this.terrain = track("terrain", () => new TerrainLayer(this.ctx));
+      this.water = track("water", () => new WaterLayer(this.ctx));
+      this.structures = track("structures", () => new StructureLayer(this.ctx));
+      this.units = track("units", () => new UnitLayer(this.ctx));
+      this.overlay = track("overlay", () => new OverlayLayer(this.ctx));
+      this.fx = track("fx", () => new FxLayer(this.ctx));
+      this.names = track("names", () => new NameLayer(this.ctx));
+      this.frameLayers = [
+        this.environment,
+        this.terrain,
+        this.water,
+        this.structures,
+        this.units,
+        this.overlay,
+        this.fx,
+      ];
       this.terrain.setTerrainBytes(null, this.heightField.terrain);
       this.water.setTerrainBytes(null, this.heightField.terrain);
 
-      if (this.threeSettings.bloom) this.post = this.createPost();
+      if (this.antialias.composer) this.post = this.createPost();
 
       this.frame = {
         nowMs: 0,
@@ -250,7 +331,21 @@ export class ThreeMapRenderer implements MapRendererLike {
         highlightOwner: 0,
         altView: false,
       };
+
+      if (this.threeSettings.perf) {
+        this.perf = new ThreePerfMonitor({
+          gl: gl.gl,
+          // three swaps renderer.info on a context restore: read it live.
+          info: () => this.renderer.info,
+          scene: this.scene,
+          layers: perfLayers,
+          panelParent: this.overlayRoot,
+          config: () => this.perfConfig(),
+        });
+      }
     } catch (err) {
+      this.perf?.dispose();
+      this.perf = null;
       this.overlayRoot.remove();
       this.renderer.dispose();
       this.renderer.forceContextLoss();
@@ -329,7 +424,9 @@ export class ThreeMapRenderer implements MapRendererLike {
     tileState: Uint16Array,
     changedTiles: readonly number[],
   ): void {
+    const t0 = this.perfNow();
     this.terrain.setTiles(tileState, changedTiles);
+    this.perf?.call("uploadLiveDelta", performance.now() - t0);
   }
 
   /** Trails are not drawn by the prototype. */
@@ -343,7 +440,9 @@ export class ThreeMapRenderer implements MapRendererLike {
     tileState: Uint16Array,
     trailState: Uint16Array,
   ): void {
+    const t0 = this.perfNow();
     this.terrain.setTiles(tileState, null);
+    this.perf?.call("uploadTileAndTrailState", performance.now() - t0);
   }
 
   /**
@@ -351,9 +450,12 @@ export class ThreeMapRenderer implements MapRendererLike {
    * updated first, then the layers are told which rects changed.
    */
   applyTerrainRects(rects: readonly TerrainRect[], bytes: Uint8Array): void {
-    if (this.heightField.applyRects(rects, bytes) === null) return;
-    this.terrain.setTerrainBytes(rects, bytes);
-    this.water.setTerrainBytes(rects, bytes);
+    const t0 = this.perfNow();
+    if (this.heightField.applyRects(rects, bytes) !== null) {
+      this.terrain.setTerrainBytes(rects, bytes);
+      this.water.setTerrainBytes(rects, bytes);
+    }
+    this.perf?.call("applyTerrainRects", performance.now() - t0);
   }
 
   /** Terrain colours changed (graphics settings): re-bake. */
@@ -416,7 +518,9 @@ export class ThreeMapRenderer implements MapRendererLike {
     snap: boolean,
     statusData?: Map<number, PlayerStatusData>,
   ): void {
+    const t0 = this.perfNow();
     this.names.updateNames(names, players, snap, statusData);
+    this.perf?.call("updateNames", performance.now() - t0);
   }
 
   refreshNames(displayNames: Map<string, string>): void {
@@ -430,6 +534,7 @@ export class ThreeMapRenderer implements MapRendererLike {
   // ---- Units / structures / FX ----
 
   updateUnits(units: Map<number, UnitState>, gameTick: number): void {
+    const t0 = this.perfNow();
     if (gameTick !== this.lastGameTick) {
       this.lastGameTick = gameTick;
       this.lastTickMs = performance.now();
@@ -437,15 +542,20 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.units.updateUnits(units, gameTick);
     // Progress bars / deletion marks change every tick (BarPass parity).
     this.structures.updateStatus(units, gameTick);
+    this.perf?.call("updateUnits", performance.now() - t0);
   }
 
   updateStructures(units: Map<number, UnitState>): void {
+    const t0 = this.perfNow();
     this.structures.updateStructures(units);
     this.terrain.setDefenseCoverage(units);
+    this.perf?.call("updateStructures", performance.now() - t0);
   }
 
   applyDeadUnits(deadUnits: DeadUnitFx[]): void {
+    const t0 = this.perfNow();
     this.fx.applyDeadUnits(deadUnits);
+    this.perf?.call("applyDeadUnits", performance.now() - t0);
   }
 
   applyConquestEvents(events: ConquestFx[]): void {
@@ -502,8 +612,14 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.overlay.triggerBlockedFlash(tileX, tileY);
   }
 
-  /** The spawn-phase overlay is not drawn by the prototype. */
-  updateSpawnOverlay(inSpawnPhase: boolean, centers: SpawnCenter[]): void {}
+  /**
+   * The spawn-phase overlay is not drawn by the prototype. The phase itself
+   * makes tile uploads immediate (no per-frame budget), as the default
+   * renderer flushes its drip buckets then.
+   */
+  updateSpawnOverlay(inSpawnPhase: boolean, centers: SpawnCenter[]): void {
+    this.terrain.setSpawnPhase(inSpawnPhase);
+  }
 
   /** The small-player glow is not drawn by the prototype. */
   updateSmallPlayerGlow(set: Uint8Array | null): void {}
@@ -511,7 +627,9 @@ export class ThreeMapRenderer implements MapRendererLike {
   // ---- Railroads (tracks only) / spirals (not drawn by the prototype) ----
 
   uploadRailroadState(data: Uint8Array): void {
+    const t0 = this.perfNow();
     this.units.setRailroads(data);
+    this.perf?.call("uploadRailroadState", performance.now() - t0);
   }
 
   /** Construction dust and the rail colour effects are not drawn. */
@@ -592,6 +710,8 @@ export class ThreeMapRenderer implements MapRendererLike {
     }
     this.disposePost();
     this.palette.dispose();
+    this.perf?.dispose();
+    this.perf = null;
     // WebGLRenderer.dispose() only clears three's caches: the context keeps
     // counting against the browser's WebGL context limit until it is GC'd,
     // and the game's event listeners keep this facade reachable. Drop it
@@ -611,6 +731,7 @@ export class ThreeMapRenderer implements MapRendererLike {
       try {
         this.renderFrame();
       } catch (err) {
+        this.perf?.abortFrame();
         if (this.frameErrors++ % FRAME_ERROR_LOG_EVERY === 0) {
           console.error(
             `[ThreeMapRenderer] frame failed (${this.frameErrors} so far)`,
@@ -625,6 +746,8 @@ export class ThreeMapRenderer implements MapRendererLike {
 
   private renderFrame(): void {
     const now = performance.now();
+    const perf = this.perf;
+    perf?.beginFrame(now);
     const dt = this.lastFrameMs > 0 ? now - this.lastFrameMs : 0;
     this.lastFrameMs = now;
 
@@ -659,18 +782,54 @@ export class ThreeMapRenderer implements MapRendererLike {
     f.highlightOwner = this.highlightOwner;
     f.altView = this.altView;
 
-    this.environment.update(f);
-    this.terrain.update(f);
-    this.water.update(f);
-    this.structures.update(f);
-    this.units.update(f);
-    this.overlay.update(f);
-    this.fx.update(f);
+    const layers = this.frameLayers;
+    for (let i = 0; i < layers.length; i++) {
+      if (perf === null) {
+        layers[i].update(f);
+      } else {
+        const t0 = performance.now();
+        layers[i].update(f);
+        perf.layerUpdate(i, performance.now() - t0);
+      }
+    }
 
+    const tRender = this.perfNow();
+    perf?.beginRender();
     if (this.post) this.post.composer.render(f.dtMs / 1000);
     else this.renderer.render(this.scene, this.rig.camera);
+    perf?.endRender();
 
+    const tNames = this.perfNow();
     this.names.update(f, this.project);
+
+    if (perf !== null) {
+      const end = performance.now();
+      perf.layerUpdate(PERF_NAMES_INDEX, end - tNames);
+      perf.endFrame(tRender - now, tNames - tRender, end - tNames);
+    }
+  }
+
+  /** performance.now() when the perf tool is on; 0 (no clock read) when off. */
+  private perfNow(): number {
+    return this.perf === null ? 0 : performance.now();
+  }
+
+  private perfConfig(): ThreePerfConfig {
+    const s = this.threeSettings;
+    return {
+      quality: s.quality,
+      bloom: s.bloom,
+      antialias: s.antialias,
+      canvasMsaaSamples: this.canvasMsaaSamples,
+      targetMsaaSamples: this.post ? this.antialias.targetSamples : 0,
+      fxaa: this.antialias.fxaa,
+      composer: this.post !== null,
+      pixelRatio: this.appliedPixelRatio,
+      width: this.canvas.width,
+      height: this.canvas.height,
+      reliefVertices: this.heightField.vertexCount,
+      maxTiltDeg: s.maxTiltDeg,
+    };
   }
 
   /** Size the backing store to the observed CSS size × capped DPR. */
@@ -695,29 +854,35 @@ export class ThreeMapRenderer implements MapRendererLike {
     }
   }
 
-  /** RenderPass → UnrealBloomPass → OutputPass (tone mapping + sRGB). */
+  /**
+   * RenderPass → [UnrealBloomPass] → OutputPass (tone mapping + sRGB) →
+   * [FXAAPass]. The HDR target is multisampled when the AA plan says so
+   * (MSAA below 1.5× pixel ratio: above, the resolution already smooths
+   * edges and multisampled half-float targets get expensive). FXAA runs on
+   * the tone-mapped image, as it expects.
+   */
   private createPost(): PostChain {
     const s = this.threeSettings;
-    // MSAA only at low pixel ratios: at 2× the resolution already smooths
-    // edges and multisampled half-float targets get expensive.
-    const samples = renderDpr() < 1.5 ? Math.max(0, s.msaaSamples) : 0;
     const target = new THREE.WebGLRenderTarget(1, 1, {
       type: THREE.HalfFloatType,
-      samples,
+      samples: this.antialias.targetSamples,
     });
     const composer = new EffectComposer(this.renderer, target);
-    const renderPass = new RenderPass(this.scene, this.rig.camera);
-    const bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(1, 1),
-      s.bloomStrength,
-      s.bloomRadius,
-      s.bloomThreshold,
-    );
-    const outputPass = new OutputPass();
-    composer.addPass(renderPass);
-    composer.addPass(bloomPass);
-    composer.addPass(outputPass);
-    return { composer, passes: [renderPass, bloomPass, outputPass] };
+    const passes: Pass[] = [new RenderPass(this.scene, this.rig.camera)];
+    if (s.bloom) {
+      passes.push(
+        new UnrealBloomPass(
+          new THREE.Vector2(1, 1),
+          s.bloomStrength,
+          s.bloomRadius,
+          s.bloomThreshold,
+        ),
+      );
+    }
+    passes.push(new OutputPass());
+    if (this.antialias.fxaa) passes.push(new FXAAPass());
+    for (const pass of passes) composer.addPass(pass);
+    return { composer, passes };
   }
 
   private disposePost(): void {
@@ -737,13 +902,23 @@ export class ThreeMapRenderer implements MapRendererLike {
 
   private readonly handleContextRestored = (): void => {
     console.warn(
-      "[ThreeMapRenderer] WebGL context restored — GPU resources are not rebuilt by the prototype",
+      "[ThreeMapRenderer] WebGL context restored — three re-uploads GPU resources on first use",
     );
     this.contextLost = false;
+    this.perf?.contextRestored();
     // Force a fresh resize on the next frame.
     this.appliedPixelRatio = 0;
     this.onContextRestored?.();
   };
+}
+
+/** Samples of the default framebuffer (the canvas) of a fresh context. */
+function canvasSamples(gl: WebGL2RenderingContext): number {
+  try {
+    return Number(gl.getParameter(gl.SAMPLES)) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**

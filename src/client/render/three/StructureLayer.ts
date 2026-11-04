@@ -21,6 +21,18 @@
  *   so it reads on any terrain), shown from the default renderer's icon
  *   zoom (1.2) on.
  *
+ * Level of detail: below STRUCTURE_LOD_ZOOM CSS px per tile
+ * (STRUCTURE_LOD_ZOOM_LOW with `quality: "low"`), where a model is only a
+ * few dozen px wide, every structure switches to its low-poly model
+ * (`createStructureLodGeometry`, batches `structures-<type>#<variant>@lod`);
+ * the switch has 15% hysteresis and costs one `rebuild`. Labels and bars
+ * stay anchored on the full model's height.
+ *
+ * Culling: structures whose bounding sphere (with a margin) leaves the view
+ * frustum get no instance (nor shadow); a change of the visible set costs
+ * one `rebuild`, so it only happens while panning close up. `perfStats()`
+ * reports the instances and triangles drawn and the structures culled.
+ *
  * Contract notes:
  * - `updateStructures` gets the FULL unit map, only on ticks where a
  *   structure changed (new, owner, level, isActive, construction finished).
@@ -47,6 +59,7 @@ import {
   BlobShadows,
   createPartMaterial,
   createStructureGeometry,
+  createStructureLodGeometry,
   InstancedBatch,
   levelChangesModel,
   MAX_VISUAL_LEVEL,
@@ -54,11 +67,12 @@ import {
   shadowOffset,
   STRUCTURE_FOOTPRINT,
   structureVariant,
+  triangleCount,
 } from "./ProceduralMeshes";
 import { barSize, StatusBars } from "./StatusBars";
 import { isLand } from "./TerrainCodec";
 import type { FrameInfo, ThreeLayerContext } from "./types";
-import { minScreenScale } from "./UnitLayer";
+import { minScreenScale, sphereInFrustum } from "./UnitLayer";
 
 /** Time over which a structure under construction grows to its full ghost size. */
 const CONSTRUCTION_GROW_MS = 6000;
@@ -70,6 +84,26 @@ export const STATUS_MIN_ZOOM = 1.2;
 const SHADOW_SIZE = 1.18;
 const SHADOW_ALPHA = 0.4;
 const SHADOW_LIFT = 0.08;
+
+/** Structures use their low-poly models below this zoom (CSS px per tile)... */
+export const STRUCTURE_LOD_ZOOM = 5;
+/** ...or below this one with `quality: "low"`. */
+export const STRUCTURE_LOD_ZOOM_LOW = 12;
+/** The full models come back above the threshold × this factor. */
+const LOD_HYSTERESIS = 1.15;
+
+/**
+ * Whether structures should use their low-poly models at `zoom`, given
+ * whether they do now (hysteresis) and the quality setting.
+ */
+export function structureLodAt(
+  zoom: number,
+  current: boolean,
+  low: boolean,
+): boolean {
+  const z = low ? STRUCTURE_LOD_ZOOM_LOW : STRUCTURE_LOD_ZOOM;
+  return current ? zoom < z * LOD_HYSTERESIS : zoom < z;
+}
 
 /** Level label font size (CSS px): 12 px zoomed out, up to 22 px close up. */
 export function levelLabelPx(cssPxPerTile: number): number {
@@ -216,6 +250,8 @@ interface StructureInst {
   /** Model height (tiles) at scale 1, for anchoring labels and bars. */
   top: number;
   label: LevelLabel | null;
+  /** Inside the view frustum (last visibility pass); culled when false. */
+  inView: boolean;
 }
 
 /** A pooled DOM level label and what was last written to it. */
@@ -240,6 +276,20 @@ export class StructureLayer {
   private readonly templates = new Map<string, THREE.BufferGeometry>();
   private readonly tops = new Map<string, number>();
   private readonly batches = new Map<string, InstancedBatch>();
+  /** Triangles of one instance, per batch key. */
+  private readonly batchTris = new Map<string, number>();
+  /**
+   * Batch keys (`type#variant`, `type#variant@lod`), built once: `rebuild`
+   * runs whenever the visible set changes (panning close up), so it should
+   * not build two strings per structure each time.
+   */
+  private readonly keys = new Map<string, string[]>();
+  private readonly lodKeys = new Map<string, string>();
+  /** Low-poly models in use (see the file comment). */
+  private lod = false;
+  private culled = 0;
+  private readonly frustum = new THREE.Frustum();
+  private readonly projScreen = new THREE.Matrix4();
   private readonly insts = new Map<number, StructureInst>();
   /** Instances that animate every frame (under construction / marked). */
   private animated: StructureInst[] = [];
@@ -325,6 +375,7 @@ export class StructureLayer {
           index: -1,
           top: 1,
           label: null,
+          inView: true,
         };
         this.place(inst, hf);
         this.insts.set(u.id, inst);
@@ -385,6 +436,22 @@ export class StructureLayer {
     this.updateStatusViews(frame);
   }
 
+  /** Counters for the facade's perf tool (picked up by duck typing). */
+  perfStats(): Record<string, number> {
+    let instances = 0;
+    let tris = 0;
+    for (const [key, b] of this.batches) {
+      instances += b.count;
+      tris += b.count * (this.batchTris.get(key) ?? 0);
+    }
+    return {
+      structureInstances: instances,
+      structureTriangles: tris,
+      structureLod: this.lod ? 1 : 0,
+      structureCulled: this.culled,
+    };
+  }
+
   dispose(): void {
     for (const b of this.batches.values()) b.dispose();
     this.batches.clear();
@@ -412,6 +479,17 @@ export class StructureLayer {
       // Terrain changed (water nuke): re-seat every structure.
       this.heightVersion = hf.version;
       for (const inst of this.insts.values()) this.place(inst, hf);
+      this.rebuild(now);
+      return;
+    }
+    const lod = structureLodAt(
+      frame.cssPxPerTile,
+      this.lod,
+      this.ctx.settings.quality === "low",
+    );
+    const viewChanged = this.updateVisibility(frame);
+    if (lod !== this.lod || viewChanged) {
+      this.lod = lod;
       this.rebuild(now);
       return;
     }
@@ -449,6 +527,43 @@ export class StructureLayer {
       }
       for (const b of touched) b.markDirty();
     }
+  }
+
+  /**
+   * Frustum test of every structure (bounding sphere at this frame's
+   * min-size scale, plus a 2-tile margin). True when any `inView` changed.
+   */
+  private updateVisibility(frame: FrameInfo): boolean {
+    const cam = frame.camera;
+    this.projScreen.multiplyMatrices(
+      cam.projectionMatrix,
+      cam.matrixWorldInverse,
+    );
+    this.frustum.setFromProjectionMatrix(this.projScreen);
+    const planes = this.frustum.planes;
+    const minPx = this.ctx.settings.structureMinScreenPx;
+    let changed = false;
+    let culled = 0;
+    for (const inst of this.insts.values()) {
+      const fp = STRUCTURE_FOOTPRINT[inst.type] ?? 6;
+      const k = minScreenScale(minPx, frame.cssPxPerTile, fp) * 1.2;
+      const half = 0.5 * inst.top * k;
+      const r = Math.hypot(0.75 * fp * k, half) + 2;
+      const inView = sphereInFrustum(
+        planes,
+        inst.x,
+        inst.ground + half,
+        inst.y,
+        r,
+      );
+      if (!inView) culled++;
+      if (inView !== inst.inView) {
+        inst.inView = inView;
+        changed = true;
+      }
+    }
+    this.culled = culled;
+    return changed;
   }
 
   /** Progress bars and level labels for this frame's camera. */
@@ -598,14 +713,16 @@ export class StructureLayer {
     for (const b of this.batches.values()) b.begin();
     this.animated = [];
     for (const inst of this.insts.values()) {
-      const key = `${inst.type}#${inst.variant}`;
-      const batch = this.batchFor(key, inst.type, inst.variant);
+      const key = this.keyOf(inst.type, inst.variant);
+      inst.top = this.topOf(key, inst.type, inst.variant);
+      const batch = inst.inView
+        ? this.batchFor(key, inst.type, inst.variant, this.lod)
+        : null;
       inst.batch = batch;
       if (batch === null) {
         inst.index = -1;
         continue;
       }
-      inst.top = this.tops.get(key) ?? 1;
       this.computeMatrix(inst, now);
       inst.index = batch.push(
         this.m,
@@ -708,30 +825,74 @@ export class StructureLayer {
     return shade;
   }
 
+  /** The batch key `type#variant`, cached. */
+  private keyOf(type: string, variant: number): string {
+    let byVariant = this.keys.get(type);
+    if (byVariant === undefined) {
+      byVariant = [];
+      this.keys.set(type, byVariant);
+    }
+    return (byVariant[variant] ??= `${type}#${variant}`);
+  }
+
+  /** Model geometry of a full (`key`) or low-poly (`key@lod`) batch. */
+  private templateFor(
+    key: string,
+    type: string,
+    variant: number,
+    lod: boolean,
+  ): THREE.BufferGeometry | null {
+    const tkey = lod ? `${key}@lod` : key;
+    let template = this.templates.get(tkey);
+    if (template === undefined) {
+      const g = lod
+        ? createStructureLodGeometry(type, variant)
+        : createStructureGeometry(type, variant);
+      if (g === null) return null;
+      template = g;
+      this.templates.set(tkey, template);
+      if (!lod) {
+        g.computeBoundingBox();
+        this.tops.set(key, Math.max(0.5, g.boundingBox?.max.y ?? 1));
+      }
+    }
+    return template;
+  }
+
+  /** Height of the full model (labels and bars anchor on it at any LOD). */
+  private topOf(key: string, type: string, variant: number): number {
+    if (!this.tops.has(key)) this.templateFor(key, type, variant, false);
+    return this.tops.get(key) ?? 1;
+  }
+
   private batchFor(
     key: string,
     type: string,
     variant: number,
+    lod: boolean,
   ): InstancedBatch | null {
-    let batch = this.batches.get(key);
-    if (batch !== undefined) return batch;
-    let template = this.templates.get(key);
-    if (template === undefined) {
-      const g = createStructureGeometry(type, variant);
-      if (g === null) return null;
-      template = g;
-      this.templates.set(key, template);
-      g.computeBoundingBox();
-      this.tops.set(key, Math.max(0.5, g.boundingBox?.max.y ?? 1));
+    let bkey = key;
+    if (lod) {
+      let k = this.lodKeys.get(key);
+      if (k === undefined) {
+        k = `${key}@lod`;
+        this.lodKeys.set(key, k);
+      }
+      bkey = k;
     }
+    let batch = this.batches.get(bkey);
+    if (batch !== undefined) return batch;
+    const template = this.templateFor(key, type, variant, lod);
+    if (template === null) return null;
     batch = new InstancedBatch(
       this.group,
       template,
       this.material,
-      `structures-${key}`,
+      `structures-${bkey}`,
       32,
     );
-    this.batches.set(key, batch);
+    this.batches.set(bkey, batch);
+    this.batchTris.set(bkey, triangleCount(template));
     return batch;
   }
 }

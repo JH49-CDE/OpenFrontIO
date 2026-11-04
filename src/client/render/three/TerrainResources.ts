@@ -1,7 +1,8 @@
 /**
  * GPU resources shared by TerrainLayer and WaterLayer:
  * - integer DataTextures (R8UI / R16UI) with immediate full uploads and
- *   per-row partial uploads,
+ *   rectangle uploads (`TextureRectUploader`: one `texSubImage2D` per
+ *   rectangle, where three's `updateRanges` cost one call per row),
  * - `TerrainByteTexture`: the full-map terrain bytes as ONE R8UI texture
  *   for both layers (refcounted per HeightField; the facade forwards each
  *   terrain change to both layers, uploads are deduplicated by the
@@ -14,12 +15,12 @@ import type { RenderSettings } from "../gl/RenderSettings";
 import type { TerrainRect } from "../types";
 import type { HeightField } from "./HeightField";
 import {
-  addTexelSpan,
   hexToSrgb01,
   type Rgb,
   srgbToLinearRgb,
   waterColors,
 } from "./TerrainShading";
+import { TileUploadQueue } from "./TileUploadQueue";
 import type { ThreeLayerContext } from "./types";
 
 type IntegerTextureData = Uint8Array | Uint16Array;
@@ -84,6 +85,54 @@ export function uploadNow(
   renderer.initTexture(tex);
 }
 
+/**
+ * Uploads rectangles of a DataTexture from its CPU data (`image.data`, read
+ * at upload time, so a swapped buffer is followed) with ONE `texSubImage2D`
+ * each, through three's public `copyTextureToTexture`: three binds the
+ * texture and saves / restores the unpack state, so its caches stay valid.
+ * The copy source is an alias DataTexture over the same data that is never
+ * uploaded itself: three copies from CPU memory only for a source it has
+ * never seen (otherwise it copies GPU to GPU). If the target was never
+ * uploaded (or the context was restored), three uploads it in full first.
+ */
+export class TextureRectUploader {
+  private readonly source: THREE.DataTexture;
+  private readonly region = new THREE.Box2();
+  private readonly position = new THREE.Vector2();
+
+  constructor(private readonly target: THREE.DataTexture) {
+    const image = target.image as { width: number; height: number };
+    this.source = new THREE.DataTexture(
+      textureData(target) as IntegerTextureData,
+      image.width,
+      image.height,
+      target.format as THREE.PixelFormat,
+      target.type,
+    );
+  }
+
+  /** Upload tiles [x, x+w) × [y, y+h) now. */
+  upload(
+    renderer: THREE.WebGLRenderer,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+  ): void {
+    if (w <= 0 || h <= 0) return;
+    setTextureData(this.source, textureData(this.target) as IntegerTextureData);
+    this.region.min.set(x, y);
+    this.region.max.set(x + w, y + h);
+    this.position.set(x, y);
+    renderer.copyTextureToTexture(
+      this.source,
+      this.target,
+      this.region,
+      this.position,
+    );
+  }
+}
+
 const sharedTerrainTextures = new WeakMap<HeightField, TerrainByteTexture>();
 
 /** The live terrain bytes (`heightField.terrain`) as one shared R8UI texture. */
@@ -91,6 +140,9 @@ export class TerrainByteTexture {
   readonly texture: THREE.DataTexture;
   private refs = 0;
   private syncedVersion: number;
+  /** Merges a change's per-row rects into few rectangle uploads. */
+  private readonly changes: TileUploadQueue;
+  private readonly uploader: TextureRectUploader;
 
   /** Get (creating on first use) the texture of `ctx.heightField`. */
   static acquire(ctx: ThreeLayerContext): TerrainByteTexture {
@@ -113,12 +165,16 @@ export class TerrainByteTexture {
     );
     uploadNow(ctx.renderer, this.texture);
     this.syncedVersion = hf.version;
+    this.changes = new TileUploadQueue(ctx.mapWidth, ctx.mapHeight);
+    this.uploader = new TextureRectUploader(this.texture);
   }
 
   /**
-   * Upload a terrain change (`setTerrainBytes` arguments). The texture
-   * references `heightField.terrain`, which the facade has already patched,
-   * so rects only select the rows to re-upload. `rects === null` = full map
+   * Upload a terrain change (`setTerrainBytes` arguments) right away. The
+   * texture references `heightField.terrain`, which the facade has already
+   * patched, so rects only select what to re-upload. They are merged into
+   * rectangles of 16×16-tile cells, one call each, where three's ranges
+   * cost one call per row of every rect. `rects === null` = full map
    * (`bytes` is the full array).
    */
   sync(rects: readonly TerrainRect[] | null, bytes: Uint8Array): void {
@@ -136,19 +192,16 @@ export class TerrainByteTexture {
     }
     if (version === this.syncedVersion) return;
     this.syncedVersion = version;
-    let rows = 0;
-    for (const r of rects) rows += Math.max(0, r.h);
-    if (rows > H / 2) {
+    const q = this.changes;
+    for (const r of rects) q.markRect(r.x, r.y, r.w, r.h);
+    if (q.pendingTexels > (W * H) / 2) {
+      q.clear();
       uploadNow(this.ctx.renderer, tex);
       return;
     }
-    for (const r of rects) {
-      if (r.w <= 0 || r.h <= 0) continue;
-      const y0 = Math.max(0, r.y);
-      const y1 = Math.min(H, r.y + r.h);
-      for (let y = y0; y < y1; y++) addTexelSpan(tex, W, r.x, y, r.w);
+    for (const r of q.take(null)) {
+      this.uploader.upload(this.ctx.renderer, r.x, r.y, r.w, r.h);
     }
-    tex.needsUpdate = true;
   }
 
   release(): void {

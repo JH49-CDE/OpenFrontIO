@@ -966,23 +966,13 @@ async function createClientGame(
       (nowMs) => metrics.recordFrame(nowMs),
     );
 
-    // Releases all WebGL/DOM resources this game created. Without it, stopping
-    // a game (e.g. joining another without a page reload) leaks the WebGL
-    // context, canvas and input overlay — a few games and mobile browsers hit
-    // their WebGL context limit. Idempotent: stop() may be called more than once.
-    let rendererDisposed = false;
-    const disposeRenderer = (): void => {
-      if (rendererDisposed) return;
-      rendererDisposed = true;
-      gameRenderer.dispose();
-      stopFrameLoop();
-      view.dispose();
-      glCanvas.remove();
-      inputOverlay.remove();
-      // Drop the debugging handle unless a newer game already replaced it.
-      const debugHandle = window as unknown as { __webglView?: unknown };
-      if (debugHandle.__webglView === view) delete debugHandle.__webglView;
-    };
+    const disposeRenderer = createRendererDisposer({
+      gameRenderer,
+      stopFrameLoop,
+      view,
+      glCanvas,
+      inputOverlay,
+    });
 
     console.log(
       `creating private game got difficulty: ${lobbyConfig.gameStartInfo.config.difficulty}`,
@@ -1027,6 +1017,37 @@ async function createClientGame(
     soundManager.dispose();
     throw err;
   }
+}
+
+/**
+ * Releases all WebGL/DOM resources a game created: HUD renderer, frame loop,
+ * map view (its WebGL context included), canvas and input overlay. Without
+ * it, stopping a game (e.g. joining another without a page reload) leaks the
+ * WebGL context, canvas and input overlay — a few games and mobile browsers
+ * hit their WebGL context limit. `ClientGameRunner.stop()` calls it; the
+ * in-game Quit / Back buttons navigate instead, so there the page unload
+ * frees everything. Idempotent: stop() may be called more than once.
+ */
+export function createRendererDisposer(parts: {
+  gameRenderer: { dispose(): void };
+  stopFrameLoop: () => void;
+  view: { dispose(): void };
+  glCanvas: HTMLCanvasElement;
+  inputOverlay: HTMLElement;
+}): () => void {
+  let disposed = false;
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    parts.gameRenderer.dispose();
+    parts.stopFrameLoop();
+    parts.view.dispose();
+    parts.glCanvas.remove();
+    parts.inputOverlay.remove();
+    // Drop the debugging handle unless a newer game already replaced it.
+    const debugHandle = window as unknown as { __webglView?: unknown };
+    if (debugHandle.__webglView === parts.view) delete debugHandle.__webglView;
+  };
 }
 
 export class ClientGameRunner {

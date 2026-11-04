@@ -2339,13 +2339,19 @@ const bootstrap = () => {
   // without a collector URL (see Telemetry.ts); never awaited.
   void initTelemetry();
 
-  // Remember an opt-in `?renderer=three` (experimental 3D map) before any
-  // history write rewrites the address bar. import(), not a static import:
-  // render/ is game-client code the homepage only loads on demand, and only
-  // when the URL names a renderer (RENDERER_URL_PARAM), so other visits
-  // fetch nothing extra.
+  // Remember an opt-in `?renderer=three` (experimental 3D map) and its
+  // `three_*` quality parameters before any history write rewrites the
+  // address bar (a game start does, solo and multiplayer). import(), not a
+  // static import: render/ is game-client code the homepage only loads on
+  // demand, and only when the URL names a renderer or a `three_*` parameter
+  // (RendererSelection.namesRendererParams), so other visits fetch nothing
+  // extra.
   const rendererSearch = window.location.search;
-  if (new URLSearchParams(rendererSearch).has("renderer")) {
+  if (
+    [...new URLSearchParams(rendererSearch).keys()].some(
+      (key) => key === "renderer" || key.startsWith("three_"),
+    )
+  ) {
     void import("./render/three/RendererSelection")
       .then((m) => m.syncRendererPreferenceFromUrl(rendererSearch))
       .catch(() => {});

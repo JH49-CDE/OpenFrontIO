@@ -427,6 +427,63 @@ function part(
   return g;
 }
 
+/**
+ * Drops the triangles of `geo` whose face normal fails `keep` (faces that
+ * are never seen, e.g. the bottom of a box lying on the ground). Returns a
+ * non-indexed position-only geometry; `geo` is disposed.
+ */
+function trimmed(
+  geo: THREE.BufferGeometry,
+  keep: (nx: number, ny: number, nz: number) => boolean,
+): THREE.BufferGeometry {
+  const g = geo.index !== null ? geo.toNonIndexed() : geo;
+  const src = g.getAttribute("position");
+  const out: number[] = [];
+  const a = new THREE.Vector3();
+  const e1 = new THREE.Vector3();
+  const e2 = new THREE.Vector3();
+  for (let i = 0; i + 2 < src.count; i += 3) {
+    // Counter-clockwise front faces: n = (b − a) × (c − a).
+    a.fromBufferAttribute(src, i);
+    e1.fromBufferAttribute(src, i + 1).sub(a);
+    e2.fromBufferAttribute(src, i + 2).sub(a);
+    const n = e1.cross(e2).normalize();
+    if (!keep(n.x, n.y, n.z)) continue;
+    for (let k = 0; k < 3; k++) {
+      out.push(src.getX(i + k), src.getY(i + k), src.getZ(i + k));
+    }
+  }
+  if (g !== geo) g.dispose();
+  geo.dispose();
+  const res = new THREE.BufferGeometry();
+  res.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(out), 3),
+  );
+  return res;
+}
+
+/** `keep` predicate: everything except faces pointing down. */
+const NO_BOTTOM = (_x: number, y: number): boolean => y > -0.5;
+
+/** Box without its bottom face (10 triangles). */
+function openBox(
+  w: number,
+  h: number,
+  d: number,
+  x: number,
+  y0: number,
+  z: number,
+): THREE.BufferGeometry {
+  return trimmed(box(w, h, d, x, y0, z), NO_BOTTOM);
+}
+
+/** Triangle count of a (non-)indexed triangle geometry. */
+export function triangleCount(g: THREE.BufferGeometry): number {
+  const n = g.index !== null ? g.index.count : g.getAttribute("position").count;
+  return Math.floor(n / 3);
+}
+
 /** Merges parts, scales them, and gives every face a flat normal. */
 function assemble(
   parts: THREE.BufferGeometry[],
@@ -813,21 +870,117 @@ function trainCarriageGeometry(loaded: boolean): THREE.BufferGeometry {
 }
 
 /**
- * Half a tile of railway, from the tile centre (x = 0) to its edge
- * (x = 0.5) along +X: gravel ballast, two sleepers and two steel rails at
- * the gauge the train models straddle. A straight rail tile is two halves
- * (east + west or north + south), a curve the two halves towards the
- * edges it connects.
+ * Railway pieces. A piece is half a tile of track, from the tile centre
+ * (x = 0) to its edge (x = 0.5) along +X; a straight rail tile is two halves
+ * (east + west or north + south), a curve the two halves towards the edges
+ * it connects. Two levels of detail share the same instance transforms:
+ * - the strip: a flat 2-triangle ballast bed, drawn for every piece;
+ * - the detail: two sleepers and two steel rails on top of the strip at the
+ *   gauge the train models straddle, drawn only close up.
  */
-export function createRailPieceGeometry(): THREE.BufferGeometry {
-  const parts = [part(box(0.5, 0.05, 0.56, 0.25, -0.02, 0), C.ballast)];
+/** Height of the ballast strip above the piece origin (the ground). */
+export const RAIL_STRIP_Y = 0.02;
+/** Top of the rail heads above the ground; trains ride on them. */
+export const RAIL_TOP = 0.1;
+
+/** The flat ballast bed of a half-tile piece: 2 triangles, normal +Y. */
+export function createRailStripGeometry(): THREE.BufferGeometry {
+  const g = new THREE.PlaneGeometry(0.5, 0.5)
+    .rotateX(-Math.PI / 2)
+    .translate(0.25, RAIL_STRIP_Y, 0);
+  g.deleteAttribute("uv");
+  return g;
+}
+
+/**
+ * Sleepers (top faces only: they are 1/30 of a tile thick) and rails (top
+ * and sides, no ends or bottom) of a half-tile piece: 16 triangles, with
+ * the part attributes of `part()`.
+ */
+export function createRailDetailGeometry(): THREE.BufferGeometry {
+  const up = (_x: number, y: number): boolean => y > 0.5;
+  const topAndSides = (x: number, y: number): boolean =>
+    Math.abs(x) < 0.5 && y > -0.5;
+  const parts: THREE.BufferGeometry[] = [];
   for (const x of [0.12, 0.37]) {
-    parts.push(part(box(0.09, 0.03, 0.46, x, 0.03, 0), C.wood));
+    parts.push(part(trimmed(box(0.09, 0.01, 0.46, x, 0.035, 0), up), C.wood));
   }
   for (const z of [-0.15, 0.15]) {
-    parts.push(part(box(0.52, 0.05, 0.05, 0.25, 0.05, z), C.steelDark));
+    parts.push(
+      part(
+        trimmed(box(0.52, RAIL_TOP - 0.04, 0.05, 0.25, 0.04, z), topAndSides),
+        C.steelDark,
+      ),
+    );
   }
   return assemble(parts);
+}
+
+/**
+ * Low-poly stand-ins for small on-screen units (boats and trains a few
+ * dozen px long, shells): the same length, owner tint and silhouette in
+ * 8-42 triangles instead of 36-364. Null for kinds without one.
+ */
+export function createUnitLodGeometry(
+  kind: UnitMeshKind,
+): THREE.BufferGeometry | null {
+  const lowHull = (
+    len: number,
+    width: number,
+    h: number,
+    y0: number,
+    bowFrac: number,
+    bluntBow = 0,
+    sternRound = 0.15,
+  ) =>
+    trimmed(hull(len, width, h, y0, bowFrac, bluntBow, sternRound), NO_BOTTOM);
+  switch (kind) {
+    case "transport":
+      return assemble([
+        part(lowHull(4.7, 1.8, 0.82, -0.3, 0.14, 0.75), C.tintBase, {
+          tint: 1,
+        }),
+        part(openBox(0.9, 0.63, 1.1, -1.75, 0.45, 0), C.white),
+      ]);
+    case "tradeShip":
+      return assemble([
+        part(lowHull(5.3, 1.55, 0.75, -0.35, 0.22, 0, 0.05), C.tintBase, {
+          tint: 1,
+        }),
+        part(openBox(3.04, 0.7, 1.28, -0.03, 0.4, 0), C.tintShade, {
+          tint: 1,
+        }),
+        part(openBox(0.8, 0.88, 1.25, -2.0, 0.4, 0), C.white),
+      ]);
+    case "warship":
+      return assemble([
+        part(lowHull(10.6, 2.2, 0.95, -0.4, 0.26, 0, 0.08), C.tintBase, {
+          tint: 1,
+        }),
+        part(openBox(3.4, 1.15, 1.4, -0.6, 0.55, 0), C.steel),
+        part(openBox(1.3, 0.35, 1.0, 2.0, 0.55, 0), C.tintShade, { tint: 1 }),
+      ]);
+    case "trainEngine":
+      return assemble([
+        part(openBox(2.0, 0.55, 0.8, 0.15, 0.0, 0), C.hullDark),
+        part(openBox(0.9, 1.05, 0.88, -0.55, 0.0, 0), C.tintBase, { tint: 1 }),
+      ]);
+    case "trainCarriage":
+      return assemble([
+        part(openBox(1.75, 0.89, 0.78, 0, 0.0, 0), C.tintBase, { tint: 1 }),
+      ]);
+    case "trainLoaded":
+      return assemble([
+        part(openBox(1.75, 0.62, 0.78, 0, 0.0, 0), C.tintBase, { tint: 1 }),
+        part(openBox(1.5, 0.2, 0.6, 0, 0.62, 0), C.gold, { glow: 0.3 }),
+      ]);
+    case "shell":
+      return assemble([
+        part(new THREE.OctahedronGeometry(0.42, 0), C.flameHot, { glow: 2.1 }),
+      ]);
+    default:
+      return null;
+  }
 }
 
 /** Atom bomb (≈7 tiles): owner-coloured body, white nose, fins, flame. */
@@ -980,6 +1133,111 @@ export function createStructureGeometry(
     default:
       return null;
   }
+}
+
+/**
+ * Low-poly stand-in for a structure model that is only a few dozen px wide
+ * on screen: the same footprint, owner-tinted roofs and rough silhouette
+ * (plaza, main block, chimney / crane / domes) in 40-110 triangles instead
+ * of 156-936, with no hidden bottom faces. Null for unknown types.
+ */
+export function createStructureLodGeometry(
+  type: string,
+  variant = 1,
+): THREE.BufferGeometry | null {
+  const lowCyl = (
+    rTop: number,
+    rBottom: number,
+    h: number,
+    seg: number,
+    x: number,
+    y0: number,
+    z: number,
+  ) => trimmed(cyl(rTop, rBottom, h, seg, x, y0, z), NO_BOTTOM);
+  const pad = (w: number, d: number, x = 0) =>
+    part(openBox(w, 1.5, d, x, -1.2, 0), C.paving, { tint: 0.45 });
+  const tint = { tint: 1 };
+  let parts: THREE.BufferGeometry[];
+  switch (type) {
+    case UT_CITY: {
+      const lv = Math.max(1, Math.min(MAX_VISUAL_LEVEL, variant));
+      const grow = 1 + 0.32 * (lv - 1);
+      const block = 0.75 * grow + 0.5;
+      const tower = 1.3 * grow + 0.5;
+      const side = lv >= 4 ? 5.1 : 4.2;
+      parts = [
+        pad(6.2, 6.2),
+        part(openBox(side, block, side, 0, 0.3, 0), C.wall),
+        part(
+          openBox(side + 0.2, 0.22, side + 0.2, 0, 0.3 + block, 0),
+          C.tintBase,
+          tint,
+        ),
+        part(openBox(1.55, tower, 1.55, 0, 0.3, 0), C.wall),
+        part(openBox(1.75, 0.3, 1.75, 0, 0.3 + tower, 0), C.tintShade, tint),
+      ];
+      break;
+    }
+    case UT_PORT:
+      parts = [
+        pad(4.2, 5.4, -1.1),
+        part(openBox(2.6, 1.0, 2.4, -1.4, 0.3, -1.1), C.wall),
+        part(openBox(2.8, 0.25, 2.6, -1.4, 1.3, -1.1), C.tintBase, tint),
+        part(openBox(3.6, 0.18, 1.3, 2.6, 0.12, 0.4), C.wood),
+        part(openBox(0.35, 2.8, 0.35, 0.8, 0.3, 1.5), C.tintBase, tint),
+        part(openBox(3.4, 0.22, 0.26, 1.9, 3.0, 1.5), C.tintBase, tint),
+      ];
+      break;
+    case UT_FACTORY:
+      parts = [
+        part(openBox(6.2, 1.5, 4.8, 0, -1.2, 0), C.stoneDark),
+        part(openBox(4.6, 1.3, 3.4, -0.5, 0.3, 0), C.wall),
+        part(openBox(4.6, 0.75, 3.4, -0.5, 1.6, 0), C.tintBase, tint),
+        part(openBox(0.75, 3.4, 0.75, 2.3, 0.3, -0.9), C.brick),
+      ];
+      break;
+    case UT_DEFENSE_POST:
+      parts = [
+        part(lowCyl(2.7, 2.7, 1.5, 8, 0, -1.2, 0), C.stoneDark),
+        part(lowCyl(2.35, 2.35, 0.99, 8, 0, 0.3, 0), C.tintBase, tint),
+        part(lowCyl(1.0, 1.1, 0.7, 6, 0, 1.29, 0), C.tintShade, tint),
+      ];
+      break;
+    case UT_SAM_LAUNCHER: {
+      const cols = Math.max(1, Math.min(3, variant));
+      parts = [
+        part(lowCyl(2.6, 2.8, 1.6, 8, 0, -1.2, 0), C.concrete),
+        part(lowCyl(1.6, 1.7, 0.3, 8, 0, 0.4, 0), C.tintBase, tint),
+        part(openBox(2.0, 0.9, 0.5 + 0.55 * cols, 0.3, 0.9, 0), C.white),
+      ];
+      break;
+    }
+    case UT_MISSILE_SILO: {
+      const n = Math.max(1, Math.min(4, variant));
+      const spots: [number, number][] =
+        n === 1
+          ? [[0.3, 0]]
+          : (
+              [
+                [-1.15, -1.15],
+                [1.15, 1.15],
+                [1.15, -1.15],
+                [-1.15, 1.15],
+              ] as [number, number][]
+            ).slice(0, n);
+      const r = n === 1 ? 1.5 : 1.0;
+      parts = [part(openBox(5.6, 1.5, 5.6, 0, -1.2, 0), C.concrete)];
+      for (const [x, z] of spots) {
+        parts.push(
+          part(lowCyl(r, r * 1.2, 0.95, 6, x, 0.3, z), C.tintBase, tint),
+        );
+      }
+      break;
+    }
+    default:
+      return null;
+  }
+  return assemble(parts, STRUCTURE_SCALE);
 }
 
 /**

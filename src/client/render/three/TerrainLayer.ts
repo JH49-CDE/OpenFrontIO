@@ -14,16 +14,29 @@
  * Shading (shaders/terrain.ts) works at TILE resolution with texelFetch on:
  * terrain bytes (R8UI, shared with WaterLayer), tile state (R16UI, the live
  * engine buffer referenced directly), the relation matrix (R8UI) and the
- * palette (RGBA32F). Partial tile uploads are per-row texel spans; nothing
- * loops over tiles per frame. Close up (a tile over ~3-7 px) the shader
- * switches to a procedural diorama look: organic terrain zones, rock / snow
- * lines and micro detail (`closeUpAmount` and friends in TerrainShading.ts
- * mirror its math); land / water and ownership stay exact per tile.
+ * palette (RGBA32F). Nothing loops over tiles per frame. Close up (a tile
+ * over ~3-7 px) the shader switches to a procedural diorama look: organic
+ * terrain zones, rock / snow lines and micro detail (`closeUpAmount` and
+ * friends in TerrainShading.ts mirror its math); land / water and
+ * ownership stay exact per tile.
+ *
+ * Tile uploads: a tick's changed tiles only mark 16×16-tile cells dirty
+ * (`TileUploadQueue`); each frame `update` sends the dirty cells as a few
+ * merged rectangles, one `texSubImage2D` each, within a per-frame budget
+ * (`TILE_UPLOAD_BUDGET`; the rest waits for the next frames, like the
+ * default renderer's drip buckets). A hydrogen bomb's ~31k tiles become one
+ * rectangle instead of one call per row. During the spawn phase everything
+ * is sent at once, and full uploads (first tick, a new buffer, context
+ * restore, more than half the map pending) stay immediate.
  *
  * Contract notes:
  * - `setTiles(tileState, changed)`: `tileState` is the live engine-mirror
  *   buffer, mutated again on the next tick. The texture references it, so a
- *   row re-upload always sends current data. `changed === null` = full upload.
+ *   deferred rectangle always sends current data, and a cell is only marked
+ *   clean once a rectangle covering it was sent. `changed === null` = full
+ *   upload.
+ * - `setSpawnPhase(on)` (from the facade's `updateSpawnOverlay`): while on,
+ *   queued tiles are all sent on the next frame, without a budget.
  * - `setTerrainBytes(null, bytes)`: `bytes` is the full-map array (the same
  *   instance as `ctx.heightField.terrain`). With rects, the facade has
  *   ALREADY patched `heightField.terrain` and recomputed the heights
@@ -43,20 +56,20 @@ import {
   refreshWaterUniforms,
   setTextureData,
   TerrainByteTexture,
+  TextureRectUploader,
   textureData,
   uploadNow,
   type WaterUniforms,
   waterColorKey,
 } from "./TerrainResources";
 import {
-  addTexelSpan,
   COAST_LIFT,
   computeCellLand,
   hexToSrgb01,
   type Rgb,
-  RowSpans,
   vertexTouchesLand,
 } from "./TerrainShading";
+import { type TileUploadBudget, TileUploadQueue } from "./TileUploadQueue";
 import type { FrameInfo, ThreeLayerContext } from "./types";
 
 /** Size of the relation matrix (frame/derive/RelationMatrix.ts). */
@@ -75,6 +88,21 @@ const MIN_BORDER_TILES = 0.2;
 const BORDER_GLOW = 0.25;
 /** Skirt bottom, below the deepest seabed. */
 const SKIRT_EXTRA_DEPTH = 1;
+
+/**
+ * Tile-state uploads per frame outside the spawn phase: at most 8
+ * `texSubImage2D` calls and 256k texels (512 KB), but always at least one
+ * rectangle. Replaying recorded ticks of a 30-bot World game at 60 FPS,
+ * an ordinary tick needs ~27 rectangles (sent within 3-4 frames) and a
+ * hydrogen bomb's disc one; the per-row spans used to send ~144 and ~263
+ * calls in one frame.
+ */
+export const TILE_UPLOAD_BUDGET: TileUploadBudget = {
+  maxCalls: 8,
+  maxTexels: 1 << 18,
+};
+/** Frames over which the perf counters keep their maxima. */
+const PERF_WINDOW = 120;
 
 /** Fallbacks = render-settings.json defaults (sRGB 0..1). */
 const DEFAULT_TERRAIN = {
@@ -150,9 +178,25 @@ export class TerrainLayer {
   private readonly tileTex: THREE.DataTexture;
   /** False until the tile texture got a full upload from us. */
   private tilesUploaded = false;
+  /** Dirty tile cells waiting for an upload. */
+  private readonly tileQueue: TileUploadQueue;
+  private readonly tileUploader: TextureRectUploader;
+  /** Spawn phase: queued tiles go out all at once. */
+  private spawnPhase = false;
+  /** Upload calls / texels since the last frame's flush (perf counters). */
+  private callsPending = 0;
+  private texelsPending = 0;
+  private callsLastFrame = 0;
+  private texelsLastFrame = 0;
+  private callsTotal = 0;
+  private texelsTotal = 0;
+  private fullUploads = 0;
+  /** Per-frame calls / texels of the last PERF_WINDOW frames (perf only). */
+  private readonly recentCalls: Int32Array | null;
+  private readonly recentTexels: Int32Array | null;
+  private recentIndex = 0;
   private relTex: THREE.DataTexture;
   private relSize = RELATION_SIZE;
-  private readonly spans: RowSpans;
 
   private readonly geometry = new THREE.BufferGeometry();
   private readonly material: THREE.ShaderMaterial;
@@ -178,7 +222,10 @@ export class TerrainLayer {
     this.hf = hf;
     this.W = ctx.mapWidth;
     this.H = ctx.mapHeight;
-    this.spans = new RowSpans(this.W, this.H);
+    this.tileQueue = new TileUploadQueue(this.W, this.H);
+    const perf = ctx.settings.perf === true;
+    this.recentCalls = perf ? new Int32Array(PERF_WINDOW) : null;
+    this.recentTexels = perf ? new Int32Array(PERF_WINDOW) : null;
 
     // ---- Textures ----
     this.terrainBytes = TerrainByteTexture.acquire(ctx);
@@ -189,6 +236,7 @@ export class TerrainLayer {
       this.H,
       "R16UI",
     );
+    this.tileUploader = new TextureRectUploader(this.tileTex);
     this.relTex = createIntegerTexture(
       new Uint8Array(RELATION_SIZE * RELATION_SIZE),
       RELATION_SIZE,
@@ -254,8 +302,7 @@ export class TerrainLayer {
     tileState: Uint16Array,
     changedTiles: readonly number[] | null,
   ): void {
-    const W = this.W;
-    if (tileState.length !== W * this.H) return;
+    if (tileState.length !== this.W * this.H) return;
     const tex = this.tileTex;
     if (
       changedTiles === null ||
@@ -263,24 +310,37 @@ export class TerrainLayer {
       textureData(tex) !== tileState
     ) {
       setTextureData(tex, tileState);
-      uploadNow(this.ctx.renderer, tex);
-      this.tilesUploaded = true;
+      this.uploadAllTiles();
       return;
     }
-    const n = this.spans.collect(changedTiles);
-    if (n === 0) return;
-    let texels = 0;
-    for (let k = 0; k < n; k++) texels += this.spans.x1[k] - this.spans.x0[k];
-    // Past half the map, one full upload beats thousands of row calls.
-    if (texels + n > (W * this.H) / 2) {
-      uploadNow(this.ctx.renderer, tex);
-      return;
-    }
-    for (let k = 0; k < n; k++) {
-      const x0 = this.spans.x0[k];
-      addTexelSpan(tex, W, x0, this.spans.rows[k], this.spans.x1[k] - x0 + 1);
-    }
-    tex.needsUpdate = true;
+    // Sent by the next frames' `update` (flushTiles).
+    this.tileQueue.markTiles(changedTiles);
+  }
+
+  /** Spawn phase on: queued tiles are all sent on the next frame. */
+  setSpawnPhase(inSpawnPhase: boolean): void {
+    this.spawnPhase = inSpawnPhase;
+  }
+
+  /**
+   * Upload counters for the perf tool (`three_perf=1`): calls and texels of
+   * the last frame (including a full upload pushed between frames), their
+   * maxima over the last 120 frames (perf builds only), totals, and what is
+   * still queued.
+   */
+  perfStats(): Record<string, number> {
+    const max = (a: Int32Array | null) => (a === null ? 0 : Math.max(...a));
+    return {
+      uploadCallsLastFrame: this.callsLastFrame,
+      texelsLastFrame: this.texelsLastFrame,
+      uploadCallsMax: max(this.recentCalls),
+      texelsMax: max(this.recentTexels),
+      pendingTexels: this.tileQueue.pendingTexels,
+      pendingCells: this.tileQueue.pendingCells,
+      uploadCallsTotal: this.callsTotal,
+      texelsTotal: this.texelsTotal,
+      fullUploads: this.fullUploads,
+    };
   }
 
   setTerrainBytes(
@@ -319,6 +379,7 @@ export class TerrainLayer {
   setDefenseCoverage(units: ReadonlyMap<number, UnitState>): void {}
 
   update(frame: FrameInfo): void {
+    this.flushTiles();
     const u = this.u;
     u.uTime.value = (frame.nowMs / 1000) % 3600;
     u.uHighlightOwner.value = frame.highlightOwner;
@@ -331,12 +392,63 @@ export class TerrainLayer {
   }
 
   dispose(): void {
+    this.tileQueue.clear();
     this.ctx.scene.remove(this.mesh);
     this.geometry.dispose();
     this.material.dispose();
     this.tileTex.dispose();
     this.relTex.dispose();
     this.terrainBytes.release();
+  }
+
+  // ---- Tile uploads ----
+
+  /** Full upload of the tile state, right now; nothing stays queued. */
+  private uploadAllTiles(): void {
+    this.tileQueue.clear();
+    uploadNow(this.ctx.renderer, this.tileTex);
+    this.tilesUploaded = true;
+    this.fullUploads++;
+    this.countUpload(1, this.W * this.H);
+  }
+
+  /**
+   * Send queued tile cells: all of them during the spawn phase, else the
+   * next rectangles within `TILE_UPLOAD_BUDGET`. Past half the map pending,
+   * one full upload is cheaper than rectangles.
+   */
+  private flushTiles(): void {
+    const q = this.tileQueue;
+    if (!q.empty) {
+      if (q.pendingTexels > (this.W * this.H) / 2) {
+        this.uploadAllTiles();
+      } else {
+        const rects = q.take(this.spawnPhase ? null : TILE_UPLOAD_BUDGET);
+        const renderer = this.ctx.renderer;
+        for (let i = 0; i < rects.length; i++) {
+          const r = rects[i];
+          this.tileUploader.upload(renderer, r.x, r.y, r.w, r.h);
+          this.countUpload(1, r.w * r.h);
+        }
+      }
+    }
+    // Close this frame's counters (between-frame full uploads included).
+    this.callsLastFrame = this.callsPending;
+    this.texelsLastFrame = this.texelsPending;
+    this.callsPending = 0;
+    this.texelsPending = 0;
+    if (this.recentCalls !== null && this.recentTexels !== null) {
+      this.recentCalls[this.recentIndex] = this.callsLastFrame;
+      this.recentTexels[this.recentIndex] = this.texelsLastFrame;
+      this.recentIndex = (this.recentIndex + 1) % PERF_WINDOW;
+    }
+  }
+
+  private countUpload(calls: number, texels: number): void {
+    this.callsPending += calls;
+    this.texelsPending += texels;
+    this.callsTotal += calls;
+    this.texelsTotal += texels;
   }
 
   // ---- Uniform refresh ----

@@ -19,6 +19,7 @@ import {
   nukeOuterRadius,
   nukeVisualRadius,
   particleEnvelope,
+  quadScreenArea,
   shockwaveAlpha,
   shockwaveParams,
   smokePuffTexels,
@@ -246,9 +247,10 @@ describe("sprite textures", () => {
 
 const MAP_W = 400;
 
-function makeCtx(quality: "high" | "low" = "high") {
+function makeCtx(quality: "high" | "low" = "high", perf = false) {
   const settings = defaultThreeSettings();
   settings.quality = quality;
+  settings.perf = perf;
   const ctx: ThreeLayerContext = {
     renderer: {} as THREE.WebGLRenderer,
     scene: new THREE.Scene(),
@@ -399,6 +401,83 @@ describe("FxLayer", () => {
       if (o instanceof THREE.PointLight) lights++;
     });
     expect(lights).toBe(0);
+    fx.dispose();
+  });
+});
+
+describe("FX fill estimate (perf tool)", () => {
+  /** Camera `height` tiles above (x, z), looking straight down, north up. */
+  function topDown(x: number, z: number, height: number, fov = 60) {
+    const cam = new THREE.PerspectiveCamera(fov, 1000 / 800, 0.5, 10000);
+    cam.up.set(0, 0, -1);
+    cam.position.set(x, height, z);
+    cam.lookAt(x, 0, z);
+    cam.updateMatrixWorld();
+    return cam;
+  }
+
+  it("projects a camera-facing quad and clips it to the viewport", () => {
+    const cam = topDown(0, 0, 100);
+    const view = cam.matrixWorldInverse.elements;
+    // 800 px high, 60° vertical fov: focal = 400 / tan(30°) px.
+    const focal = 400 / Math.tan(Math.PI / 6);
+    const side = (10 * focal) / 100;
+    expect(quadScreenArea(view, focal, 1000, 800, 0, 0, 0, 10)).toBeCloseTo(
+      side * side,
+      6,
+    );
+    // Centred on the right edge of the view: half of it is on screen.
+    const edgeX = (500 * 100) / focal;
+    expect(quadScreenArea(view, focal, 1000, 800, edgeX, 0, 0, 10)).toBeCloseTo(
+      (side * side) / 2,
+      6,
+    );
+    // Behind the camera, or empty: nothing.
+    expect(quadScreenArea(view, focal, 1000, 800, 0, 150, 0, 10)).toBe(0);
+    expect(quadScreenArea(view, focal, 1000, 800, 0, 0, 0, 0)).toBe(0);
+    // Larger than the screen: the whole viewport.
+    expect(quadScreenArea(view, focal, 1000, 800, 0, 0, 0, 1e4)).toBe(
+      1000 * 800,
+    );
+  });
+
+  it("reports particle counts and the fill of a hydrogen bomb in screens", () => {
+    const ctx = makeCtx("high", true);
+    const fx = new FxLayer(ctx);
+    const at = (nowMs: number, height: number): FrameInfo => ({
+      ...frame(nowMs),
+      camera: topDown(200.5, 120.5, height),
+    });
+    fx.update(at(900, 400));
+    expect(fx.perfStats()).toMatchObject({
+      smokeParticles: 0,
+      fillScreens: 0,
+      fillScreensMax: 0,
+    });
+    fx.applyDeadUnits([dead("Hydrogen Bomb", true, 120 * MAP_W + 200)]);
+    fx.update(at(1000, 400));
+    fx.update(at(3000, 400));
+    const far = fx.perfStats();
+    expect(far.smokeParticles).toBeGreaterThan(80);
+    expect(far.liveEffects).toBe(1);
+    expect(far.fillScreens).toBeGreaterThan(0);
+    // Closer, the same cloud covers more of the screen.
+    fx.update(at(3000, 150));
+    const near = fx.perfStats();
+    expect(near.fillScreens).toBeGreaterThan(far.fillScreens);
+    expect(near.fillScreensMax).toBe(near.fillScreens);
+    fx.dispose();
+  });
+
+  it("does no fill work without the perf tool", () => {
+    const fx = new FxLayer(makeCtx());
+    fx.applyDeadUnits([dead("Hydrogen Bomb", true, 120 * MAP_W + 200)]);
+    fx.update(frame(1000));
+    fx.update(frame(3000));
+    const s = fx.perfStats();
+    expect(s.smokeParticles).toBeGreaterThan(80);
+    expect(s.fillScreens).toBe(0);
+    expect(s.fillScreensMax).toBe(0);
     fx.dispose();
   });
 });

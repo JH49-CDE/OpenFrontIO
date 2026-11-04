@@ -130,6 +130,9 @@ const FIREBALL_CAPACITY = 48;
 const DECAL_CAPACITY = 32;
 const LIGHT_POOL = 4;
 
+/** Frames over which the perf counters keep their maxima. */
+const FILL_WINDOW = 120;
+
 const RENDER_ORDER_DECALS = 20;
 const RENDER_ORDER_SMOKE = 21;
 const RENDER_ORDER_FIREBALLS = 22;
@@ -348,6 +351,46 @@ function smoothstep(e0: number, e1: number, x: number): number {
 }
 
 /** Soft round glow: gaussian core, zero alpha at the quad edge. */
+/**
+ * Screen area (device px², clipped to the viewport) of a camera-facing quad
+ * of side `size` (world units) centred on world point (x, y, z), seen
+ * through `view` (the camera's `matrixWorldInverse` elements, column-major)
+ * with a perspective focal length of `focalPx` (device px). 0 behind the
+ * camera. Rotation of the quad is ignored. This is the fill estimate of
+ * `FxLayer.perfStats`: blended FX fragments cost fill rate, not vertices.
+ */
+export function quadScreenArea(
+  view: ArrayLike<number>,
+  focalPx: number,
+  widthPx: number,
+  heightPx: number,
+  x: number,
+  y: number,
+  z: number,
+  size: number,
+): number {
+  const vx = view[0] * x + view[4] * y + view[8] * z + view[12];
+  const vy = view[1] * x + view[5] * y + view[9] * z + view[13];
+  const vz = view[2] * x + view[6] * y + view[10] * z + view[14];
+  const depth = -vz;
+  if (!(depth > 1e-3) || !(size > 0)) return 0;
+  const k = focalPx / depth;
+  const cx = widthPx / 2 + vx * k;
+  const cy = heightPx / 2 - vy * k;
+  const half = (size / 2) * k;
+  const w = Math.min(widthPx, cx + half) - Math.max(0, cx - half);
+  const h = Math.min(heightPx, cy + half) - Math.max(0, cy - half);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+/** Camera data for the fill estimate (perf tool only). */
+interface FillView {
+  view: ArrayLike<number>;
+  focalPx: number;
+  widthPx: number;
+  heightPx: number;
+}
+
 export function softCircleTexels(size: number): Uint8Array {
   const out = new Uint8Array(size * size * 4);
   const half = size / 2;
@@ -773,6 +816,26 @@ class ParticlePool {
     }
   }
 
+  /** Screen area of the quads streamed by the last `update` (device px²). */
+  screenArea(v: FillView): number {
+    const off = this.offsets.array as Float32Array;
+    const sr = this.sizeRot.array as Float32Array;
+    let area = 0;
+    for (let i = 0; i < this.geometry.instanceCount; i++) {
+      area += quadScreenArea(
+        v.view,
+        v.focalPx,
+        v.widthPx,
+        v.heightPx,
+        off[i * 3],
+        off[i * 3 + 1],
+        off[i * 3 + 2],
+        sr[i * 2],
+      );
+    }
+    return area;
+  }
+
   dispose(): void {
     this.geometry.dispose();
   }
@@ -876,6 +939,29 @@ class FireballPool {
       markRange(this.mesh.instanceMatrix, n);
       markRange(this.mesh.instanceColor!, n);
     }
+  }
+
+  /** Screen area of the spheres drawn by the last `update` (device px²). */
+  screenArea(v: FillView): number {
+    const m = this.mesh.instanceMatrix.array as Float32Array;
+    let area = 0;
+    for (let i = 0; i < this.mesh.count; i++) {
+      const o = i * 16;
+      // Bounding square of the disc (side 2r), times π/4 for the disc.
+      area +=
+        (Math.PI / 4) *
+        quadScreenArea(
+          v.view,
+          v.focalPx,
+          v.widthPx,
+          v.heightPx,
+          m[o + 12],
+          m[o + 13],
+          m[o + 14],
+          2 * m[o],
+        );
+    }
+    return area;
   }
 
   dispose(): void {
@@ -1243,10 +1329,28 @@ export class FxLayer {
    */
   private flashGain = 1;
   private readonly baseDensity: number;
+  /**
+   * Perf tool only (`three_perf=1`): FX fill of the last frames, in screens
+   * (quad / sphere screen area over the viewport area), and the camera data
+   * of the last frame.
+   */
+  private readonly recentFill: Float32Array | null;
+  private recentIndex = 0;
+  private readonly fillView: {
+    view: Float32Array;
+    focalPx: number;
+    widthPx: number;
+    heightPx: number;
+  } | null;
 
   constructor(private readonly ctx: ThreeLayerContext) {
     const low = ctx.settings.quality === "low";
     this.baseDensity = low ? 0.5 : 1;
+    const perf = ctx.settings.perf === true;
+    this.recentFill = perf ? new Float32Array(FILL_WINDOW) : null;
+    this.fillView = perf
+      ? { view: new Float32Array(16), focalPx: 1, widthPx: 1, heightPx: 1 }
+      : null;
 
     const glowTex = makeSpriteTexture(softCircleTexels(64), 64);
     const smokeTex = makeSpriteTexture(smokePuffTexels(64, 7), 64);
@@ -1363,6 +1467,54 @@ export class FxLayer {
     this.fireballs.update(now);
     this.decals.update(now, this.ctx.heightField);
     this.lights.update(now);
+    if (this.recentFill !== null) {
+      this.recentFill[this.recentIndex] = this.fillScreens(frame);
+      this.recentIndex = (this.recentIndex + 1) % FILL_WINDOW;
+    }
+  }
+
+  /**
+   * Counters for the perf tool (`three_perf=1`): live particles and
+   * effects, and the FX fill in screens (screen area of the glow / smoke
+   * quads and fireballs over the viewport area: 2 = every pixel blended
+   * twice on average) for the last frame and its maximum over the last 120
+   * frames. Decals are thin draped rings and left out.
+   */
+  perfStats(): Record<string, number> {
+    const fill = this.recentFill;
+    const last =
+      fill === null
+        ? 0
+        : fill[(this.recentIndex + FILL_WINDOW - 1) % FILL_WINDOW];
+    let max = 0;
+    if (fill !== null) for (const v of fill) max = Math.max(max, v);
+    return {
+      glowParticles: this.glow.size,
+      smokeParticles: this.smoke.size,
+      fireballs: this.fireballs.size,
+      decals: this.decals.size,
+      pendingEffects: this.pending.length,
+      liveEffects: this.liveEnds.length,
+      fillScreens: Math.round(last * 100) / 100,
+      fillScreensMax: Math.round(max * 100) / 100,
+    };
+  }
+
+  /** FX fill of this frame, in screens (perf tool only). */
+  private fillScreens(frame: FrameInfo): number {
+    const v = this.fillView;
+    const cam = frame.camera;
+    if (v === null || !(cam instanceof THREE.PerspectiveCamera)) return 0;
+    const dpr = frame.dpr > 0 ? frame.dpr : 1;
+    v.widthPx = Math.max(1, frame.cssWidth * dpr);
+    v.heightPx = Math.max(1, frame.cssHeight * dpr);
+    v.focalPx = v.heightPx / 2 / Math.tan(((cam.fov / 2) * Math.PI) / 180);
+    v.view.set(cam.matrixWorldInverse.elements);
+    const area =
+      this.glow.screenArea(v) +
+      this.smoke.screenArea(v) +
+      this.fireballs.screenArea(v);
+    return area / (v.widthPx * v.heightPx);
   }
 
   /** Pool / queue occupancy (debugging and tests). */

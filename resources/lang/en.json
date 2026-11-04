@@ -2545,6 +2545,33 @@
     },
     "select_skin": "Skin"
   },
+  "three_perf": {
+    "aa_fxaa": "FXAA",
+    "aa_msaa": "MSAA ×{samples}",
+    "aa_off": "no AA",
+    "between_frames": "Between frames (ticks): {avg} ms · max {max}",
+    "bloom_off": "no bloom",
+    "bloom_on": "bloom",
+    "draws": "Draw calls {calls} · triangles {triangles}",
+    "fps": "FPS {fps} · frame {avg} ms · p99 {p99} ms",
+    "gpu": "GPU {avg} ms · p99 {p99}",
+    "gpu_na": "GPU n/a",
+    "js": "JS {total} ms (update {update} · render {render} · names {names}) · max {max}",
+    "layer_environment": "Sky & lights",
+    "layer_fx": "Effects",
+    "layer_line": "{layer}: {triangles} tris · {avg}/{max} ms",
+    "layer_names": "Names",
+    "layer_other": "Other",
+    "layer_overlay": "Overlays",
+    "layer_structures": "Structures",
+    "layer_terrain": "Terrain",
+    "layer_units": "Units",
+    "layer_water": "Water",
+    "layers_header": "Layers: triangles · update avg/max",
+    "quality_high": "high",
+    "quality_low": "low",
+    "title": "3D renderer · {quality} · {bloom} · {aa}"
+  },
   "token_login_modal": {
     "success": "Successfully logged in as {email}!",
     "title": "Logging in..."

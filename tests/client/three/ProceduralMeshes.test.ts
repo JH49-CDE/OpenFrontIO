@@ -2,15 +2,20 @@ import * as THREE from "three";
 import { describe, expect, it } from "vitest";
 import {
   BlobShadows,
-  createRailPieceGeometry,
+  createRailDetailGeometry,
+  createRailStripGeometry,
   createStructureGeometry,
+  createStructureLodGeometry,
   createUnitGeometry,
+  createUnitLodGeometry,
   InstancedBatch,
   nextCapacity,
+  RAIL_TOP,
   setOwnerColor,
   shadowOffset,
   STRUCTURE_FOOTPRINT,
   structureVariant,
+  triangleCount,
   UNIT_MESH_LENGTH,
   UnitMesh,
 } from "../../../src/client/render/three/ProceduralMeshes";
@@ -106,7 +111,70 @@ describe("unit models", () => {
   }
 });
 
+describe("unit LOD models", () => {
+  it("boats, trains and shells: far fewer triangles, same size, no bottoms", () => {
+    const withLod: string[] = [
+      UnitMesh.Transport,
+      UnitMesh.TradeShip,
+      UnitMesh.Warship,
+      UnitMesh.TrainEngine,
+      UnitMesh.TrainCarriage,
+      UnitMesh.TrainLoaded,
+      UnitMesh.Shell,
+    ];
+    for (const kind of Object.values(UnitMesh)) {
+      const lod = createUnitLodGeometry(kind);
+      if (!withLod.includes(kind)) {
+        expect(lod, kind).toBeNull();
+        continue;
+      }
+      expect(lod, kind).not.toBeNull();
+      const full = createUnitGeometry(kind);
+      expectPartAttributes(lod!);
+      expect(triangleCount(lod!), kind).toBeLessThanOrEqual(42);
+      expect(triangleCount(lod!) * 2, kind).toBeLessThan(triangleCount(full));
+      full.computeBoundingBox();
+      lod!.computeBoundingBox();
+      const fb = full.boundingBox!;
+      const lb = lod!.boundingBox!;
+      // Same footprint within 15%, so the switch does not pop.
+      expect(lb.max.x - lb.min.x).toBeCloseTo(fb.max.x - fb.min.x, 0);
+      expect(
+        Math.abs(lb.max.z - lb.min.z - (fb.max.z - fb.min.z)),
+      ).toBeLessThan(0.15 * (fb.max.z - fb.min.z));
+      // Owner-tinted surface (shells are neutral flames).
+      const tint = lod!.getAttribute("aTint").array;
+      if (kind !== UnitMesh.Shell) expect(tint.some((v) => v === 1)).toBe(true);
+      full.dispose();
+      lod!.dispose();
+    }
+  });
+});
+
 describe("structure models", () => {
+  it("LOD models: same footprint, a fraction of the triangles", () => {
+    for (const type of STRUCTURE_TYPES) {
+      for (const v of [1, 3, 6]) {
+        const variant = structureVariant(type, v);
+        const full = createStructureGeometry(type, variant)!;
+        const lod = createStructureLodGeometry(type, variant);
+        expect(lod, `${type} v${variant}`).not.toBeNull();
+        expectPartAttributes(lod!);
+        expect(triangleCount(lod!)).toBeLessThanOrEqual(110);
+        expect(triangleCount(lod!) * 2).toBeLessThan(triangleCount(full));
+        lod!.computeBoundingBox();
+        const box = lod!.boundingBox!;
+        const extent = Math.max(box.max.x - box.min.x, box.max.z - box.min.z);
+        expect(extent).toBeLessThanOrEqual(STRUCTURE_FOOTPRINT[type] * 1.02);
+        expect(extent).toBeGreaterThan(STRUCTURE_FOOTPRINT[type] * 0.6);
+        expect(box.min.y).toBeLessThan(-1);
+        full.dispose();
+        lod!.dispose();
+      }
+    }
+    expect(createStructureLodGeometry("Warship")).toBeNull();
+  });
+
   it("builds every type and level variant within its footprint", () => {
     for (const type of STRUCTURE_TYPES) {
       const variants = new Set<number>();
@@ -171,16 +239,32 @@ describe("setOwnerColor", () => {
 
 describe("rail pieces and shadows", () => {
   it("builds a half-track from the tile centre to its edge", () => {
-    const g = createRailPieceGeometry();
-    expectPartAttributes(g);
-    g.computeBoundingBox();
-    const box = g.boundingBox!;
+    // Strip: one flat quad, the ballast bed.
+    const strip = createRailStripGeometry();
+    expect(triangleCount(strip)).toBe(2);
+    strip.computeBoundingBox();
+    const sb = strip.boundingBox!;
+    expect([sb.min.x, sb.max.x]).toEqual([0, 0.5]);
+    expect(sb.max.y - sb.min.y).toBeCloseTo(0, 6);
+    expect(sb.max.z - sb.min.z).toBeLessThanOrEqual(0.5);
+    expect(strip.getAttribute("normal").getY(0)).toBeCloseTo(1, 6);
+    // Detail: sleepers + rails, 16 triangles (was 60 with the old boxes),
+    // on top of the strip with the rail heads at RAIL_TOP.
+    const detail = createRailDetailGeometry();
+    expectPartAttributes(detail);
+    expect(triangleCount(detail)).toBe(16);
+    detail.computeBoundingBox();
+    const box = detail.boundingBox!;
     expect(box.min.x).toBeCloseTo(0, 1);
     expect(box.max.x).toBeCloseTo(0.5, 1);
-    // Flat on the ground, narrower than a tile.
-    expect(box.max.y).toBeLessThanOrEqual(0.1 + 1e-6);
+    expect(box.min.y).toBeGreaterThan(sb.max.y);
+    expect(box.max.y).toBeCloseTo(RAIL_TOP, 6);
     expect(box.max.z - box.min.z).toBeLessThan(0.6);
-    g.dispose();
+    // No face points down (they are never seen).
+    const n = detail.getAttribute("normal");
+    for (let i = 0; i < n.count; i++) expect(n.getY(i)).toBeGreaterThan(-0.5);
+    strip.dispose();
+    detail.dispose();
   });
 
   it("shifts shadows away from the north-west sun", () => {

@@ -24,8 +24,14 @@
  *   away from the sun.
  * - Warships show the default renderer's health bar (when damaged) and
  *   veterancy pips (`StatusBars`), selected ones a glowing owner ring.
- * - Railways (`RailTracks`) are drawn from the railroad tile state so
+ * - Railways (`RailTracks.ts`) are drawn from the railroad tile state so
  *   trains run on visible tracks; trains ride on top of the rails.
+ * - Culling and level of detail: units whose bounding sphere is outside the
+ *   view frustum are not drawn (their trails keep sampling). Boats, trains
+ *   and shells shorter on screen than UNIT_LOD_PX (UNIT_LOD_PX_LOW with
+ *   `quality: "low"`) use a low-poly model (`createUnitLodGeometry`, batch
+ *   `units-<kind>-lod`).
+ * - `perfStats()` reports unit and railway counters for the perf tool.
  *
  * Contract notes:
  * - `updateUnits` runs once per sim tick with the FULL unit map (structures
@@ -54,21 +60,26 @@ import {
   type UnitState,
 } from "../types";
 import { smoothstep } from "./CameraRig";
-import type { HeightField } from "./HeightField";
 import {
   BlobShadows,
   createPartMaterial,
-  createRailPieceGeometry,
   createUnitGeometry,
+  createUnitLodGeometry,
   InstancedBatch,
   nextCapacity,
+  RAIL_TOP,
   setOwnerColor,
   shadowOffset,
+  triangleCount,
   UNIT_MESH_LENGTH,
+  UnitMesh,
   type UnitMeshKind,
 } from "./ProceduralMeshes";
+import { pxPerTileAtDepth, RailTracks } from "./RailTracks";
 import { barSize, StatusBars } from "./StatusBars";
 import type { FrameInfo, ThreeLayerContext } from "./types";
+
+export { railHalfDirections } from "./RailTracks";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -242,32 +253,21 @@ export function healthBarValue(
 }
 
 /**
- * Tile-space directions (radians: 0 east, π/2 south) of the half-tracks of
- * a railroad tile code (RailroadCache: rail type + 1): 1 vertical, 2
- * horizontal, 3 top-left, 4 top-right, 5 bottom-left, 6 bottom-right
- * (a curve joins the two named edges). Unknown codes have none.
+ * Whether a sphere at (x, y, z) of radius `r` is at least partly inside the
+ * frustum `planes` (normals pointing inwards, as `THREE.Frustum` builds them).
  */
-export function railHalfDirections(code: number): readonly number[] {
-  const E = 0;
-  const S = Math.PI / 2;
-  const Wd = Math.PI;
-  const N = -Math.PI / 2;
-  switch (code) {
-    case 1:
-      return [N, S];
-    case 2:
-      return [E, Wd];
-    case 3:
-      return [N, Wd];
-    case 4:
-      return [N, E];
-    case 5:
-      return [S, Wd];
-    case 6:
-      return [S, E];
-    default:
-      return [];
+export function sphereInFrustum(
+  planes: readonly THREE.Plane[],
+  x: number,
+  y: number,
+  z: number,
+  r: number,
+): boolean {
+  for (const pl of planes) {
+    const n = pl.normal;
+    if (n.x * x + n.y * y + n.z * z + pl.constant < -r) return false;
   }
+  return true;
 }
 
 /** Interpolation weight for a tick segment (see the file comment). */
@@ -408,10 +408,16 @@ const SELECTION_LIGHTEN = 0.3;
 const SELECTION_GLOW = 1.7;
 /** Shadows sit this far above the water / ground (tiles). */
 const SHADOW_LIFT = 0.06;
-/** Height of the rail heads above the ground; trains ride on them. */
-const RAIL_TOP = 0.1;
-/** Minimum time between two rebuilds of the railway instances. */
-const RAIL_REBUILD_MS = 750;
+/**
+ * Boats, trains and shells shorter than this on screen (CSS px) use their
+ * low-poly model; `quality: "low"` switches earlier.
+ */
+export const UNIT_LOD_PX = 24;
+export const UNIT_LOD_PX_LOW = 72;
+/** Batch key of each kind's low-poly model (no string building per frame). */
+const LOD_KEY = Object.fromEntries(
+  Object.values(UnitMesh).map((k) => [k, `${k}-lod`]),
+) as Readonly<Record<UnitMeshKind, string>>;
 /** Health bars / pips fade in between these zooms (CSS px per tile). */
 const BAR_FADE_ZOOM: readonly [number, number] = [0.8, 1.2];
 /** Height of shells above the surface, tiles. */
@@ -723,91 +729,6 @@ class TrailRenderer {
 }
 
 // ---------------------------------------------------------------------------
-// Railways
-// ---------------------------------------------------------------------------
-
-/**
- * Every railroad tile as instanced half-tracks (one draw call), draped on
- * the relief and pitched along its slope. Rebuilt from the full tile state
- * when it changed (or the terrain did), at most every RAIL_REBUILD_MS: a
- * scan of the W×H state plus two instances per rail tile.
- */
-class RailTracks {
-  private readonly geometry = createRailPieceGeometry();
-  private readonly batch: InstancedBatch;
-  private state: Uint8Array | null = null;
-  private dirty = false;
-  private lastBuildMs = -Infinity;
-  private heightVersion = -1;
-  private readonly m = new THREE.Matrix4();
-  private readonly q = new THREE.Quaternion();
-  private readonly e = new THREE.Euler(0, 0, 0, "YZX");
-  private readonly p = new THREE.Vector3();
-  private readonly one = new THREE.Vector3(1, 1, 1);
-  private readonly white = new THREE.Color(1, 1, 1);
-
-  constructor(
-    parent: THREE.Object3D,
-    material: THREE.Material,
-    private readonly hf: HeightField,
-    private readonly mapW: number,
-  ) {
-    this.batch = new InstancedBatch(
-      parent,
-      this.geometry,
-      material,
-      "rails",
-      256,
-    );
-  }
-
-  get count(): number {
-    return this.batch.count;
-  }
-
-  set(state: Uint8Array): void {
-    this.state = state;
-    this.dirty = true;
-  }
-
-  update(nowMs: number): void {
-    if (this.hf.version !== this.heightVersion) {
-      this.heightVersion = this.hf.version;
-      this.dirty = this.state !== null;
-    }
-    if (!this.dirty || this.state === null) return;
-    if (nowMs - this.lastBuildMs < RAIL_REBUILD_MS) return;
-    this.dirty = false;
-    this.lastBuildMs = nowMs;
-    const st = this.state;
-    const W = this.mapW;
-    const hf = this.hf;
-    this.batch.begin();
-    for (let i = 0; i < st.length; i++) {
-      const code = st[i];
-      if (code === 0) continue;
-      const x = (i % W) + 0.5;
-      const z = Math.floor(i / W) + 0.5;
-      const h = hf.surfaceAt(x, z);
-      for (const a of railHalfDirections(code)) {
-        const he = hf.surfaceAt(x + 0.5 * Math.cos(a), z + 0.5 * Math.sin(a));
-        this.p.set(x, h, z);
-        this.e.set(0, -a, Math.atan2(he - h, 0.5), "YZX");
-        this.q.setFromEuler(this.e);
-        this.m.compose(this.p, this.q, this.one);
-        this.batch.push(this.m, this.white);
-      }
-    }
-    this.batch.end();
-  }
-
-  dispose(): void {
-    this.batch.dispose();
-    this.geometry.dispose();
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Layer
 // ---------------------------------------------------------------------------
 
@@ -816,8 +737,11 @@ export class UnitLayer {
   /** Shared emissive strength of all unit parts (flickers a little). */
   private readonly glow = { value: 1 };
   private readonly material: THREE.MeshStandardMaterial;
-  private readonly templates = new Map<UnitMeshKind, THREE.BufferGeometry>();
-  private readonly batches = new Map<UnitMeshKind, InstancedBatch>();
+  /** Model geometry per batch key (`kind` or `kind-lod`); null = no LOD. */
+  private readonly templates = new Map<string, THREE.BufferGeometry | null>();
+  private readonly batches = new Map<string, InstancedBatch>();
+  /** Triangles of one instance, per batch. */
+  private readonly batchTris = new Map<InstancedBatch, number>();
   private readonly tracks = new Map<number, UnitTrack>();
   private readonly trails: TrailRenderer;
 
@@ -835,7 +759,17 @@ export class UnitLayer {
   private paletteVersion = -1;
   private lastNowMs = 0;
 
+  // Counters of the last frame (perfStats).
+  private drawnUnits = 0;
+  private lodUnits = 0;
+  private culledUnits = 0;
+  private unitTriangles = 0;
+  private unitJsMs = 0;
+
   // Scratch objects (no per-frame allocation).
+  private readonly frustum = new THREE.Frustum();
+  private readonly projScreen = new THREE.Matrix4();
+  private readonly fwd = new THREE.Vector3();
   private readonly m = new THREE.Matrix4();
   private readonly q = new THREE.Quaternion();
   private readonly e = new THREE.Euler(0, 0, 0, "YZX");
@@ -857,9 +791,10 @@ export class UnitLayer {
     this.healthRules = warshipHealthRules(ctx.config);
     this.rails = new RailTracks(
       this.group,
-      this.material,
       ctx.heightField,
       ctx.mapWidth,
+      ctx.mapHeight,
+      ctx.settings,
     );
 
     // Selection ring: a flat annulus facing up, drawn over everything.
@@ -952,6 +887,7 @@ export class UnitLayer {
   }
 
   update(frame: FrameInfo): void {
+    const t0 = performance.now();
     const now = frame.nowMs;
     this.lastNowMs = now;
     const t = now / 1000;
@@ -961,6 +897,24 @@ export class UnitLayer {
     this.glow.value = 1 + 0.1 * Math.sin(t * 23) + 0.07 * Math.sin(t * 37);
     const barFade = smoothstep(BAR_FADE_ZOOM[0], BAR_FADE_ZOOM[1], zoom);
     const pulse = 1 + 0.15 * Math.sin(t * 4);
+
+    // View frustum, and depth along the view direction for the LOD.
+    const cam = frame.camera;
+    this.projScreen.multiplyMatrices(
+      cam.projectionMatrix,
+      cam.matrixWorldInverse,
+    );
+    this.frustum.setFromProjectionMatrix(this.projScreen);
+    const planes = this.frustum.planes;
+    const ce = cam.matrixWorld.elements;
+    const fwd = this.fwd.set(-ce[8], -ce[9], -ce[10]).normalize();
+    const camDepth = ce[12] * fwd.x + ce[13] * fwd.y + ce[14] * fwd.z;
+    const focalPx = pxPerTileAtDepth(1, cam.fov, frame.cssHeight);
+    const lodPx =
+      this.ctx.settings.quality === "low" ? UNIT_LOD_PX_LOW : UNIT_LOD_PX;
+    let drawn = 0;
+    let lods = 0;
+    let culled = 0;
 
     for (const b of this.batches.values()) b.begin();
     this.rings.begin();
@@ -1065,13 +1019,6 @@ export class UnitLayer {
       }
       tr.worldY = wy;
 
-      this.p.set(x, wy, y);
-      this.e.set(roll, yaw, pitch, "YZX");
-      this.q.setFromEuler(this.e);
-      this.s.set(scale * stretch, scale, scale);
-      this.m.compose(this.p, this.q, this.s);
-      this.batchFor(tr.kind).push(this.m, tr.color, tr.targetable ? 1 : 0.6);
-
       if (info.trail !== undefined) {
         tr.trail ??= this.trails.create(info.trail, tr.color);
         // Trail starts at the missile's tail: centre − forward·(len/2).
@@ -1087,6 +1034,29 @@ export class UnitLayer {
           info.trail.width * 0.5 * scale,
         );
       }
+
+      // Off-screen: no model, shadow, bars or ring (the trail keeps going).
+      const radius = 0.6 * len * scale * stretch + 0.5;
+      if (!sphereInFrustum(planes, x, wy, y, radius)) {
+        culled++;
+        continue;
+      }
+      const depth = x * fwd.x + wy * fwd.y + y * fwd.z - camDepth;
+      const lengthPx = depth > 1e-6 ? (len * scale * focalPx) / depth : 1e9;
+      const lod = lengthPx < lodPx && this.lodTemplate(tr.kind) !== null;
+
+      this.p.set(x, wy, y);
+      this.e.set(roll, yaw, pitch, "YZX");
+      this.q.setFromEuler(this.e);
+      this.s.set(scale * stretch, scale, scale);
+      this.m.compose(this.p, this.q, this.s);
+      this.batchFor(tr.kind, lod).push(
+        this.m,
+        tr.color,
+        tr.targetable ? 1 : 0.6,
+      );
+      drawn++;
+      if (lod) lods++;
 
       if (info.shadow !== undefined) {
         const [sl, sw, sh, sa] = info.shadow;
@@ -1124,12 +1094,47 @@ export class UnitLayer {
       }
     }
 
-    for (const b of this.batches.values()) b.end();
+    let tris = 0;
+    for (const b of this.batches.values()) {
+      b.end();
+      tris += b.count * (this.batchTris.get(b) ?? 0);
+    }
     this.rings.end();
     this.shadows.end();
     this.bars.end();
     this.trails.update(now);
-    this.rails.update(now);
+    this.drawnUnits = drawn;
+    this.lodUnits = lods;
+    this.culledUnits = culled;
+    this.unitTriangles = tris;
+    this.unitJsMs = performance.now() - t0;
+    this.rails.update(frame);
+  }
+
+  /**
+   * Counters for the facade's perf tool (picked up by duck typing): railway
+   * pieces / triangles / blocks / JS time (see `RailStats`) and the units
+   * drawn this frame.
+   */
+  perfStats(): Record<string, number> {
+    const r = this.rails.stats();
+    return {
+      railPieces: r.pieces,
+      railDetailPieces: r.detailPieces,
+      railTriangles: r.triangles,
+      railBlocks: r.blocks,
+      railDetailBlocks: r.detailBlocks,
+      railBlocksRebuiltLastFrame: r.blocksRebuilt,
+      railBlocksPending: r.blocksPending,
+      railJsMs: r.jsMs,
+      railJsMsMax: r.jsMsMax,
+      railUploadKB: r.uploadBytes / 1024,
+      unitInstances: this.drawnUnits,
+      unitLodInstances: this.lodUnits,
+      unitCulled: this.culledUnits,
+      unitTriangles: this.unitTriangles,
+      unitJsMs: this.unitJsMs,
+    };
   }
 
   /**
@@ -1160,7 +1165,8 @@ export class UnitLayer {
   dispose(): void {
     for (const b of this.batches.values()) b.dispose();
     this.batches.clear();
-    for (const g of this.templates.values()) g.dispose();
+    this.batchTris.clear();
+    for (const g of this.templates.values()) g?.dispose();
     this.templates.clear();
     this.rings.dispose();
     this.ringTemplate.dispose();
@@ -1231,22 +1237,35 @@ export class UnitLayer {
     };
   }
 
-  private batchFor(kind: UnitMeshKind): InstancedBatch {
-    let batch = this.batches.get(kind);
+  /** The low-poly model of `kind` (built once), or null if it has none. */
+  private lodTemplate(kind: UnitMeshKind): THREE.BufferGeometry | null {
+    const key = LOD_KEY[kind];
+    let template = this.templates.get(key);
+    if (template === undefined) {
+      template = createUnitLodGeometry(kind);
+      this.templates.set(key, template);
+    }
+    return template;
+  }
+
+  private batchFor(kind: UnitMeshKind, lod = false): InstancedBatch {
+    const key = lod ? LOD_KEY[kind] : kind;
+    let batch = this.batches.get(key);
     if (batch === undefined) {
-      let template = this.templates.get(kind);
-      if (template === undefined) {
+      let template = lod ? this.lodTemplate(kind) : this.templates.get(key);
+      if (template === undefined || template === null) {
         template = createUnitGeometry(kind);
-        this.templates.set(kind, template);
+        this.templates.set(key, template);
       }
       batch = new InstancedBatch(
         this.group,
         template,
         this.material,
-        `units-${kind}`,
+        `units-${key}`,
         kind === "mirvWarhead" ? 512 : 32,
       );
-      this.batches.set(kind, batch);
+      this.batches.set(key, batch);
+      this.batchTris.set(batch, triangleCount(template));
     }
     return batch;
   }

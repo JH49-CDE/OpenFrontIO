@@ -15,8 +15,14 @@ import {
 } from "../../../src/client/render/three/OverlayLayer";
 import { PaletteView } from "../../../src/client/render/three/PaletteView";
 import {
+  createUnitGeometry,
+  triangleCount,
+  UnitMesh,
+} from "../../../src/client/render/three/ProceduralMeshes";
+import {
   levelLabelPx,
   StructureLayer,
+  structureLodAt,
   structureProgress,
   type StructureProgressRules,
 } from "../../../src/client/render/three/StructureLayer";
@@ -76,12 +82,32 @@ function makeContext(config?: Config): ThreeLayerContext {
   };
 }
 
+/**
+ * A camera looking straight down (north up) at the map centre from the
+ * height where the ground is drawn at `cssPxPerTile` CSS px per tile on the
+ * 800×600 canvas of `frame` — the whole 64×64 map is in view from 8 px per
+ * tile down.
+ */
+function topDownCamera(
+  cssPxPerTile: number,
+  cx = W / 2,
+  cz = H / 2,
+): THREE.PerspectiveCamera {
+  const cam = new THREE.PerspectiveCamera(60, 800 / 600, 1, 10_000);
+  const focal = 600 / (2 * Math.tan(Math.PI / 6));
+  cam.position.set(cx, focal / cssPxPerTile, cz);
+  cam.rotation.set(-Math.PI / 2, 0, 0, "YXZ");
+  cam.updateProjectionMatrix();
+  cam.updateMatrixWorld(true);
+  return cam;
+}
+
 function frame(nowMs: number, tickAlpha: number, cssPxPerTile = 4): FrameInfo {
   return {
     nowMs,
     dtMs: 16,
     tickAlpha,
-    camera: new THREE.PerspectiveCamera(),
+    camera: topDownCamera(cssPxPerTile),
     cssPxPerTile,
     tilt: 0,
     cssWidth: 800,
@@ -163,12 +189,7 @@ function barInstances(ctx: ThreeLayerContext, name: string): number {
 
 /** A camera looking straight down at the whole 64×64 test map. */
 function topDownFrame(nowMs: number, cssPxPerTile: number): FrameInfo {
-  const f = frame(nowMs, 1, cssPxPerTile);
-  const cam = new THREE.PerspectiveCamera(60, 800 / 600, 1, 500);
-  cam.position.set(W / 2, 80, H / 2);
-  cam.lookAt(W / 2, 0, H / 2);
-  cam.updateMatrixWorld(true);
-  return { ...f, camera: cam };
+  return frame(nowMs, 1, cssPxPerTile);
 }
 
 const disposers: (() => void)[] = [];
@@ -235,7 +256,7 @@ describe("UnitLayer", () => {
       ),
       1,
     );
-    layer.update(frame(0, 1));
+    layer.update(frame(0, 1, 8));
     expect(ctx.scene.getObjectByName("units-warship")).toBeUndefined();
     expect(ctx.scene.getObjectByName("units-atomBomb")).toBeUndefined();
     expect(instanced(ctx, "units-transport").count).toBe(1);
@@ -314,8 +335,82 @@ describe("UnitLayer", () => {
     const mesh = instanced(ctx, "units-transport");
     expect(instanceScale(mesh).y).toBeCloseTo(1);
     layer.update(frame(16, 1, 0.5));
-    // 10 px / (0.5 px/tile × 5 tiles) = ×4.
-    expect(instanceScale(mesh).y).toBeCloseTo(4);
+    // 10 px / (0.5 px/tile × 5 tiles) = ×4 — on the low-poly model, since
+    // the boat is now only 10 px long.
+    expect(mesh.count).toBe(0);
+    const lod = instanced(ctx, "units-transport-lod");
+    expect(lod.count).toBe(1);
+    expect(instanceScale(lod).y).toBeCloseTo(4);
+  });
+
+  it("culls units outside the view and keeps their trails going", () => {
+    const ctx = makeContext();
+    const layer = new UnitLayer(ctx);
+    disposers.push(() => layer.dispose());
+    layer.updateUnits(
+      unitMap(
+        unit({ id: 1, pos: ref(5, 5) }),
+        unit({ id: 2, pos: ref(60, 60) }),
+        unit({
+          id: 3,
+          unitType: "Atom Bomb",
+          pos: ref(58, 58),
+          lastPos: ref(57, 58),
+          targetTile: ref(62, 62),
+        }),
+      ),
+      1,
+    );
+    // Zoomed in on the north-west corner: 16 px per tile, ±25 × 19 tiles.
+    const f = { ...frame(0, 1, 16), camera: topDownCamera(16, 10, 10) };
+    layer.update(f);
+    expect(instanced(ctx, "units-warship").count).toBe(1);
+    expect(instancePosition(instanced(ctx, "units-warship")).x).toBeCloseTo(
+      5.5,
+    );
+    expect(ctx.scene.getObjectByName("units-atomBomb")).toBeUndefined();
+    expect(instanced(ctx, "unit-shadows").count).toBe(1);
+    // The off-screen nuke still lays its trail.
+    const trail = ctx.scene.getObjectByName("unit-trails") as THREE.Mesh;
+    layer.update({ ...f, nowMs: 100 });
+    expect(trail.visible).toBe(true);
+    const stats = layer.perfStats();
+    expect(stats.unitInstances).toBe(1);
+    expect(stats.unitCulled).toBe(2);
+    // The whole map in view: all three drawn.
+    layer.update(frame(200, 1, 4));
+    expect(layer.perfStats().unitCulled).toBe(0);
+    expect(layer.perfStats().unitInstances).toBe(3);
+  });
+
+  it("switches small boats and trains to low-poly models, earlier in low quality", () => {
+    const ships = () =>
+      unitMap(
+        unit({ id: 1, unitType: "Trade Ship", pos: ref(10, 10) }),
+        unit({ id: 2, unitType: "Trade Ship", pos: ref(20, 10) }),
+        unit({ id: 3, unitType: "Atom Bomb", pos: ref(30, 30) }),
+      );
+    const run = (quality: "high" | "low", zoom: number) => {
+      const ctx = makeContext();
+      if (quality === "low") ctx.settings.quality = "low";
+      const layer = new UnitLayer(ctx);
+      disposers.push(() => layer.dispose());
+      layer.updateUnits(ships(), 1);
+      layer.update(frame(0, 1, zoom));
+      return layer.perfStats();
+    };
+    // 5.5-tile ships: 44 px at 8 px per tile → full models (240 triangles).
+    const close = run("high", 8);
+    expect(close.unitLodInstances).toBe(0);
+    // 22 px at 4 px per tile → low-poly; the nuke has no LOD model.
+    const far = run("high", 4);
+    expect(far.unitLodInstances).toBe(2);
+    const bomb = triangleCount(createUnitGeometry(UnitMesh.AtomBomb));
+    expect(far.unitTriangles - bomb).toBeLessThan(
+      (close.unitTriangles - bomb) / 5,
+    );
+    // Low quality: still low-poly at 44 px.
+    expect(run("low", 8).unitLodInstances).toBe(2);
   });
 });
 
@@ -353,18 +448,33 @@ describe("UnitLayer status, shadows and rails", () => {
     layer.update(frame(16, 1, 0.5));
     expect(barInstances(ctx, "unit-status-bars")).toBe(0);
 
-    // Rails: a straight N-S tile and a curve, two half-tracks each.
+    // Rails: a straight N-S tile and a curve, two half-tracks each, as
+    // strips (each block's slot keeps some slack: zero matrices).
     const rails = new Uint8Array(W * H);
     rails[ref(40, 20)] = 1;
     rails[ref(41, 20)] = 6;
     layer.setRailroads(rails);
     layer.update(frame(2000, 1, 4));
-    expect(instanced(ctx, "rails").count).toBe(4);
-    // Trains ride on top of the rails, above the ground.
-    const train = instanced(ctx, "units-trainEngine");
+    expect(layer.perfStats().railPieces).toBe(4);
+    const strips = instanced(ctx, "rails");
+    expect(strips.count).toBeGreaterThanOrEqual(4);
+    expect(instancePosition(strips, 0).x).toBeCloseTo(40.5);
+    const slack = new THREE.Matrix4();
+    strips.getMatrixAt(4, slack);
+    expect(slack.elements.every((v) => v === 0)).toBe(true);
+    // Trains ride on top of the rails, above the ground (a 10 px train is
+    // drawn with its low-poly model).
+    const train = instanced(ctx, "units-trainEngine-lod");
     expect(instancePosition(train).y).toBeGreaterThan(
       ctx.heightField.surfaceAt(40.5, 20.5),
     );
+    // Close up the rails get sleepers and steel.
+    layer.update(frame(2016, 1, 12));
+    expect(instanced(ctx, "rails-detail").count).toBe(4);
+    const stats = layer.perfStats();
+    expect(stats.railDetailPieces).toBe(4);
+    expect(stats.railTriangles).toBe(strips.count * 2 + 4 * 16);
+    expect(stats.railJsMsMax).toBeGreaterThanOrEqual(stats.railJsMs);
   });
 
   it("maps railroad codes to the edges they join", () => {
@@ -433,6 +543,74 @@ describe("StructureLayer", () => {
     // Destroyed / removed structures disappear.
     layer.updateStructures(unitMap());
     expect(city.count).toBe(0);
+  });
+
+  it("switches to low-poly models when zoomed out (earlier in low quality)", () => {
+    expect(structureLodAt(4.9, false, false)).toBe(true);
+    expect(structureLodAt(5.2, false, false)).toBe(false);
+    // Hysteresis: back to full models only 15% above the threshold.
+    expect(structureLodAt(5.2, true, false)).toBe(true);
+    expect(structureLodAt(5.8, true, false)).toBe(false);
+    expect(structureLodAt(8, false, true)).toBe(true);
+
+    const ctx = makeContext();
+    const layer = new StructureLayer(ctx);
+    disposers.push(() => layer.dispose());
+    const cities = unitMap(
+      unit({ id: 1, unitType: "City", pos: ref(45, 20), level: 3 }),
+      unit({ id: 2, unitType: "City", pos: ref(50, 40), level: 3 }),
+    );
+    layer.update(frame(0, 1, 8));
+    layer.updateStructures(cities);
+    const full = layer.perfStats();
+    expect(full.structureLod).toBe(0);
+    expect(full.structureInstances).toBe(2);
+    const fullCity = instanced(ctx, "structures-City#3");
+    const fullScale = instanceScale(fullCity).x;
+    layer.update(frame(16, 1, 1));
+    const far = layer.perfStats();
+    expect(far.structureLod).toBe(1);
+    expect(fullCity.count).toBe(0);
+    const lodCity = instanced(ctx, "structures-City#3@lod");
+    expect(lodCity.count).toBe(2);
+    expect(far.structureTriangles * 3).toBeLessThan(full.structureTriangles);
+    // Same min-size boost as the full model would get at this zoom.
+    expect(instanceScale(lodCity).x).toBeGreaterThan(fullScale);
+    layer.update(frame(32, 1, 8));
+    expect(layer.perfStats().structureLod).toBe(0);
+    expect(fullCity.count).toBe(2);
+  });
+
+  it("culls structures outside the view", () => {
+    const ctx = makeContext();
+    const layer = new StructureLayer(ctx);
+    disposers.push(() => layer.dispose());
+    layer.update(frame(0, 1, 8));
+    layer.updateStructures(
+      unitMap(
+        unit({ id: 1, unitType: "City", pos: ref(36, 8), level: 3 }),
+        unit({ id: 2, unitType: "City", pos: ref(56, 56), level: 3 }),
+        unit({ id: 3, unitType: "Factory", pos: ref(40, 10) }),
+      ),
+    );
+    // Zoomed in on the north: the south-east city is out of view.
+    const near = { ...frame(16, 1, 30), camera: topDownCamera(30, 38, 9) };
+    layer.update(near);
+    const stats = layer.perfStats();
+    expect(stats.structureCulled).toBe(1);
+    expect(stats.structureInstances).toBe(2);
+    expect(instanced(ctx, "structures-City#3").count).toBe(1);
+    expect(instancePosition(instanced(ctx, "structures-City#3")).x).toBeCloseTo(
+      36.5,
+    );
+    expect(instanced(ctx, "structure-shadows").count).toBe(2);
+    // The same view next frame: nothing to rebuild, same draw.
+    layer.update({ ...near, nowMs: 32 });
+    expect(layer.perfStats().structureInstances).toBe(2);
+    // Whole map in view again.
+    layer.update(frame(48, 1, 8));
+    expect(layer.perfStats().structureCulled).toBe(0);
+    expect(instanced(ctx, "structures-City#3").count).toBe(2);
   });
 });
 
