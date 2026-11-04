@@ -661,6 +661,13 @@ export class UserSettings {
     return localStorage.getItem("dev-crown") ?? undefined;
   }
 
+  // For development only. Territory skin image URL for testing, set in the
+  // console manually (localStorage "dev-skin"), like getDevOnlyCrown. The
+  // image must load with CORS (crossOrigin "anonymous").
+  getDevOnlySkin(): string | undefined {
+    return localStorage.getItem("dev-skin") ?? undefined;
+  }
+
   /** Returns the selected crown name, or null if none is selected. */
   getSelectedCrownName(): string | null {
     return this.getCached(CROWN_KEY);

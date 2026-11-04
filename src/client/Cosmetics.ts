@@ -1635,7 +1635,11 @@ export async function getPlayerCosmetics(
     }
   }
 
-  if (refs.skinName && cosmetics) {
+  const devSkin = new UserSettings().getDevOnlySkin();
+
+  if (devSkin) {
+    result.skin = { name: "dev_skin", url: devSkin };
+  } else if (refs.skinName && cosmetics) {
     const skin = cosmetics.skins?.[refs.skinName];
     if (skin) {
       result.skin = { name: refs.skinName, url: skin.url };

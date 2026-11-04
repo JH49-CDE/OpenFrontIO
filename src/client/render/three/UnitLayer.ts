@@ -18,7 +18,9 @@
  * - Boats float at sea level with a gentle bob / roll; trains sit on the
  *   terrain, pitched along the slope; nukes fly an altitude profile (see
  *   `nukeAltitude`) pitched along their 3D velocity and leave a glowing
- *   additive ribbon trail.
+ *   additive ribbon trail; a nuke whose owner has a nuke-trail cosmetic
+ *   effect gets a ribbon in the effect's colours instead (the effect
+ *   palette of EffectTrails.ts, same colours as its ground track).
  * - Every model is scaled up to at least `settings.unitMinScreenPx` CSS px.
  * - Boats and trains get a soft contact shadow (`BlobShadows`), shifted
  *   away from the sun.
@@ -61,6 +63,13 @@ import {
 } from "../types";
 import { smoothstep } from "./CameraRig";
 import {
+  EFFECT_COLOR_GLSL,
+  EffectTrails,
+  effectColorAt,
+  hasEffect,
+  NUKE_TRAIL_BLOCK,
+} from "./EffectTrails";
+import {
   BlobShadows,
   createPartMaterial,
   createUnitGeometry,
@@ -76,7 +85,9 @@ import {
   type UnitMeshKind,
 } from "./ProceduralMeshes";
 import { pxPerTileAtDepth, RailTracks } from "./RailTracks";
+import { FRAG_OUTPUT } from "./shaders/water";
 import { barSize, StatusBars } from "./StatusBars";
+import { type Rgb, srgbToLinearRgb } from "./TerrainShading";
 import type { FrameInfo, ThreeLayerContext } from "./types";
 
 export { railHalfDirections } from "./RailTracks";
@@ -489,6 +500,91 @@ const TRAIL_SAMPLE_MS = 40;
 const TRAIL_FADE_MS = 700;
 /** Floats per trail sample: x, y, z, side.x, side.z. */
 const TRAIL_STRIDE = 5;
+/** Opacity of a nuke ribbon in its owner's effect colours, at its head. */
+export const RIBBON_EFFECT_OPACITY = 0.85;
+/** Extra emission of an effect-coloured ribbon (bloom), × its colour. */
+export const RIBBON_EFFECT_GLOW = 0.5;
+
+/**
+ * What a ribbon fragment writes before tone mapping and fog (TS mirror of
+ * RIBBON_FRAG): the default trail colour added (`alpha` 0: additive), or,
+ * for a nuke whose owner (`effectOwner`, 0 for other missiles) has a
+ * nuke-trail effect, the effect's colour at world (x, z) and time `t` (s),
+ * linear, composited over the scene at `RIBBON_EFFECT_OPACITY ×
+ * intensity`. Both are premultiplied (rgb already × alpha for the effect).
+ */
+export function ribbonFragment(
+  base: Rgb,
+  effectOwner: number,
+  intensity: number,
+  effect: Float32Array | null,
+  effectsOn: boolean,
+  x: number,
+  z: number,
+  t: number,
+): { rgb: Rgb; alpha: number } {
+  const e =
+    effectsOn && effectOwner > 0 && effect !== null
+      ? effectColorAt(effect, effectOwner, NUKE_TRAIL_BLOCK, x, z, t)
+      : null;
+  if (e === null) return { rgb: [base[0], base[1], base[2]], alpha: 0 };
+  const a = Math.min(1, Math.max(0, intensity)) * RIBBON_EFFECT_OPACITY;
+  const k = (1 + RIBBON_EFFECT_GLOW) * a;
+  const lin = srgbToLinearRgb(e);
+  return { rgb: [lin[0] * k, lin[1] * k, lin[2] * k], alpha: a };
+}
+
+const RIBBON_VERT = /* glsl */ `
+attribute vec3 aColor;  // default trail colour x intensity (linear)
+attribute vec2 aEffect; // (effect owner smallID, 0 = none; intensity)
+varying vec3 vColor;
+varying vec2 vEffect;
+varying vec3 vWorld;
+#include <fog_pars_vertex>
+void main() {
+  vColor = aColor;
+  vEffect = aEffect;
+  vec4 world = modelMatrix * vec4(position, 1.0);
+  vWorld = world.xyz;
+  vec4 mvPosition = viewMatrix * world;
+  gl_Position = projectionMatrix * mvPosition;
+  #include <fog_vertex>
+}
+`;
+
+const RIBBON_FRAG = /* glsl */ `
+${FRAG_OUTPUT}
+${EFFECT_COLOR_GLSL}
+varying vec3 vColor;
+varying vec2 vEffect;
+varying vec3 vWorld;
+#include <fog_pars_fragment>
+
+vec3 srgbToLinear(vec3 c) {
+  vec3 lo = c * (1.0 / 12.92);
+  vec3 hi = pow((c + 0.055) * (1.0 / 1.055), vec3(2.4));
+  return mix(lo, hi, step(vec3(0.04045), c));
+}
+
+void main() {
+  // Default: added (alpha 0 with ONE / ONE_MINUS_SRC_ALPHA blending), as the
+  // former additive MeshBasicMaterial. A nuke-trail effect: its colour
+  // (block 1, same bands as the ground track below), composited over.
+  vec3 rgb = vColor;
+  float a = 0.0;
+  int owner = int(vEffect.x + 0.5);
+  vec3 e;
+  if (owner > 0 && effectColor(owner, EFFECT_BLOCK_ROWS, vWorld.xz, e)) {
+    a = clamp(vEffect.y, 0.0, 1.0) * ${RIBBON_EFFECT_OPACITY.toFixed(3)};
+    rgb = srgbToLinear(e) * ${(1 + RIBBON_EFFECT_GLOW).toFixed(3)};
+  }
+  gl_FragColor = vec4(rgb, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+  #include <fog_fragment>
+  gl_FragColor = a > 0.0 ? vec4(gl_FragColor.rgb * a, a) : vec4(gl_FragColor.rgb, 0.0);
+}
+`;
 
 interface Trail {
   /** Ring buffer of samples, `TRAIL_STRIDE` floats each. */
@@ -508,36 +604,65 @@ interface Trail {
   /** Half width at the head, tiles. */
   halfWidth: number;
   color: THREE.Color;
+  /** Owner whose nuke-trail effect colours the ribbon (0 = none). */
+  effectOwner: number;
   diedMs: number;
 }
 
 /**
- * All nuke / SAM trails as one additive ribbon mesh, rebuilt every frame.
- * Each trail is a strip of quads from the missile's tail back through its
- * samples, tapering and fading to black (= invisible under additive blending).
+ * All nuke / SAM trails as one ribbon mesh, rebuilt every frame. Each trail
+ * is a strip of quads from the missile's tail back through its samples,
+ * tapering and fading to black (= invisible under additive blending).
  * Ribbons lie flat (their width is horizontal) so they read from above.
+ * A nuke's ribbon takes its owner's nuke-trail effect colours when they have
+ * one (outside the alt view), composited over the scene and fading the same
+ * way (see `ribbonFragment`).
  */
 class TrailRenderer {
-  private readonly material = new THREE.MeshBasicMaterial({
-    vertexColors: true,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-  });
+  private readonly material: THREE.ShaderMaterial;
+  /** Any player has a nuke-trail effect and the alt view is off. */
+  private readonly effectsOn = { value: 0 };
   private readonly mesh: THREE.Mesh;
   private positions = new Float32Array(0);
   private colors = new Float32Array(0);
+  private effect = new Float32Array(0);
   private index = new Uint32Array(0);
   private posAttr = new THREE.BufferAttribute(this.positions, 3);
   private colAttr = new THREE.BufferAttribute(this.colors, 3);
+  private effAttr = new THREE.BufferAttribute(this.effect, 2);
   private idxAttr = new THREE.BufferAttribute(this.index, 1);
   private vertCap = 0;
   private indexCap = 0;
   private readonly live = new Set<Trail>();
   private dying: Trail[] = [];
+  /** Live / dying nuke ribbons drawn in effect colours (last update). */
+  effectRibbons = 0;
 
-  constructor(parent: THREE.Object3D) {
+  constructor(
+    parent: THREE.Object3D,
+    private readonly effects: EffectTrails,
+  ) {
+    this.material = new THREE.ShaderMaterial({
+      name: "three-unit-trails",
+      glslVersion: THREE.GLSL3,
+      vertexShader: RIBBON_VERT,
+      fragmentShader: RIBBON_FRAG,
+      uniforms: {
+        ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
+        // Shared by reference with the ground trails.
+        uEffectPalette: effects.uniforms.uEffectPalette,
+        uTrailTime: effects.uniforms.uTrailTime,
+        uEffectsOn: this.effectsOn,
+      },
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: true,
+      // Premultiplied: alpha 0 adds (the default look), alpha > 0 is "over".
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneMinusSrcAlphaFactor,
+    });
     this.mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.material);
     this.mesh.name = "unit-trails";
     this.mesh.frustumCulled = false;
@@ -547,7 +672,8 @@ class TrailRenderer {
     this.ensure(1024, 3072);
   }
 
-  create(style: TrailStyle, owner: THREE.Color): Trail {
+  /** A trail; `effectOwner` > 0 colours it by that owner's nuke effect. */
+  create(style: TrailStyle, owner: THREE.Color, effectOwner = 0): Trail {
     // style colour × mix(1, owner, ownerMix): a warm glow with a hint of
     // the owner's colour.
     const k = style.ownerMix;
@@ -570,6 +696,7 @@ class TrailRenderer {
       liveSZ: 1,
       halfWidth: style.width / 2,
       color,
+      effectOwner,
       diedMs: 0,
     };
     this.live.add(trail);
@@ -616,7 +743,14 @@ class TrailRenderer {
     trail.pts[o + 4] = trail.liveSZ;
   }
 
-  update(nowMs: number): void {
+  update(nowMs: number, altView: boolean): void {
+    // Effects stay off in the alt view (strategic overlay), as the ground
+    // trails and the default renderer's spiral ribbons.
+    const palette = this.effects.effects;
+    const effectsOn = palette.nukePlayers > 0 && !altView;
+    this.effectsOn.value = effectsOn ? 1 : 0;
+    const effectData = effectsOn ? palette.data : null;
+    let effectRibbons = 0;
     this.dying = this.dying.filter((t) => nowMs - t.diedMs < TRAIL_FADE_MS);
     let verts = 0;
     let indices = 0;
@@ -631,11 +765,13 @@ class TrailRenderer {
     }
     if (indices === 0) {
       this.mesh.visible = false;
+      this.effectRibbons = 0;
       return;
     }
     this.ensure(verts, indices);
     const pos = this.positions;
     const col = this.colors;
+    const eff = this.effect;
     const idx = this.index;
     let v = 0;
     let ii = 0;
@@ -644,6 +780,14 @@ class TrailRenderer {
       if (n < 2) continue;
       const life = t.live ? 1 : 1 - (nowMs - t.diedMs) / TRAIL_FADE_MS;
       const base = v;
+      const owner = t.effectOwner;
+      if (
+        effectData !== null &&
+        owner > 0 &&
+        hasEffect(effectData, owner, NUKE_TRAIL_BLOCK)
+      ) {
+        effectRibbons++;
+      }
       for (let k = 0; k < n; k++) {
         let x: number, y: number, z: number, sx: number, sz: number;
         if (t.live && k === 0) {
@@ -677,6 +821,9 @@ class TrailRenderer {
         col[p] = col[p + 3] = r;
         col[p + 1] = col[p + 4] = g;
         col[p + 2] = col[p + 5] = b;
+        const q = v * 2;
+        eff[q] = eff[q + 2] = owner;
+        eff[q + 1] = eff[q + 3] = intensity;
         v += 2;
       }
       for (let k = 0; k < n - 1; k++) {
@@ -691,9 +838,11 @@ class TrailRenderer {
     }
     publishRange(this.posAttr, v * 3);
     publishRange(this.colAttr, v * 3);
+    publishRange(this.effAttr, v * 2);
     publishRange(this.idxAttr, ii);
     this.mesh.geometry.setDrawRange(0, ii);
     this.mesh.visible = true;
+    this.effectRibbons = effectRibbons;
   }
 
   dispose(): void {
@@ -711,16 +860,19 @@ class TrailRenderer {
     this.indexCap = nextCapacity(this.indexCap, indices);
     this.positions = new Float32Array(this.vertCap * 3);
     this.colors = new Float32Array(this.vertCap * 3);
+    this.effect = new Float32Array(this.vertCap * 2);
     this.index = new Uint32Array(this.indexCap);
     const g = new THREE.BufferGeometry();
     this.posAttr = new THREE.BufferAttribute(this.positions, 3);
     this.colAttr = new THREE.BufferAttribute(this.colors, 3);
+    this.effAttr = new THREE.BufferAttribute(this.effect, 2);
     this.idxAttr = new THREE.BufferAttribute(this.index, 1);
-    for (const a of [this.posAttr, this.colAttr, this.idxAttr]) {
+    for (const a of [this.posAttr, this.colAttr, this.effAttr, this.idxAttr]) {
       a.setUsage(THREE.DynamicDrawUsage);
     }
     g.setAttribute("position", this.posAttr);
-    g.setAttribute("color", this.colAttr);
+    g.setAttribute("aColor", this.colAttr);
+    g.setAttribute("aEffect", this.effAttr);
     g.setIndex(this.idxAttr);
     const old = this.mesh.geometry;
     this.mesh.geometry = g;
@@ -744,6 +896,8 @@ export class UnitLayer {
   private readonly batchTris = new Map<InstancedBatch, number>();
   private readonly tracks = new Map<number, UnitTrack>();
   private readonly trails: TrailRenderer;
+  /** Effect palette (shared with the ground trails). */
+  private readonly effectTrails: EffectTrails;
 
   private readonly ringTemplate: THREE.BufferGeometry;
   private readonly ringMaterial: THREE.MeshBasicMaterial;
@@ -781,7 +935,8 @@ export class UnitLayer {
     this.group.name = "units";
     ctx.scene.add(this.group);
     this.material = createPartMaterial({ glow: this.glow });
-    this.trails = new TrailRenderer(this.group);
+    this.effectTrails = EffectTrails.acquire(ctx);
+    this.trails = new TrailRenderer(this.group, this.effectTrails);
     this.shadows = new BlobShadows(this.group, "unit-shadows");
     this.bars = new StatusBars(
       this.group,
@@ -1020,7 +1175,12 @@ export class UnitLayer {
       tr.worldY = wy;
 
       if (info.trail !== undefined) {
-        tr.trail ??= this.trails.create(info.trail, tr.color);
+        // Nukes (TrailManager's nuke trails) take their owner's effect.
+        tr.trail ??= this.trails.create(
+          info.trail,
+          tr.color,
+          info.motion === "nuke" ? tr.owner : 0,
+        );
         // Trail starts at the missile's tail: centre − forward·(len/2).
         const cp = Math.cos(pitch);
         const back = (len / 2) * scale * 0.9;
@@ -1102,7 +1262,7 @@ export class UnitLayer {
     this.rings.end();
     this.shadows.end();
     this.bars.end();
-    this.trails.update(now);
+    this.trails.update(now, frame.altView);
     this.drawnUnits = drawn;
     this.lodUnits = lods;
     this.culledUnits = culled;
@@ -1113,8 +1273,8 @@ export class UnitLayer {
 
   /**
    * Counters for the facade's perf tool (picked up by duck typing): railway
-   * pieces / triangles / blocks / JS time (see `RailStats`) and the units
-   * drawn this frame.
+   * pieces / triangles / blocks / JS time (see `RailStats`), the units
+   * drawn this frame and the nuke ribbons drawn in effect colours.
    */
   perfStats(): Record<string, number> {
     const r = this.rails.stats();
@@ -1134,6 +1294,7 @@ export class UnitLayer {
       unitCulled: this.culledUnits,
       unitTriangles: this.unitTriangles,
       unitJsMs: this.unitJsMs,
+      nukeEffectRibbons: this.trails.effectRibbons,
     };
   }
 
@@ -1175,6 +1336,7 @@ export class UnitLayer {
     this.bars.dispose();
     this.rails.dispose();
     this.trails.dispose();
+    this.effectTrails.release();
     this.material.dispose();
     this.tracks.clear();
     this.ctx.scene.remove(this.group);

@@ -64,6 +64,7 @@ import { PaletteView } from "./PaletteView";
 import { threeSettingsSearch } from "./RendererSelection";
 import { SceneEnvironment } from "./SceneEnvironment";
 import { StructureLayer } from "./StructureLayer";
+import { GRID_VIEW_KEY } from "./SurfaceOverlay";
 import { TerrainLayer } from "./TerrainLayer";
 import {
   type PerfLayer,
@@ -182,6 +183,11 @@ export class ThreeMapRenderer implements MapRendererLike {
   private localPlayerID = 0;
   private highlightOwner = 0;
   private altView = false;
+  /** Persistent coordinate grid (M key), like GPURenderer.gridView. */
+  private gridView = false;
+  /** smallID → team, for the SAM rings' teammates (GPURenderer.playerTeams). */
+  private readonly playerTeams = new Map<number, string>();
+  private readonly samAllies = new Set<number>();
 
   // Tick timing for interpolation (tickAlpha).
   private lastGameTick = -1;
@@ -300,7 +306,11 @@ export class ThreeMapRenderer implements MapRendererLike {
       this.water = track("water", () => new WaterLayer(this.ctx));
       this.structures = track("structures", () => new StructureLayer(this.ctx));
       this.units = track("units", () => new UnitLayer(this.ctx));
-      this.overlay = track("overlay", () => new OverlayLayer(this.ctx));
+      // Overlays drape on the drawn relief (TerrainLayer's surface).
+      this.overlay = track(
+        "overlay",
+        () => new OverlayLayer(this.ctx, this.terrain),
+      );
       this.fx = track("fx", () => new FxLayer(this.ctx));
       this.names = track("names", () => new NameLayer(this.ctx));
       this.frameLayers = [
@@ -314,6 +324,10 @@ export class ThreeMapRenderer implements MapRendererLike {
       ];
       this.terrain.setTerrainBytes(null, this.heightField.terrain);
       this.water.setTerrainBytes(null, this.heightField.terrain);
+      // The grid toggle is remembered across games, as GPURenderer does.
+      this.gridView = readGridView();
+      this.terrain.setGridView(this.gridView);
+      this.addTeams(header.players);
 
       if (this.antialias.composer) this.post = this.createPost();
 
@@ -429,19 +443,29 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.perf?.call("uploadLiveDelta", performance.now() - t0);
   }
 
-  /** Trails are not drawn by the prototype. */
+  /**
+   * Rows of the trail buffer a tick stamped (TrailManager): diffed against
+   * the trail texture's mirror, sent by the next frames within a budget
+   * (EffectTrails.ts). Drawn on the relief and the sea.
+   */
   uploadLiveTrailDelta(
     trailState: Uint16Array,
     dirtyRowMin: number,
     dirtyRowMax: number,
-  ): void {}
+  ): void {
+    const t0 = this.perfNow();
+    this.terrain.applyTrailDelta(trailState, dirtyRowMin, dirtyRowMax);
+    this.perf?.call("uploadLiveTrailDelta", performance.now() - t0);
+  }
 
+  /** Full tile and trail state (first tick, context restore): uploaded now. */
   uploadTileAndTrailState(
     tileState: Uint16Array,
     trailState: Uint16Array,
   ): void {
     const t0 = this.perfNow();
     this.terrain.setTiles(tileState, null);
+    this.terrain.setTrailState(trailState);
     this.perf?.call("uploadTileAndTrailState", performance.now() - t0);
   }
 
@@ -463,8 +487,14 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.terrain.rebuild();
   }
 
+  /**
+   * Relation matrix (frame/derive/RelationMatrix.ts): territory colours and
+   * trail colours (TerrainLayer) and structure icons / models
+   * (StructureLayer) in the alt view tell allies from enemies.
+   */
   updateRelations(data: Uint8Array, size: number): void {
     this.terrain.setRelations(data, size);
+    this.structures.setRelations(data, size);
   }
 
   // ---- Players / palette ----
@@ -473,8 +503,15 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.palette.update(paletteData);
   }
 
-  /** Trail / structure effect colours are not used by the prototype. */
-  updateEffectPalette(effectData: Float32Array): void {}
+  /**
+   * The cosmetic effect palette (RGBA32F 4096 × 48), mirrored in a texture
+   * shared by the ground trails (boat / nuke) and the nukes' aerial
+   * ribbons (EffectTrails.ts). The structure, warship, train and railway
+   * blocks are not drawn yet.
+   */
+  updateEffectPalette(effectData: Float32Array): void {
+    this.terrain.setEffectPalette(effectData);
+  }
 
   addPlayers(
     players: PlayerStatic[],
@@ -483,10 +520,15 @@ export class ThreeMapRenderer implements MapRendererLike {
     patternData: Uint8Array,
   ): void {
     this.palette.update(paletteData);
+    this.terrain.setPatterns(patternMeta, patternData);
     this.names.addPlayers(players);
+    this.addTeams(players);
   }
 
-  /** New flags / crowns / colours: palette refresh + NameLayer upsert. */
+  /**
+   * Cosmetics visibility changed: palette, territory patterns, flags /
+   * crowns / colours (NameLayer upsert).
+   */
   updatePlayerCosmetics(
     players: PlayerStatic[],
     paletteData: Float32Array,
@@ -494,20 +536,32 @@ export class ThreeMapRenderer implements MapRendererLike {
     patternData: Uint8Array,
   ): void {
     this.palette.update(paletteData);
+    this.terrain.setPatterns(patternMeta, patternData);
     this.names.addPlayers(players);
   }
 
-  /** Territory skins are not drawn by the prototype. */
-  setPlayerSkin(smallID: number, url: string | null): void {}
+  /**
+   * A player's territory skin (a URL given to `initSkinAtlas`; others are
+   * ignored), or none (null). Drawn by the terrain shader
+   * (TerritoryCosmetics.ts).
+   */
+  setPlayerSkin(smallID: number, url: string | null): void {
+    this.terrain.setPlayerSkin(smallID, url);
+  }
 
-  /** Territory skins are not drawn by the prototype. */
-  initSkinAtlas(urls: readonly string[]): void {}
+  /** The game's unique skin URLs, once at game start: one atlas layer each. */
+  initSkinAtlas(urls: readonly string[]): void {
+    this.terrain.initSkinAtlas(urls);
+  }
 
-  /** Only used to centre territory skins; not drawn by the prototype. */
-  setPlayerSpawn(smallID: number, x: number, y: number): void {}
+  /** A player's spawn tile: the centre of their territory skin. */
+  setPlayerSpawn(smallID: number, x: number, y: number): void {
+    this.terrain.setPlayerSpawn(smallID, x, y);
+  }
 
   setLocalPlayerID(id: number): void {
     this.localPlayerID = id;
+    this.overlay.setLocalPlayer(id);
   }
 
   // ---- Names / labels ----
@@ -520,6 +574,7 @@ export class ThreeMapRenderer implements MapRendererLike {
   ): void {
     const t0 = this.perfNow();
     this.names.updateNames(names, players, snap, statusData);
+    this.syncSamAllies(players);
     this.perf?.call("updateNames", performance.now() - t0);
   }
 
@@ -542,12 +597,14 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.units.updateUnits(units, gameTick);
     // Progress bars / deletion marks change every tick (BarPass parity).
     this.structures.updateStatus(units, gameTick);
+    this.overlay.setSamTick(gameTick);
     this.perf?.call("updateUnits", performance.now() - t0);
   }
 
   updateStructures(units: Map<number, UnitState>): void {
     const t0 = this.perfNow();
     this.structures.updateStructures(units);
+    this.overlay.setSamStructures(units);
     this.terrain.setDefenseCoverage(units);
     this.perf?.call("updateStructures", performance.now() - t0);
   }
@@ -581,15 +638,28 @@ export class ThreeMapRenderer implements MapRendererLike {
 
   setHighlightStructureTypes(unitTypes: string[] | null): void {
     this.structures.setHighlightTypes(unitTypes);
+    // SAM / bomb build buttons show the SAM range rings (GPURenderer).
+    this.overlay.setHighlightStructureTypes(unitTypes);
   }
 
-  /** SAM range rings are not drawn by the prototype. */
-  setSAMAllianceClusters(clusters: Map<number, number>): void {}
+  /**
+   * Alliance clusters (pushed every tick). The SAM rings only use them in
+   * the "owner" colour mode, as SAMRadiusPass does; the rings themselves
+   * come from `updateStructures` and show in build mode.
+   */
+  setSAMAllianceClusters(clusters: Map<number, number>): void {
+    this.overlay.setSamAllianceClusters(clusters);
+  }
 
   // ---- Overlays ----
 
+  /**
+   * Build ghost: the 3D model, range ring and SAM rings (OverlayLayer), and
+   * the ghost icon while structures show as icons (StructureLayer).
+   */
   updateGhostPreview(data: GhostPreviewData | null): void {
     this.overlay.updateGhostPreview(data);
+    this.structures.setGhostPreview(data);
   }
 
   updateNukeTrajectory(data: NukeTrajectoryData | null): void {
@@ -613,16 +683,20 @@ export class ThreeMapRenderer implements MapRendererLike {
   }
 
   /**
-   * The spawn-phase overlay is not drawn by the prototype. The phase itself
-   * makes tile uploads immediate (no per-frame budget), as the default
-   * renderer flushes its drip buckets then.
+   * Spawn halos (OverlayLayer / SpawnOverlay: the local player's breathing
+   * halo, teammates', and other humans' spawn highlights; empty = off). The
+   * phase itself also makes tile uploads immediate (no per-frame budget),
+   * as the default renderer flushes its drip buckets then.
    */
   updateSpawnOverlay(inSpawnPhase: boolean, centers: SpawnCenter[]): void {
     this.terrain.setSpawnPhase(inSpawnPhase);
+    this.overlay.updateSpawnOverlay(centers);
   }
 
-  /** The small-player glow is not drawn by the prototype. */
-  updateSmallPlayerGlow(set: Uint8Array | null): void {}
+  /** Small players' breathing red aura (TerrainLayer / SurfaceOverlay). */
+  updateSmallPlayerGlow(set: Uint8Array | null): void {
+    this.terrain.setSmallPlayerGlow(set);
+  }
 
   // ---- Railroads (tracks only) / spirals (not drawn by the prototype) ----
 
@@ -637,6 +711,11 @@ export class ThreeMapRenderer implements MapRendererLike {
 
   setLocalRailColor(r: number, g: number, b: number): void {}
 
+  /**
+   * Spiral nuke-trail vortexes (the default's SpiralRibbonPass) are not
+   * drawn: a spiral nuke trail shows its first colour on the ground track
+   * and on the nuke's ribbon (EffectTrails.ts).
+   */
   updateSpiralRibbons(ribbons: readonly SpiralRibbon[]): void {}
 
   // ---- Map layers (decorative art on 3 maps; not drawn by the prototype) ----
@@ -657,8 +736,19 @@ export class ThreeMapRenderer implements MapRendererLike {
     this.altView = active;
   }
 
-  /** The tile grid view is not drawn by the prototype. */
-  setGridView(active: boolean): void {}
+  /**
+   * Persistent coordinate grid (M key; the alt view also shows it while
+   * held). Remembered in localStorage under the default renderer's key.
+   */
+  setGridView(active: boolean): void {
+    this.gridView = active;
+    this.terrain.setGridView(active);
+    try {
+      window.localStorage.setItem(GRID_VIEW_KEY, active ? "true" : "false");
+    } catch {
+      // Storage unavailable: the toggle still works for this game.
+    }
+  }
 
   setHighlightOwner(ownerID: number): void {
     this.highlightOwner = ownerID;
@@ -809,6 +899,34 @@ export class ThreeMapRenderer implements MapRendererLike {
     }
   }
 
+  private addTeams(players: readonly PlayerStatic[]): void {
+    for (const p of players) {
+      if (p.team !== null) this.playerTeams.set(p.smallID, p.team);
+    }
+    // Team game = any player has a team: skins are tinted by the territory
+    // colour (GPURenderer.addPlayers).
+    this.terrain.setTeamMode(this.playerTeams.size > 0);
+  }
+
+  /**
+   * The local player's allies plus teammates, for the SAM ring colours
+   * (GPURenderer.updateNames). The rings only rebuild when the set changed.
+   */
+  private syncSamAllies(players: Map<number, PlayerState>): void {
+    const me = this.localPlayerID;
+    if (me <= 0) return;
+    const friendly = this.samAllies;
+    friendly.clear();
+    for (const a of players.get(me)?.allies ?? []) friendly.add(a);
+    const team = this.playerTeams.get(me);
+    if (team !== undefined) {
+      for (const [sid, t] of this.playerTeams) {
+        if (t === team && sid !== me) friendly.add(sid);
+      }
+    }
+    this.overlay.setSamAllies(friendly);
+  }
+
   /** performance.now() when the perf tool is on; 0 (no clock read) when off. */
   private perfNow(): number {
     return this.perf === null ? 0 : performance.now();
@@ -906,10 +1024,20 @@ export class ThreeMapRenderer implements MapRendererLike {
     );
     this.contextLost = false;
     this.perf?.contextRestored();
+    this.terrain.contextRestored();
     // Force a fresh resize on the next frame.
     this.appliedPixelRatio = 0;
     this.onContextRestored?.();
   };
+}
+
+/** The remembered grid toggle (GPURenderer reads the same key). */
+function readGridView(): boolean {
+  try {
+    return window.localStorage.getItem(GRID_VIEW_KEY) === "true";
+  } catch {
+    return false;
+  }
 }
 
 /** Samples of the default framebuffer (the canvas) of a fresh context. */

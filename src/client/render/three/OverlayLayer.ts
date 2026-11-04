@@ -1,9 +1,17 @@
 /**
- * OverlayLayer — interaction overlays drawn on the map: ghost build preview,
- * nuke trajectory arc, in-flight nuke telegraph rings, transport attack
- * rings, warship move indicator and the blocked-action flash.
+ * OverlayLayer — interaction overlays drawn on the map: ghost build preview
+ * (with its range ring), SAM range rings, the spawn-phase halos, nuke
+ * trajectory arc, in-flight nuke telegraph rings, transport attack rings,
+ * warship move indicator and the blocked-action flash.
  *
- * Three kinds of drawables, all readable top-down and under tilt:
+ * Everything on the ground drapes on the drawn surface (`ReliefSurface`:
+ * the relief mesh's own triangles, or the sea plane), handed in by the
+ * facade (TerrainLayer); without one (tests) the HeightField stands in.
+ * - SAM range rings (`SamRings.ts`): draped ribbons, shown in build mode.
+ * - Spawn halos (`SpawnOverlay.ts`): relief-grid patches around each
+ *   spawn centre during the spawn phase.
+ *
+ * Three more kinds of drawables, all readable top-down and under tilt:
  * - Draped discs (`DrapedDiscs`): polar grids whose vertices follow the
  *   visible surface (+ a small lift), shaded by one shader — filled inner
  *   disc, outer ring (optionally dashed and rotating), pulse. Strokes are a
@@ -26,6 +34,7 @@ import * as THREE from "three";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
+import type { SpawnCenter } from "../gl/passes/SpawnOverlayPass";
 import type { RenderSettings } from "../gl/RenderSettings";
 import {
   STRUCTURE_TYPES,
@@ -35,6 +44,7 @@ import {
   type GhostPreviewData,
   type NukeTelegraphData,
   type NukeTrajectoryData,
+  type UnitState,
 } from "../types";
 import type { HeightField } from "./HeightField";
 import {
@@ -43,7 +53,16 @@ import {
   setOwnerColor,
   STRUCTURE_FOOTPRINT,
 } from "./ProceduralMeshes";
-import type { FrameInfo, ThreeLayerContext } from "./types";
+import { SamRangeRings } from "./SamRings";
+import { SpawnOverlay } from "./SpawnOverlay";
+import {
+  iconFadeBand,
+  modelFadeScaleX,
+  modelFadeScaleY,
+  modelWeightAt,
+} from "./StructureIcons";
+import { createIntegerTexture } from "./TerrainResources";
+import type { FrameInfo, ReliefSurface, ThreeLayerContext } from "./types";
 import { minScreenScale, nukeAltitude, NukeFlight } from "./UnitLayer";
 
 type Rgb = readonly [number, number, number];
@@ -73,6 +92,33 @@ const WHITE: Rgb = [0.95, 0.95, 0.95];
 
 /** Lift of draped overlays above the surface (tiles). */
 const DRAPE_LIFT = 0.7;
+/**
+ * Ghost range ring fill: the default renderer fills the range at 20% white;
+ * a little less here, over lit relief (the band alpha is fillAlpha / 3).
+ */
+export const RANGE_FILL_ALPHA = 0.45;
+/** Ring spacing inside the ghost range disc's rim band (tiles). */
+const RANGE_INTERIOR_SPACING = 10;
+/** Render orders of the draped overlays (water is -10, sea overlay -9). */
+const SPAWN_RENDER_ORDER = 5;
+const SAM_RENDER_ORDER = 19;
+
+/**
+ * The HeightField as a `ReliefSurface` (bilinear heights, at least sea
+ * level), for layers built without the terrain (tests).
+ */
+export function heightFieldSurface(hf: HeightField): ReliefSurface {
+  return {
+    get version() {
+      return hf.version;
+    },
+    grid: hf,
+    surfaceAt: (x, z) => hf.surfaceAt(x, z),
+    vertexSurface: (i, j) => Math.max(0, hf.heights[j * hf.cols + i]),
+    // Every tile unowned.
+    tileTexture: createIntegerTexture(new Uint16Array(1), 1, 1, "R16UI"),
+  };
+}
 const ATTACK_RING_FADE_IN_MS = 200;
 const ATTACK_RING_FADE_OUT_MS = 300;
 const MOVE_INDICATOR_MS = 800;
@@ -164,26 +210,51 @@ interface DiscChunk {
   vertexCount: number;
 }
 
-/** Polar grid resolution for a disc of `outer` tiles. */
-function discGrid(outer: number): { segs: number; rings: number } {
-  return {
-    segs: Math.min(96, Math.max(32, Math.round(outer * 0.9))),
-    rings: Math.min(32, Math.max(3, Math.ceil(outer / 3))),
-  };
+/** Rim spacing of the disc grids (tiles). */
+const DISC_RIM_SPACING = 2;
+/** Most segments around a disc (rims of up to ~120 tiles keep 2 tiles). */
+const DISC_MAX_SEGS = 384;
+
+/**
+ * Polar grid of a disc of `outer` tiles: segments ~2 tiles apart on the rim,
+ * and ring radii every ≤ `interior` tiles inside plus a 1-tile band at the
+ * rim (3 rings), where the stroke is. On the World map this keeps the rim
+ * stroke above the relief everywhere with DRAPE_LIFT (the old 3-tile rings
+ * and ≤ 96 segments let it dip up to ~1.3 tiles under ridges).
+ */
+export function discGrid(
+  outer: number,
+  interior = 4,
+): { segs: number; radii: number[] } {
+  const segs = Math.min(
+    DISC_MAX_SEGS,
+    Math.max(32, Math.ceil((2 * Math.PI * outer) / DISC_RIM_SPACING)),
+  );
+  const radii: number[] = [];
+  const band = Math.max(0, outer - 3);
+  const inner = Math.max(1, Math.ceil(band / interior));
+  if (band > 0) for (let k = 1; k <= inner; k++) radii.push((band * k) / inner);
+  for (const d of [2, 1, 0]) {
+    const r = outer - d;
+    if (r > (radii[radii.length - 1] ?? 0) + 1e-6) radii.push(r);
+  }
+  return { segs, radii };
 }
 
 /**
- * Builds the draped grid: a centre vertex plus `rings` rings of `segs + 1`
- * vertices (the seam vertex is duplicated with angle 2π so the angle
- * attribute never wraps inside a triangle).
+ * Builds the draped grid: a centre vertex plus one ring of `segs + 1`
+ * vertices per radius (the seam vertex is duplicated with angle 2π so the
+ * angle attribute never wraps inside a triangle).
  */
 function buildDiscChunk(
-  hf: HeightField,
+  hf: ReliefSurface,
   cx: number,
   cy: number,
   outer: number,
+  interior: number,
 ): DiscChunk {
-  const { segs, rings } = discGrid(outer);
+  const { segs, radii } = discGrid(outer, interior);
+  const rings = radii.length;
   const cols = segs + 1;
   const vertexCount = 1 + rings * cols;
   const positions = new Float32Array(vertexCount * 3);
@@ -192,7 +263,7 @@ function buildDiscChunk(
   positions[1] = hf.surfaceAt(cx, cy) + DRAPE_LIFT;
   positions[2] = cy;
   for (let k = 1; k <= rings; k++) {
-    const r = (outer * k) / rings;
+    const r = radii[k - 1];
     for (let s = 0; s < cols; s++) {
       const a = (s / segs) * Math.PI * 2;
       const x = cx + Math.cos(a) * r;
@@ -252,7 +323,9 @@ class DrapedDiscs {
     parent: THREE.Object3D,
     name: string,
     renderOrder: number,
-    private readonly hf: HeightField,
+    private readonly hf: ReliefSurface,
+    /** Ring spacing inside the rim band (tiles). */
+    private readonly interior = 4,
   ) {
     this.material = new THREE.ShaderMaterial({
       vertexShader: DISC_VERT,
@@ -294,7 +367,13 @@ class DrapedDiscs {
       if (!(d.outer > 0)) continue;
       const key = `${d.x},${d.y},${d.outer}`;
       let chunk = used.get(key) ?? this.chunks.get(key);
-      chunk ??= buildDiscChunk(this.hf, d.x + 0.5, d.y + 0.5, d.outer);
+      chunk ??= buildDiscChunk(
+        this.hf,
+        d.x + 0.5,
+        d.y + 0.5,
+        d.outer,
+        this.interior,
+      );
       used.set(key, chunk);
       list.push([chunk, d]);
       verts += chunk.vertexCount;
@@ -736,10 +815,14 @@ interface TimedMarker {
 
 export class OverlayLayer {
   private readonly group = new THREE.Group();
-  private readonly hf: HeightField;
+  private readonly hf: ReliefSurface;
+  /** True when `hf` is our own HeightField stand-in (disposed with us). */
+  private readonly ownsSurface: boolean;
   private readonly telegraphs: DrapedDiscs;
   private readonly rangeRing: DrapedDiscs;
   private readonly markers: MarkerPool;
+  private readonly samRings: SamRangeRings;
+  private readonly spawn: SpawnOverlay;
 
   // Trajectory preview.
   private trajectory: NukeTrajectoryData | null = null;
@@ -755,6 +838,8 @@ export class OverlayLayer {
   private readonly ghostGeometries = new Map<string, THREE.BufferGeometry>();
   private readonly ghostMaterial: THREE.MeshStandardMaterial;
   private readonly ghostMesh: THREE.Mesh;
+  /** The ghost is a structure with a 3D model (shown per the crossfade). */
+  private ghostModel = false;
 
   private readonly relationColors: readonly Rgb[];
   private readonly attackRings = new Map<number, AttackRingState>();
@@ -762,18 +847,45 @@ export class OverlayLayer {
   private blockedFlashes: TimedMarker[] = [];
   private readonly scratch = new THREE.Color();
 
-  constructor(private readonly ctx: ThreeLayerContext) {
-    this.hf = ctx.heightField;
+  constructor(
+    private readonly ctx: ThreeLayerContext,
+    surface?: ReliefSurface,
+  ) {
+    this.hf = surface ?? heightFieldSurface(ctx.heightField);
+    this.ownsSurface = surface === undefined;
     this.relationColors = telegraphColors(ctx.renderSettings.nukeTelegraph);
     this.group.name = "overlays";
     ctx.scene.add(this.group);
+    this.spawn = new SpawnOverlay(
+      this.group,
+      this.hf,
+      ctx.renderSettings.spawnOverlay,
+      ctx.mapWidth,
+      ctx.mapHeight,
+      SPAWN_RENDER_ORDER,
+    );
+    this.samRings = new SamRangeRings(
+      this.group,
+      this.hf,
+      ctx.mapWidth,
+      ctx.renderSettings.samRadius,
+      ctx.palette,
+      SAM_RENDER_ORDER,
+    );
     this.telegraphs = new DrapedDiscs(
       this.group,
       "nuke-telegraphs",
       20,
       this.hf,
     );
-    this.rangeRing = new DrapedDiscs(this.group, "ghost-range", 21, this.hf);
+    // Rebuilt as the cursor moves: a coarse interior (only the faint fill).
+    this.rangeRing = new DrapedDiscs(
+      this.group,
+      "ghost-range",
+      21,
+      this.hf,
+      RANGE_INTERIOR_SPACING,
+    );
     this.markers = new MarkerPool(this.group);
 
     this.arcHalo = fatLine(this.group, "trajectory-halo", 33, {
@@ -826,6 +938,7 @@ export class OverlayLayer {
   /** null = clear. */
   updateGhostPreview(d: GhostPreviewData | null): void {
     this.ghost = d;
+    this.samRings.setGhostType(d?.ghostType ?? null);
     if (d !== null && d.rangeRadius > 0) {
       this.rangeRing.setDiscs([
         {
@@ -834,7 +947,7 @@ export class OverlayLayer {
           inner: 0,
           outer: d.rangeRadius,
           color: d.rangeWarning ? BAD_COLOR : WHITE,
-          fillAlpha: 0.07,
+          fillAlpha: RANGE_FILL_ALPHA,
           dashed: false,
         },
       ]);
@@ -846,6 +959,7 @@ export class OverlayLayer {
         ? this.ghostGeometry(d.ghostType)
         : null;
     if (geo !== null) this.ghostMesh.geometry = geo;
+    this.ghostModel = geo !== null;
     this.ghostMesh.visible = geo !== null;
   }
 
@@ -941,9 +1055,69 @@ export class OverlayLayer {
     if (this.blockedFlashes.length > 4) this.blockedFlashes.shift();
   }
 
+  // ---- Spawn phase ----
+
+  /** Spawn centres of the tick (the facade's updateSpawnOverlay). */
+  updateSpawnOverlay(centers: readonly SpawnCenter[]): void {
+    this.spawn.setCenters(centers);
+  }
+
+  // ---- SAM range rings (inputs; drawn only in build mode) ----
+
+  /** All units; SAM launchers are kept. */
+  setSamStructures(units: ReadonlyMap<number, UnitState>): void {
+    this.samRings.setStructures(units);
+  }
+
+  setSamTick(tick: number): void {
+    this.samRings.setTick(tick);
+  }
+
+  setLocalPlayer(id: number): void {
+    this.samRings.setLocalPlayer(id);
+  }
+
+  /** Allies and teammates of the local player. */
+  setSamAllies(allies: ReadonlySet<number>): void {
+    this.samRings.setAllies(allies);
+  }
+
+  setSamAllianceClusters(clusters: ReadonlyMap<number, number>): void {
+    this.samRings.setAllianceClusters(clusters);
+  }
+
+  /** Build-bar highlight (null = none): SAM / bomb buttons show the rings. */
+  setHighlightStructureTypes(types: readonly string[] | null): void {
+    this.samRings.setHighlightTypes(types);
+  }
+
+  /**
+   * Counters for the perf tool: spawn halos (`spawnHalos`, patch vertices
+   * and triangles, rebuilds) and SAM rings (`samCircles`, `samArcs`,
+   * `samRingSegments` (8 triangles each), `samPendingCircles` (heights
+   * still being sampled, 2 ms per frame), `samRebuilds`, `samBuildMs` /
+   * `samBuildMsMax`).
+   */
+  perfStats(): Record<string, number> {
+    const sam = this.samRings.perfStats();
+    return {
+      ...this.spawn.perfStats(),
+      samVisible: this.samRings.mesh.visible ? 1 : 0,
+      samCircles: sam.circles,
+      samArcs: sam.arcs,
+      samRingSegments: sam.segments,
+      samPendingCircles: sam.pendingCircles,
+      samRebuilds: sam.rebuilds,
+      samBuildMs: sam.buildMs,
+      samBuildMsMax: sam.buildMsMax,
+    };
+  }
+
   update(frame: FrameInfo): void {
     const now = frame.nowMs;
     const zoom = Math.max(1e-3, frame.cssPxPerTile);
+    this.spawn.update(frame);
+    this.samRings.update(frame);
     this.telegraphs.update(frame);
     this.rangeRing.update(frame);
     // Dash lengths in CSS px: line distances are in tiles.
@@ -1014,6 +1188,9 @@ export class OverlayLayer {
   }
 
   dispose(): void {
+    this.spawn.dispose();
+    this.samRings.dispose();
+    if (this.ownsSurface) this.hf.tileTexture?.dispose();
     this.telegraphs.dispose();
     this.rangeRing.dispose();
     this.markers.dispose();
@@ -1067,7 +1244,7 @@ export class OverlayLayer {
     const color = ok ? OK_COLOR : BAD_COLOR;
     const t = frame.nowMs / 1000;
 
-    if (this.ghostMesh.visible) {
+    if (this.ghostModel) {
       const fp = STRUCTURE_FOOTPRINT[d.ghostType] ?? 6;
       const k = minScreenScale(
         this.ctx.settings.structureMinScreenPx,
@@ -1076,8 +1253,19 @@ export class OverlayLayer {
       );
       const x = d.tileX + 0.5;
       const z = d.tileY + 0.5;
+      // Same crossfade as the structures: while they show as icons the
+      // ghost is an icon too (StructureLayer), the model grows in with them.
+      const w = modelWeightAt(
+        zoom,
+        iconFadeBand(this.ctx.settings.quality === "low"),
+      );
+      this.ghostMesh.visible = w > 0;
       this.ghostMesh.position.set(x, this.hf.surfaceAt(x, z), z);
-      this.ghostMesh.scale.setScalar(k);
+      this.ghostMesh.scale.set(
+        k * modelFadeScaleX(w),
+        k * modelFadeScaleY(w),
+        k * modelFadeScaleX(w),
+      );
       // Tint every frame: the controller may update `d` in place.
       this.ghostMaterial.color.setRGB(color[0], color[1], color[2]);
       this.ghostMaterial.emissive.setRGB(color[0], color[1], color[2]);

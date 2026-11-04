@@ -10,6 +10,8 @@
  * uniform says sRGB.
  */
 
+import { EFFECT_TRAILS_GLSL } from "../EffectTrails";
+
 /** Fragment output for GLSL3 ShaderMaterials (three's chunks use gl_FragColor). */
 export const FRAG_OUTPUT = /* glsl */ `
 layout(location = 0) out highp vec4 pc_fragColor;
@@ -211,10 +213,15 @@ ${NOISE_COMMON}
 ${WATER_COMMON}
 
 uniform highp usampler2D uTerrain; // R8UI W x H terrain bytes
+uniform highp sampler2D uPalette;  // RGBA32F 4096 x 2: row 0 fill (trail colour)
 uniform ivec2 uMapSize;
 uniform float uTime;
 uniform float uAltView;
 uniform float uSeabedDepth; // world depth of the deepest seabed (tiles)
+
+// ---- BEGIN effect trails uniforms + effectTrail() (EffectTrails.ts)
+${EFFECT_TRAILS_GLSL}
+// ---- END effect trails uniforms
 
 varying vec3 vWorld;
 #include <fog_pars_fragment>
@@ -269,6 +276,21 @@ void main() {
   col = mix(col, mix(seabedAlbedo(mag) * diffuseLight(UP), wtr.rgb, wtr.a), composite);
   alpha = mix(alpha, 1.0, composite);
   col *= mix(1.0, 0.6, uAltView);
+
+  // ---- BEGIN effect trails composite (boat / nuke trails, EffectTrails.ts):
+  // lit flat like the terrain shader's, "over" the water and what shows
+  // through it (this plane is translucent over the shallows). A uniform
+  // branch: free while no tile holds a trail.
+  if (uTrailsOn > 0.5 && dOut <= 0.0) {
+    vec4 tr = effectTrail(clamp(ivec2(floor(p)), ivec2(0), uMapSize - 1), p, uAltView > 0.5);
+    if (tr.a > 0.0) {
+      vec3 tc = srgbToLinear(tr.rgb) * diffuseLight(UP);
+      float a2 = tr.a + alpha * (1.0 - tr.a);
+      col = (col * alpha * (1.0 - tr.a) + tc * tr.a) / a2;
+      alpha = a2;
+    }
+  }
+  // ---- END effect trails composite
 
   gl_FragColor = vec4(col, alpha);
   #include <tonemapping_fragment>

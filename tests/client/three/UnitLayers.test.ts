@@ -567,15 +567,20 @@ describe("StructureLayer", () => {
     expect(full.structureInstances).toBe(2);
     const fullCity = instanced(ctx, "structures-City#3");
     const fullScale = instanceScale(fullCity).x;
-    layer.update(frame(16, 1, 1));
+    // Inside the icon fade band (2.5-5 px per tile): low-poly models,
+    // still growing out of the ground under the fading icons.
+    layer.update(frame(16, 1, 3));
     const far = layer.perfStats();
     expect(far.structureLod).toBe(1);
     expect(fullCity.count).toBe(0);
     const lodCity = instanced(ctx, "structures-City#3@lod");
     expect(lodCity.count).toBe(2);
     expect(far.structureTriangles * 3).toBeLessThan(full.structureTriangles);
-    // Same min-size boost as the full model would get at this zoom.
-    expect(instanceScale(lodCity).x).toBeGreaterThan(fullScale);
+    expect(instanceScale(lodCity).x).toBeLessThan(fullScale);
+    // Below the band: icons only, no model at all.
+    layer.update(frame(24, 1, 1));
+    expect(layer.perfStats().structureInstances).toBe(0);
+    expect(lodCity.count).toBe(0);
     layer.update(frame(32, 1, 8));
     expect(layer.perfStats().structureLod).toBe(0);
     expect(fullCity.count).toBe(2);
@@ -824,6 +829,16 @@ describe("OverlayLayer", () => {
         .filter((o) => o.name === "overlay-marker" && o.visible).length;
     // Footprint ring + move chevrons + blocked X + attack ring.
     expect(markers()).toBe(4);
+    // While structures show as icons (1 px per tile) the ghost is an icon
+    // (StructureLayer); the model grows in with the structures' crossfade.
+    layer.update(frame(performance.now(), 1, 1));
+    expect(ghost.visible).toBe(false);
+    layer.update(frame(performance.now(), 1, 4));
+    expect(ghost.visible).toBe(true);
+    expect(ghost.scale.x).toBeGreaterThan(ghost.scale.y);
+    layer.update(frame(performance.now(), 1, 8));
+    expect(ghost.visible).toBe(true);
+    expect(ghost.scale.x).toBeCloseTo(ghost.scale.y);
     layer.updateGhostPreview(null);
     expect(ghost.visible).toBe(false);
     layer.update(frame(performance.now() + 5000, 1));

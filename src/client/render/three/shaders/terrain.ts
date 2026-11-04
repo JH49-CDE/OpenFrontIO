@@ -1,7 +1,8 @@
 /**
  * GLSL (ES 3.00) of the relief mesh: terrain colours, lighting, territory
- * fill, crisp sub-tile borders, fallout and the water surface wherever the
- * (low-pass) relief rises above sea level. Used by TerrainLayer through a
+ * fill (with patterns and skins, TerritoryCosmetics.ts), crisp sub-tile
+ * borders, fallout, boat / nuke trails (EffectTrails.ts) and the water
+ * surface wherever the (low-pass) relief rises above sea level. Used by TerrainLayer through a
  * `ShaderMaterial` with `glslVersion: GLSL3`, `fog: true`.
  *
  * Everything per tile is decided with `texelFetch` on full-resolution
@@ -20,6 +21,9 @@
  * SwiftShader (headless runs) executes both sides of every branch.
  */
 
+import { EFFECT_TRAILS_GLSL } from "../EffectTrails";
+import { SURFACE_OVERLAY_GLSL } from "../SurfaceOverlay";
+import { TERRITORY_COSMETICS_GLSL } from "../TerritoryCosmetics";
 import { ENV_COMMON, FRAG_OUTPUT, NOISE_COMMON, WATER_COMMON } from "./water";
 
 export const TERRAIN_VERT = /* glsl */ `
@@ -80,6 +84,21 @@ uniform vec3 uAffEnemy;
 uniform float uBorderPx;   // target border width, device px
 uniform float uMinBorder;  // narrowest border, tiles
 uniform float uBorderGlow; // border emission (bloom), fraction of its colour
+
+// ---- BEGIN surface overlay uniforms + surfaceOverlay() (SurfaceOverlay.ts:
+// coordinate grid, small-player glow). Lot 2; keep this block self-contained.
+${SURFACE_OVERLAY_GLSL}
+// ---- END surface overlay uniforms
+
+// ---- BEGIN territory cosmetics uniforms + territoryCosmetic()
+// (TerritoryCosmetics.ts: patterns and skins). Keep this block self-contained.
+${TERRITORY_COSMETICS_GLSL}
+// ---- END territory cosmetics uniforms
+
+// ---- BEGIN effect trails uniforms + effectTrail() (EffectTrails.ts: boat
+// and nuke trails, effect palette). Keep this block self-contained.
+${EFFECT_TRAILS_GLSL}
+// ---- END effect trails uniforms
 
 varying vec3 vWorld;
 varying vec3 vNormal;
@@ -218,11 +237,11 @@ vec3 shadeWaterTile(vec2 p, uvec4 t4, vec2 w, vec3 V, float tpp) {
 
 // p: world xz; tile / f: the tile under p and the position in it; t4 / w:
 // the 4 tile centres around the (close up: domain-warped) sample point and
-// its bilinear weights; nw: the warp noise; close: 0 at strategy zoom .. 1
-// once a tile spans ~7+ pixels.
+// its bilinear weights; nw: the warp noise; dp: (dFdx(p), dFdy(p)); close:
+// 0 at strategy zoom .. 1 once a tile spans ~7+ pixels.
 vec3 shadeLandTile(
   vec2 p, ivec2 tile, vec2 f, uint tb, uvec4 t4, vec2 w, vec3 nw,
-  vec3 nMesh, vec2 fw, float tpp, float detail, float close
+  vec3 nMesh, vec2 fw, vec4 dp, float tpp, float detail, float close
 ) {
   vec3 albedo;
   vec3 n = nMesh;
@@ -369,6 +388,13 @@ vec3 shadeLandTile(
       a = uAltFillAlpha;
     } else {
       fill = texelFetch(uPalette, ivec2(owner, 0), 0).rgb;
+      // ---- BEGIN territory cosmetics (pattern / skin, TerritoryCosmetics.ts):
+      // replaces the fill colour before saturation / highlight, as the
+      // default renderer; never on fallout. A uniform switch: free while off.
+      if (uCosmeticsOn > 0.5 && !fallout) {
+        fill = territoryCosmetic(owner, tile, fill, dp.xy, dp.zw);
+      }
+      // ---- END territory cosmetics
       float l = dot(fill, vec3(0.299, 0.587, 0.114));
       fill = mix(vec3(l), fill, uFillSaturation);
       if (hl) fill = clamp((fill - 0.5) * (1.0 + uHighlightFill) + 0.5, 0.0, 1.0);
@@ -476,8 +502,10 @@ vec3 shadeLandTile(
 
 void main() {
   vec2 p = vWorld.xz;
-  // Derivatives in uniform control flow: tiles per device pixel along x / z.
-  vec2 fw = max(fwidth(p), vec2(1e-5));
+  // Derivatives in uniform control flow: tiles per device pixel along x / z
+  // (fw = fwidth(p)); dp also sets the skin's mip level.
+  vec4 dp = vec4(dFdx(p), dFdy(p));
+  vec2 fw = max(abs(dp.xy) + abs(dp.zw), vec2(1e-5));
   float tpp = max(fw.x, fw.y);
   vec3 V = normalize(cameraPosition - vWorld);
   vec3 nMesh = normalize(vNormal);
@@ -522,8 +550,29 @@ void main() {
     if (!land) {
       col = shadeWaterTile(p, t4, w, V, tpp);
     } else {
-      col = shadeLandTile(p, tile, f, tb, t4, w, nw, nMesh, fw, tpp, detail, close);
+      col = shadeLandTile(p, tile, f, tb, t4, w, nw, nMesh, fw, dp, tpp, detail, close);
     }
+    // ---- BEGIN effect trails composite (boat / nuke trails, EffectTrails.ts):
+    // the trail colour lit flat, over the shaded ground at trailAlpha, where
+    // this mesh is the visible surface (land, and water tiles where the
+    // relief rises above sea level; WaterLayer paints the same elsewhere).
+    // Under the surface overlays (the sea plane draws those over the water).
+    // A uniform branch: free while no tile holds a trail.
+    if (uTrailsOn > 0.5 && (land || vWorld.y > 0.0)) {
+      vec4 tr = effectTrail(tile, p, uAltView > 0.5);
+      col = mix(col, srgbToLinear(tr.rgb) * diffuseLight(UP), tr.a);
+    }
+    // ---- END effect trails composite
+    // ---- BEGIN surface overlay composite (grid / small-player glow, see
+    // SurfaceOverlay.ts). Unlit, over the shaded ground, before fog. Only
+    // where this mesh is the visible surface: land, and water tiles where the
+    // relief rises above sea level (elsewhere the sea-level overlay plane
+    // draws it above the water). A uniform branch: free while off.
+    if (uOverlayOn > 0.5 && (land || vWorld.y > 0.0)) {
+      vec4 ov = surfaceOverlay(p, fw);
+      col = col * (1.0 - ov.a) + ov.rgb;
+    }
+    // ---- END surface overlay composite
   }
 
   gl_FragColor = vec4(col, 1.0);

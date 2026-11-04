@@ -43,13 +43,36 @@
  *   (`heightField.lastDirty` holds the changed vertex range).
  * - `setDefenseCoverage` is a documented no-op (the engine never sets the
  *   tile defense bit, and posts are drawn by StructureLayer).
+ *
+ * Territory cosmetics (TerritoryCosmetics.ts): patterns (`setPatterns`)
+ * and skins (`initSkinAtlas`, `setPlayerSkin`, `setPlayerSpawn`,
+ * `setTeamMode`) replace the fill colour per tile in this shader, as the
+ * default renderer's territory pass does.
+ *
+ * Effect trails (EffectTrails.ts, shared with WaterLayer and UnitLayer):
+ * boat and nuke trails (`setTrailState`, `applyTrailDelta`) coloured by the
+ * effect palette (`setEffectPalette`), painted per tile by this shader on
+ * land and by WaterLayer on the sea; this layer sends their uploads each
+ * frame (`TRAIL_UPLOAD_BUDGET`) and reports their counters.
+ *
+ * Surface overlays (SurfaceOverlay.ts): the coordinate grid
+ * (`setGridView`, plus the alt view) and the small-player glow
+ * (`setSmallPlayerGlow`) are painted by this shader on land and by a
+ * sea-level plane on open water; both are off (no draw, a skipped uniform
+ * branch) unless shown.
+ *
+ * The layer is also the `ReliefSurface` overlays drape on: `surfaceAt`
+ * interpolates the relief mesh's own triangles (coast lift included),
+ * clamped to sea level, so draped geometry matches what is drawn.
  */
 
 import * as THREE from "three";
 import type { TerrainRect, UnitState } from "../types";
+import { EffectTrails } from "./EffectTrails";
 import type { GridRange, HeightField } from "./HeightField";
 import { environmentUniforms } from "./SceneEnvironment";
 import { TERRAIN_FRAG, TERRAIN_VERT } from "./shaders/terrain";
+import { SurfaceOverlay } from "./SurfaceOverlay";
 import {
   createIntegerTexture,
   createWaterUniforms,
@@ -69,8 +92,9 @@ import {
   type Rgb,
   vertexTouchesLand,
 } from "./TerrainShading";
+import { TerritoryCosmetics } from "./TerritoryCosmetics";
 import { type TileUploadBudget, TileUploadQueue } from "./TileUploadQueue";
-import type { FrameInfo, ThreeLayerContext } from "./types";
+import type { FrameInfo, ReliefSurface, ThreeLayerContext } from "./types";
 
 /** Size of the relation matrix (frame/derive/RelationMatrix.ts). */
 const RELATION_SIZE = 1024;
@@ -170,7 +194,7 @@ interface SkirtEdge {
   nz: number;
 }
 
-export class TerrainLayer {
+export class TerrainLayer implements ReliefSurface {
   private readonly hf: HeightField;
   private readonly W: number;
   private readonly H: number;
@@ -203,6 +227,12 @@ export class TerrainLayer {
   private readonly mesh: THREE.Mesh;
   private readonly u: TerrainUniforms;
   private waterKey = "";
+  /** Coordinate grid + small-player glow (terrain shader + sea plane). */
+  private readonly overlay: SurfaceOverlay;
+  /** Territory patterns and skins (terrain shader). */
+  private readonly cosmetics: TerritoryCosmetics;
+  /** Boat / nuke trails and the effect palette (shared, see the header). */
+  readonly trails: EffectTrails;
 
   // Relief geometry (grid vertices first, then skirt [top, bottom] pairs).
   private readonly positions: Float32Array;
@@ -278,6 +308,16 @@ export class TerrainLayer {
     this.u.uHeightScale.value = hf.heightScale;
     this.refreshColors();
     this.refreshOverlaySettings();
+    this.overlay = new SurfaceOverlay(
+      ctx.renderSettings,
+      this.W,
+      this.H,
+      this.tileTex,
+      this.terrainBytes.texture,
+      THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
+    );
+    this.cosmetics = new TerritoryCosmetics(ctx.renderer);
+    this.trails = EffectTrails.acquire(ctx);
     this.material = new THREE.ShaderMaterial({
       name: "three-terrain",
       glslVersion: THREE.GLSL3,
@@ -288,6 +328,11 @@ export class TerrainLayer {
         // Shared by reference: values follow SceneEnvironment.
         ...environmentUniforms(ctx.scene),
         ...this.u,
+        // Shared by reference with the sea-level overlay plane.
+        ...this.overlay.uniforms,
+        ...this.cosmetics.uniforms,
+        // Shared by reference with WaterLayer (and the nukes' ribbons).
+        ...this.trails.uniforms,
       },
       fog: true,
     });
@@ -296,6 +341,126 @@ export class TerrainLayer {
     this.mesh.frustumCulled = false;
     this.mesh.name = "terrain";
     ctx.scene.add(this.mesh);
+    ctx.scene.add(this.overlay.plane);
+  }
+
+  // ---- ReliefSurface (what overlays drape on) ----
+
+  /** HeightField version the drawn relief was last built from. */
+  get version(): number {
+    return this.reliefVersion;
+  }
+
+  get grid(): HeightField {
+    return this.hf;
+  }
+
+  get tileTexture(): THREE.Texture {
+    return this.tileTex;
+  }
+
+  /** Drawn surface Y at grid vertex (i, j): relief vertex, at least 0. */
+  vertexSurface(i: number, j: number): number {
+    const y = this.positions[(j * this.hf.cols + i) * 3 + 1];
+    return y > 0 ? y : 0;
+  }
+
+  /**
+   * Drawn surface Y at world (x, z): the relief triangle under the point
+   * (cells split (a, c, b) + (b, c, d) like the index buffer), at least sea
+   * level. Clamped to the map.
+   */
+  surfaceAt(x: number, z: number): number {
+    const hf = this.hf;
+    const s = hf.step;
+    const cols = hf.cols;
+    const xc = x > 0 ? (x < this.W ? x : this.W) : 0;
+    const zc = z > 0 ? (z < this.H ? z : this.H) : 0;
+    let i = Math.floor(xc / s);
+    if (i > cols - 2) i = cols - 2;
+    let j = Math.floor(zc / s);
+    if (j > hf.rows - 2) j = hf.rows - 2;
+    const x0 = i * s;
+    const z0 = j * s;
+    const fx = Math.min(1, (xc - x0) / (hf.vertexX(i + 1) - x0));
+    const fz = Math.min(1, (zc - z0) / (hf.vertexY(j + 1) - z0));
+    const pos = this.positions;
+    const a = (j * cols + i) * 3 + 1;
+    const ha = pos[a];
+    const hb = pos[a + 3];
+    const hc = pos[a + cols * 3];
+    const hd = pos[a + cols * 3 + 3];
+    const h =
+      fx + fz <= 1
+        ? ha + (hb - ha) * fx + (hc - ha) * fz
+        : hd + (hc - hd) * (1 - fx) + (hb - hd) * (1 - fz);
+    return h > 0 ? h : 0;
+  }
+
+  // ---- Surface overlays ----
+
+  /** The persistent coordinate grid (M key); the alt view also shows it. */
+  setGridView(active: boolean): void {
+    this.overlay.setGridView(active);
+  }
+
+  /** Small-player glow set (1 byte per owner smallID), null = none. */
+  setSmallPlayerGlow(set: Uint8Array | null): void {
+    this.overlay.setSmallPlayers(set, this.ctx.renderer);
+  }
+
+  /** After a WebGL context restore: rebuild what lived only on the GPU. */
+  contextRestored(): void {
+    this.overlay.contextRestored();
+    this.cosmetics.contextRestored();
+  }
+
+  // ---- Territory cosmetics (patterns, skins) ----
+
+  /** Every player's pattern (`addPlayers` / `updatePlayerCosmetics` data). */
+  setPatterns(patternMeta: Float32Array, patternData: Uint8Array): void {
+    this.cosmetics.setPatterns(patternMeta, patternData);
+  }
+
+  /** One atlas layer per unique skin URL of the game (loaded async). */
+  initSkinAtlas(urls: readonly string[]): void {
+    this.cosmetics.initSkinAtlas(urls);
+  }
+
+  /** A player's skin (a URL given to `initSkinAtlas`), or none. */
+  setPlayerSkin(smallID: number, url: string | null): void {
+    this.cosmetics.setPlayerSkin(smallID, url);
+  }
+
+  /** A player's spawn tile, the centre of their skin. */
+  setPlayerSpawn(smallID: number, x: number, y: number): void {
+    this.cosmetics.setPlayerSpawn(smallID, x, y);
+  }
+
+  /** Team games tint skins by the territory colour. */
+  setTeamMode(on: boolean): void {
+    this.cosmetics.setTeamMode(on);
+  }
+
+  // ---- Effect trails (boat / nuke trails, effect palette) ----
+
+  /** The whole trail buffer (first tick, context restore): uploaded now. */
+  setTrailState(trailState: Uint16Array): void {
+    this.trails.setTrailState(trailState);
+  }
+
+  /** Rows a tick stamped: diffed, sent by the next frames within budget. */
+  applyTrailDelta(
+    trailState: Uint16Array,
+    dirtyRowMin: number,
+    dirtyRowMax: number,
+  ): void {
+    this.trails.applyTrailDelta(trailState, dirtyRowMin, dirtyRowMax);
+  }
+
+  /** The effect palette (RGBA32F 4096 × 48), mirrored. */
+  setEffectPalette(effectData: Float32Array): void {
+    this.trails.setEffectPalette(effectData);
   }
 
   setTiles(
@@ -326,11 +491,15 @@ export class TerrainLayer {
    * Upload counters for the perf tool (`three_perf=1`): calls and texels of
    * the last frame (including a full upload pushed between frames), their
    * maxima over the last 120 frames (perf builds only), totals, and what is
-   * still queued.
+   * still queued; plus the surface overlay, territory cosmetics and effect
+   * trail counters.
    */
   perfStats(): Record<string, number> {
     const max = (a: Int32Array | null) => (a === null ? 0 : Math.max(...a));
     return {
+      ...this.overlay.perfStats(),
+      ...this.cosmetics.perfStats(),
+      ...this.trails.perfStats(),
       uploadCallsLastFrame: this.callsLastFrame,
       texelsLastFrame: this.texelsLastFrame,
       uploadCallsMax: max(this.recentCalls),
@@ -373,6 +542,8 @@ export class TerrainLayer {
       setTextureData(this.relTex, data);
     }
     uploadNow(this.ctx.renderer, this.relTex);
+    // Alt-view trail colours (allies).
+    this.trails.setRelations(data, size);
   }
 
   /** Not drawn: no defended-territory tint in the prototype. */
@@ -380,6 +551,14 @@ export class TerrainLayer {
 
   update(frame: FrameInfo): void {
     this.flushTiles();
+    // After the tile uploads: the glow mask reads the tile texture.
+    this.overlay.update(frame, this.ctx.renderer);
+    // Same switch as the default renderer (debug GUI; on by default).
+    this.cosmetics.update(
+      this.ctx.renderSettings.passEnabled.territoryPatterns === true,
+    );
+    // Trail uploads within budget, trail / effect uniforms (shared).
+    this.trails.update(frame);
     const u = this.u;
     u.uTime.value = (frame.nowMs / 1000) % 3600;
     u.uHighlightOwner.value = frame.highlightOwner;
@@ -393,6 +572,9 @@ export class TerrainLayer {
 
   dispose(): void {
     this.tileQueue.clear();
+    this.overlay.dispose();
+    this.cosmetics.dispose();
+    this.trails.release();
     this.ctx.scene.remove(this.mesh);
     this.geometry.dispose();
     this.material.dispose();

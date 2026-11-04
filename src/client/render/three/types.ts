@@ -62,6 +62,27 @@ export interface FrameInfo {
   altView: boolean;
 }
 
+/**
+ * The visible ground as drawn: the relief mesh (TerrainLayer), and the sea
+ * plane (Y = 0) wherever the relief dips below it. Overlays drape on it so
+ * they never float above or sink under what is on screen.
+ */
+export interface ReliefSurface {
+  /** Bumped whenever the drawn heights change (terrain patches). */
+  readonly version: number;
+  /** The grid the relief mesh is built on (step, cols, rows, vertexX/Y). */
+  readonly grid: HeightField;
+  /**
+   * World Y of the visible surface at world (x, z): the relief mesh's own
+   * triangles (coast lift included), at least sea level. Clamped to the map.
+   */
+  surfaceAt(x: number, z: number): number;
+  /** The same at grid vertex (i, j): max(relief vertex Y, 0). */
+  vertexSurface(i: number, j: number): number;
+  /** Tile state texture (R16UI, owner in the low 12 bits), if any. */
+  readonly tileTexture: THREE.Texture | null;
+}
+
 /** Camera inputs in the TransformHandler's terms (all CSS px / tiles). */
 export interface CameraInputs {
   /** World point (tiles) at the canvas centre. */

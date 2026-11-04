@@ -13,6 +13,10 @@
  * Where the relief rises above the plane over water tiles, TerrainLayer
  * draws this same water shading itself.
  *
+ * Boat (and nuke) trails over water tiles are painted here, with the same
+ * GLSL and uniforms as TerrainLayer's (EffectTrails.ts, shared; TerrainLayer
+ * sends the uploads).
+ *
  * Draw order: transparent queue with `renderOrder` -10 (before other
  * transparent objects, which should keep renderOrder >= 0), depth-writing,
  * pushed back slightly with a polygon offset so coastal relief at sea level
@@ -21,6 +25,7 @@
 
 import * as THREE from "three";
 import type { TerrainRect } from "../types";
+import { EffectTrails } from "./EffectTrails";
 import { environmentUniforms } from "./SceneEnvironment";
 import { WATER_FRAG, WATER_VERT } from "./shaders/water";
 import {
@@ -47,13 +52,16 @@ export class WaterLayer {
     uTime: { value: number };
     uAltView: { value: number };
     uSeabedDepth: { value: number };
+    uPalette: { value: THREE.Texture };
   };
   private colorKey = "";
+  private readonly trails: EffectTrails;
 
   constructor(private readonly ctx: ThreeLayerContext) {
     const W = ctx.mapWidth;
     const H = ctx.mapHeight;
     this.terrainBytes = TerrainByteTexture.acquire(ctx);
+    this.trails = EffectTrails.acquire(ctx);
 
     this.u = {
       ...createWaterUniforms(),
@@ -62,6 +70,8 @@ export class WaterLayer {
       uTime: { value: 0 },
       uAltView: { value: 0 },
       uSeabedDepth: { value: ctx.heightField.seabedDepth },
+      // Trail colour without an effect (territory colour, row 0).
+      uPalette: { value: ctx.palette.texture },
     };
     this.refreshColors();
 
@@ -79,6 +89,8 @@ export class WaterLayer {
         ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
         ...environmentUniforms(ctx.scene),
         ...this.u,
+        // Shared by reference with the terrain material.
+        ...this.trails.uniforms,
       },
       transparent: true,
       depthWrite: true,
@@ -121,6 +133,7 @@ export class WaterLayer {
     this.mesh.geometry.dispose();
     this.material.dispose();
     this.terrainBytes.release();
+    this.trails.release();
   }
 
   private refreshColors(): void {
