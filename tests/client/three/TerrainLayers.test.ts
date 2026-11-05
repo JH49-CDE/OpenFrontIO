@@ -8,12 +8,21 @@ import {
   environmentUniforms,
   SceneEnvironment,
 } from "../../../src/client/render/three/SceneEnvironment";
+import { FALLOUT_BIT } from "../../../src/client/render/three/TerrainCodec";
 import {
+  APRON_SLOPE_TILES,
   TerrainLayer,
   TILE_UPLOAD_BUDGET,
 } from "../../../src/client/render/three/TerrainLayer";
 import { TerrainByteTexture } from "../../../src/client/render/three/TerrainResources";
-import { COAST_LIFT } from "../../../src/client/render/three/TerrainShading";
+import {
+  ALT_GROUND_FREE,
+  ALT_GROUND_OWNED,
+  apronWidthTiles,
+  COAST_LIFT,
+  edgeReachTiles,
+  territoryLook,
+} from "../../../src/client/render/three/TerrainShading";
 import { defaultThreeSettings } from "../../../src/client/render/three/ThreeSettings";
 import type {
   FrameInfo,
@@ -150,17 +159,20 @@ function triangleNormal(
 }
 
 describe("TerrainLayer geometry", () => {
-  it("is the HeightField grid plus outward-facing edge skirts", () => {
+  it("is the HeightField grid plus outward-facing edge skirts and the apron", () => {
     const { ctx, heightField: hf } = makeCtx();
     const terrain = new TerrainLayer(ctx);
     const geo = meshNamed(ctx, "terrain").geometry;
     const pos = geo.getAttribute("position").array;
     const index = geo.getIndex()!.array;
     const grid = hf.cols * hf.rows;
-    expect(pos.length / 3).toBe(grid + 2 * (2 * hf.cols + 2 * hf.rows));
+    const skirtVerts = 2 * (2 * hf.cols + 2 * hf.rows);
+    // Grid, skirts, the apron's slope columns (as many as the skirts'),
+    // 4 slope-foot and 4 rim corners.
+    expect(pos.length / 3).toBe(grid + 2 * skirtVerts + 8);
     const gridTris = (hf.cols - 1) * (hf.rows - 1) * 2;
     const skirtTris = 2 * (2 * (hf.cols - 1) + 2 * (hf.rows - 1));
-    expect(index.length).toBe((gridTris + skirtTris) * 3);
+    expect(index.length).toBe((gridTris + 2 * skirtTris + 16) * 3);
 
     for (let t = 0; t < gridTris; t++) {
       const n = triangleNormal(
@@ -181,9 +193,61 @@ describe("TerrainLayer geometry", () => {
     }
     // Skirt bottoms sit below the deepest seabed.
     let minY = Infinity;
-    for (let k = grid; k < pos.length / 3; k++)
+    for (let k = grid; k < grid + skirtVerts; k++)
       minY = Math.min(minY, pos[k * 3 + 1]);
     expect(minY).toBeLessThan(-ctx.settings.seabedDepth);
+    terrain.dispose();
+  });
+
+  it("lays an apron around the map, sloping from the edge, facing up", () => {
+    const { ctx, heightField: hf } = makeCtx();
+    // Land along the north edge: the apron's inner row follows it.
+    for (let x = 0; x < W; x++) hf.terrain[x] = LAND | 20;
+    hf.applyRects([{ x: 0, y: 0, w: W, h: 1 }], hf.terrain.slice(0, W));
+    const terrain = new TerrainLayer(ctx);
+    const geo = meshNamed(ctx, "terrain").geometry;
+    const pos = geo.getAttribute("position").array;
+    const nrm = geo.getAttribute("normal").array;
+    const index = geo.getIndex()!.array;
+    const A = apronWidthTiles(W, H);
+    expect(terrain.apronWidth).toBe(A);
+    const grid = hf.cols * hf.rows;
+    const skirtVerts = 2 * (2 * hf.cols + 2 * hf.rows);
+    const first = grid + skirtVerts;
+    let maxY = 0;
+    for (let k = first; k < pos.length / 3; k++) {
+      // Never under the water plane; flat-lit (normal up).
+      expect(pos[k * 3 + 1]).toBeGreaterThanOrEqual(COAST_LIFT - 1e-6);
+      expect([nrm[k * 3], nrm[k * 3 + 1], nrm[k * 3 + 2]]).toEqual([0, 1, 0]);
+      maxY = Math.max(maxY, pos[k * 3 + 1]);
+    }
+    // The north edge's inner row sits on the (raised) edge vertices.
+    for (let i = 0; i < hf.cols; i++) {
+      const edgeY = pos[i * 3 + 1];
+      expect(edgeY).toBeGreaterThan(COAST_LIFT);
+      expect(pos[(first + 2 * i) * 3 + 1]).toBeCloseTo(edgeY, 6);
+      expect(pos[(first + 2 * i) * 3 + 2]).toBe(0);
+      // Its foot, APRON_SLOPE_TILES out, at COAST_LIFT.
+      expect(pos[(first + 2 * i + 1) * 3 + 2]).toBe(-APRON_SLOPE_TILES);
+      expect(pos[(first + 2 * i + 1) * 3 + 1]).toBeCloseTo(COAST_LIFT, 6);
+    }
+    expect(maxY).toBeGreaterThan(COAST_LIFT);
+    // Every apron triangle faces up; their footprint is the ring between
+    // the map and the map grown by A on every side, covered once.
+    const gridTris = (hf.cols - 1) * (hf.rows - 1) * 2;
+    const skirtTris = 2 * (2 * (hf.cols - 1) + 2 * (hf.rows - 1));
+    let area = 0;
+    for (let t = gridTris + skirtTris; t < index.length / 3; t++) {
+      const [a, b, c] = [index[3 * t], index[3 * t + 1], index[3 * t + 2]];
+      for (const v of [a, b, c]) expect(v).toBeGreaterThanOrEqual(first);
+      const n = triangleNormal(pos, a, b, c);
+      expect(n.y).toBeGreaterThan(0); // counter-clockwise from above
+      area += n.y / 2;
+    }
+    expect(area).toBeCloseTo((W + 2 * A) * (H + 2 * A) - W * H, 4);
+    // The shader gets the virtual land's reach.
+    const u = uniformsOf(meshNamed(ctx, "terrain"));
+    expect(u.uEdgeReach.value).toBe(edgeReachTiles(W, H));
     terrain.dispose();
   });
 
@@ -435,8 +499,49 @@ describe("TerrainLayer tile state uploads", () => {
     expect(u.uHighlightOwner.value).toBe(5);
     expect(u.uLocalPlayer.value).toBe(3);
     expect(u.uAltView.value).toBe(1);
-    expect(u.uBorderPx.value).toBeCloseTo(2.6, 9); // 1.3 CSS px at dpr 2
+    // The zoom's territory look (4 CSS px per tile) at dpr 2.
+    const look = territoryLook(4, ctx.renderSettings.mapOverlay.territoryAlpha);
+    expect(u.uBorderPx.value).toBeCloseTo(look.borderCssPx * 2, 9);
+    expect(u.uFillAlpha.value).toBeCloseTo(look.fillAlpha, 9);
     expect(u.uTime.value).toBeCloseTo(1.234, 9);
+    terrain.dispose();
+  });
+
+  it("strengthens the territory look as the camera zooms out (lot 3)", () => {
+    const { ctx } = makeCtx();
+    const terrain = new TerrainLayer(ctx);
+    const u = uniformsOf(meshNamed(ctx, "terrain"));
+    const base = ctx.renderSettings.mapOverlay.territoryAlpha;
+    const at = (zoom: number, dpr = 1) => {
+      terrain.update({
+        ...frameFor(new THREE.PerspectiveCamera()),
+        cssPxPerTile: zoom,
+        dpr,
+      });
+      return {
+        fill: u.uFillAlpha.value as number,
+        border: u.uBorderPx.value as number,
+        flatten: u.uFarFlatten.value as number,
+        alt: u.uAltFillAlpha.value as number,
+      };
+    };
+    // Close up: the settings' fill, the 1.3 px border, no flattening.
+    expect(at(12)).toEqual({ fill: base, border: 1.3, flatten: 0, alt: 0.4 });
+    // Full map: stronger fill, wider border (in device px), flattened
+    // hillshade on owned land, stronger alt-view fill.
+    const full = at(0.7);
+    expect(full.fill).toBeGreaterThan(0.8);
+    expect(full.border).toBeCloseTo(2.4, 9);
+    expect(full.flatten).toBeGreaterThan(0.3);
+    expect(full.alt).toBeGreaterThan(0.5);
+    expect(at(0.7, 2).border).toBeCloseTo(4.8, 9);
+    // The alt view's ground: owned land lighter than unowned land.
+    expect(u.uAltGroundOwned.value).toBe(ALT_GROUND_OWNED);
+    expect(u.uAltGroundFree.value).toBe(ALT_GROUND_FREE);
+    expect(ALT_GROUND_OWNED).toBeGreaterThan(ALT_GROUND_FREE);
+    // A configured alt fill stronger than ours wins (twice the setting).
+    ctx.renderSettings.altView.fillAlpha = 0.45;
+    expect(at(12).alt).toBeCloseTo(0.9, 9);
     terrain.dispose();
   });
 });
@@ -492,5 +597,85 @@ describe("TerrainByteTexture", () => {
     b.release();
     expect(disposed).toBe(1);
     expect(TerrainByteTexture.acquire(ctx)).not.toBe(a);
+  });
+});
+
+describe("TerrainLayer lot 3 surfaces", () => {
+  it("keeps a relief texture of the grid's slope and height (item 9)", () => {
+    const { ctx, heightField: hf } = makeCtx();
+    const terrain = new TerrainLayer(ctx);
+    const mesh = meshNamed(ctx, "terrain");
+    const u = uniformsOf(mesh);
+    const tex = u.uRelief.value as THREE.DataTexture;
+    expect(tex).toBeInstanceOf(THREE.DataTexture);
+    expect(tex.type).toBe(THREE.HalfFloatType);
+    expect(tex.format).toBe(THREE.RGBAFormat);
+    expect(tex.magFilter).toBe(THREE.LinearFilter);
+    expect([tex.image.width, tex.image.height]).toEqual([hf.cols, hf.rows]);
+    expect((u.uReliefGrid.value as THREE.Vector3).toArray()).toEqual([
+      hf.step,
+      hf.cols,
+      hf.rows,
+    ]);
+    // Per vertex: the mesh normal's slope and the vertex height.
+    const data = tex.image.data as Uint16Array;
+    const pos = mesh.geometry.getAttribute("position").array;
+    const nrm = mesh.geometry.getAttribute("normal").array;
+    const half = THREE.DataUtils.fromHalfFloat;
+    let sloped = 0;
+    for (let k = 0; k < hf.cols * hf.rows; k++) {
+      const gx = half(data[k * 4]);
+      const gz = half(data[k * 4 + 1]);
+      expect(half(data[k * 4 + 2])).toBeCloseTo(pos[k * 3 + 1], 2);
+      expect(gx).toBeCloseTo(-nrm[k * 3] / nrm[k * 3 + 1], 2);
+      expect(gz).toBeCloseTo(-nrm[k * 3 + 2] / nrm[k * 3 + 1], 2);
+      if (Math.abs(gx) + Math.abs(gz) > 1e-3) sloped++;
+    }
+    expect(sloped).toBeGreaterThan(0); // around the island
+    expect(terrain.perfStats().reliefTextureMB).toBeCloseTo(
+      (hf.cols * hf.rows * 8) / (1 << 20),
+      9,
+    );
+    terrain.dispose();
+  });
+
+  it("feeds the fallout field from the tile path, bounded (item 5)", () => {
+    const MW = 64;
+    const MH = 48;
+    const { ctx } = makeCtx({ perf: true, width: MW, height: MH });
+    const terrain = new TerrainLayer(ctx);
+    const frame = () => frameFor(new THREE.PerspectiveCamera());
+    const state = new Uint16Array(MW * MH);
+    // A first full upload re-reads the buffer over the next frames.
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) state[y * MW + x] = FALLOUT_BIT;
+    }
+    terrain.setTiles(state, null);
+    expect(terrain.fallout.rebuilding).toBe(true);
+    let frames = 0;
+    while (terrain.fallout.rebuilding && frames < 100) {
+      terrain.update(frame());
+      frames++;
+    }
+    expect(terrain.fallout.total).toBe(64);
+    expect(terrain.fallout.denseCells).toBe(1);
+    // Then each tick's changed tiles, exactly (no rescan).
+    const changed: number[] = [];
+    for (let x = 20; x < 30; x++) {
+      state[30 * MW + x] = FALLOUT_BIT | 5;
+      changed.push(30 * MW + x);
+    }
+    state[0] = 3; // cleaned and conquered
+    changed.push(0);
+    terrain.setTiles(state, changed);
+    expect(terrain.fallout.total).toBe(64 + 10 - 1);
+    terrain.update(frame());
+    expect(terrain.perfStats()).toMatchObject({
+      falloutTiles: 73,
+      falloutDenseCells: 1,
+      falloutRebuilding: 0,
+    });
+    expect(terrain.perfStats().falloutMsMax).toBeGreaterThanOrEqual(0);
+    terrain.dispose();
   });
 });

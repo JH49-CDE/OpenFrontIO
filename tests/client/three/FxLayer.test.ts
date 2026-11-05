@@ -3,6 +3,10 @@ import * as THREE from "three";
 import { describe, expect, it } from "vitest";
 import { createRenderSettings } from "../../../src/client/render/gl/RenderSettings";
 import {
+  FALLOUT_SMOKE_SLOTS,
+  FalloutField,
+} from "../../../src/client/render/three/FalloutField";
+import {
   dragDisplacement,
   easeOutCubic,
   effectStartMs,
@@ -21,12 +25,15 @@ import {
   particleEnvelope,
   quadScreenArea,
   shockwaveAlpha,
+  SHOCKWAVE_ALPHA,
+  SHOCKWAVE_COLOR,
   shockwaveParams,
   smokePuffTexels,
   softCircleTexels,
 } from "../../../src/client/render/three/FxLayer";
 import type { HeightField } from "../../../src/client/render/three/HeightField";
 import { PaletteView } from "../../../src/client/render/three/PaletteView";
+import { FALLOUT_BIT } from "../../../src/client/render/three/TerrainCodec";
 import { defaultThreeSettings } from "../../../src/client/render/three/ThreeSettings";
 import type {
   FrameInfo,
@@ -73,6 +80,16 @@ describe("dead unit → effect", () => {
     expect(shockwaveParams(30, undefined).radius).toBe(45);
     expect(shockwaveParams(100, undefined).radius).toBe(150);
     expect(shockwaveParams(18, undefined).durationMs).toBe(1500);
+    // Lot 3: the default ring stays just over the bloom threshold
+    // (luminance ~1.2, was ~2) at a lower opacity, not a pale glowing disc.
+    const c = shockwaveParams(30, undefined).color;
+    const lum = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    expect(lum).toBeGreaterThan(1);
+    expect(lum).toBeLessThan(1.4);
+    expect(SHOCKWAVE_ALPHA).toBeLessThanOrEqual(0.6);
+    // A copy per nuke (decals keep it).
+    expect(c).not.toBe(SHOCKWAVE_COLOR);
+    expect(c).toEqual(SHOCKWAVE_COLOR);
   });
 
   it("sizes the cloud like the default renderer's per-type radii", () => {
@@ -478,6 +495,96 @@ describe("FX fill estimate (perf tool)", () => {
     expect(s.smokeParticles).toBeGreaterThan(80);
     expect(s.fillScreens).toBe(0);
     expect(s.fillScreensMax).toBe(0);
+    fx.dispose();
+  });
+});
+
+describe("fallout smoke (lot 3, item 5)", () => {
+  /** A camera looking straight down at (cx, cz) from `h` tiles up. */
+  function topDown(cx: number, cz: number, h: number) {
+    const cam = new THREE.PerspectiveCamera(50, 1.25, 1, 5000);
+    cam.position.set(cx, h, cz);
+    cam.up.set(0, 0, -1);
+    cam.lookAt(cx, 0, cz);
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+    return cam;
+  }
+
+  function falloutBlock(x0: number, z0: number, size: number) {
+    const field = new FalloutField(MAP_W, 300);
+    const state = new Uint16Array(MAP_W * 300);
+    const changed: number[] = [];
+    for (let z = z0; z < z0 + size; z++) {
+      for (let x = x0; x < x0 + size; x++) {
+        state[z * MAP_W + x] = FALLOUT_BIT;
+        changed.push(z * MAP_W + x);
+      }
+    }
+    field.applyChanges(state, changed);
+    return field;
+  }
+
+  const smokeMesh = (ctx: ThreeLayerContext) =>
+    ctx.scene.getObjectByName("fx-fallout-smoke") as THREE.Mesh;
+
+  it("rises only over fallout in view, close enough, within its slots", () => {
+    const ctx = makeCtx("high", true);
+    const fx = new FxLayer(ctx);
+    const mesh = smokeMesh(ctx);
+    const geo = mesh.geometry as THREE.InstancedBufferGeometry;
+    const at = (now: number, zoom: number, cam: THREE.PerspectiveCamera) => {
+      fx.update({ ...frame(now), cssPxPerTile: zoom, camera: cam });
+      return geo.instanceCount;
+    };
+    const cam = topDown(120, 120, 60);
+    // No field: nothing.
+    expect(at(1000, 6, cam)).toBe(0);
+    expect(mesh.visible).toBe(false);
+    fx.setFallout(falloutBlock(100, 100, 40));
+    // Zoomed out: nothing either.
+    expect(at(1100, 0.7, cam)).toBe(0);
+    // Close up over the zone: puffs, all from fallout tiles.
+    let shown = 0;
+    for (let t = 2000; t < 12000; t += 500) {
+      const n = at(t, 6, cam);
+      shown = Math.max(shown, n);
+      expect(n).toBeLessThanOrEqual(FALLOUT_SMOKE_SLOTS);
+      const off = geo.getAttribute("iOffset").array;
+      for (let i = 0; i < n; i++) {
+        // Emitted inside the block, drifted at most 3 tiles downwind.
+        expect(off[i * 3]).toBeGreaterThan(100 - 3.5);
+        expect(off[i * 3]).toBeLessThan(140 + 3.5);
+        expect(off[i * 3 + 2]).toBeGreaterThan(100 - 3.5);
+        expect(off[i * 3 + 2]).toBeLessThan(140 + 3.5);
+        expect(off[i * 3 + 1]).toBeGreaterThan(1); // above the ground (1)
+      }
+    }
+    expect(shown).toBeGreaterThan(FALLOUT_SMOKE_SLOTS / 3);
+    expect(mesh.visible).toBe(true);
+    expect(fx.perfStats().falloutPuffs).toBe(geo.instanceCount);
+    expect(fx.perfStats().falloutSmokeMs).toBeGreaterThanOrEqual(0);
+    // Looking elsewhere: the slots leave the zone.
+    expect(at(13000, 6, topDown(320, 250, 30))).toBe(0);
+    fx.dispose();
+  });
+
+  it("halves its slots at low quality", () => {
+    const ctx = makeCtx("low");
+    const fx = new FxLayer(ctx);
+    fx.setFallout(falloutBlock(100, 100, 40));
+    const geo = smokeMesh(ctx).geometry as THREE.InstancedBufferGeometry;
+    let max = 0;
+    for (let t = 2000; t < 12000; t += 500) {
+      fx.update({
+        ...frame(t),
+        cssPxPerTile: 6,
+        camera: topDown(120, 120, 60),
+      });
+      max = Math.max(max, geo.instanceCount);
+    }
+    expect(max).toBeGreaterThan(0);
+    expect(max).toBeLessThanOrEqual(FALLOUT_SMOKE_SLOTS / 2);
     fx.dispose();
   });
 });

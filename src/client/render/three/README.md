@@ -135,21 +135,21 @@ ClientGameRunner ──import()──► ThreeMapRenderer (facade, implements Ma
 - **Layers** (one file each; every layer gets the shared `ThreeLayerContext`
   from `types.ts`):
 
-  | File                                                       | Draws                                                                                                                                                    |
-  | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-  | `SceneEnvironment.ts`                                      | Sun and hemisphere lights, sky dome, distance fog                                                                                                        |
-  | `TerrainLayer.ts`, `shaders/terrain.ts`                    | Relief mesh: terrain colours, territory fill, borders, fallout, coastal water; close-up detail                                                           |
-  | `TerritoryCosmetics.ts` (owned by `TerrainLayer`)          | Territory patterns and skins in the fill (terrain shader)                                                                                                |
-  | `SurfaceOverlay.ts` (owned by `TerrainLayer`)              | Coordinate grid and small-player glow, painted on the ground (terrain shader + sea-level plane)                                                          |
-  | `EffectTrails.ts` (shared: terrain, water, units)          | Boat and nuke trails on the ground (terrain + water shaders), the cosmetic effect palette                                                                |
-  | `WaterLayer.ts`, `shaders/water.ts`                        | Sea plane: depth tint, waves, glints, shore foam; boat / nuke trails over water                                                                          |
-  | `StructureLayer.ts`                                        | Icons when zoomed out (`StructureIcons.ts`) fading into instanced models; bars, level badges                                                             |
-  | `UnitLayer.ts`                                             | Instanced ships, trains, nukes, shells and missiles (culled, low-poly when small); health bars; nuke / SAM ribbons (nukes in their owner's trail effect) |
-  | `RailTracks.ts` (owned by `UnitLayer`)                     | Railways: per-block ballast strips, sleepers and rails close up                                                                                          |
-  | `OverlayLayer.ts`                                          | Build ghost and range ring, nuke arc, nuke target rings, attack rings, move and blocked markers                                                          |
-  | `SpawnOverlay.ts`, `SamRings.ts` (owned by `OverlayLayer`) | Spawn halos; SAM range rings                                                                                                                             |
-  | `FxLayer.ts`                                               | Explosions, mushroom clouds, shockwaves, smoke, sparkles                                                                                                 |
-  | `NameLayer.ts`                                             | Player names, troop counts, flags, attack labels, gold popups (DOM)                                                                                      |
+  | File                                                       | Draws                                                                                                                                                                         |
+  | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `SceneEnvironment.ts`                                      | Sun and hemisphere lights, sky dome, distance fog                                                                                                                             |
+  | `TerrainLayer.ts`, `shaders/terrain.ts`                    | Relief mesh: terrain colours, territory fill, borders, fallout (burnt ground, hotspots, embers), coastal water; close-up detail and smooth relief shading; the map-edge apron |
+  | `TerritoryCosmetics.ts` (owned by `TerrainLayer`)          | Territory patterns and skins in the fill (terrain shader)                                                                                                                     |
+  | `SurfaceOverlay.ts` (owned by `TerrainLayer`)              | Coordinate grid and small-player glow, painted on the ground (terrain shader + sea-level plane)                                                                               |
+  | `EffectTrails.ts` (shared: terrain, water, units)          | Boat and nuke trails on the ground (terrain + water shaders), the cosmetic effect palette                                                                                     |
+  | `WaterLayer.ts`, `shaders/water.ts`                        | Sea plane: depth tint, waves, screen-scaled glints, shore foam; boat / nuke trails over water                                                                                 |
+  | `StructureLayer.ts`                                        | Icons when zoomed out (`StructureIcons.ts`) fading into instanced models standing on pads fitted to the land and the relief; bars, level badges                               |
+  | `UnitLayer.ts`                                             | Instanced ships, trains, nukes, shells and missiles (culled, low-poly when small); health bars; nuke / SAM ribbons (nuke contrails, or their owner's trail effect)            |
+  | `RailTracks.ts` (owned by `UnitLayer`)                     | Railways: per-block ballast strips, sleepers and rails close up                                                                                                               |
+  | `OverlayLayer.ts`                                          | Build ghost and range ring, nuke arc, nuke target rings, attack rings, move and blocked markers                                                                               |
+  | `SpawnOverlay.ts`, `SamRings.ts` (owned by `OverlayLayer`) | Spawn halos; SAM range rings                                                                                                                                                  |
+  | `FxLayer.ts`                                               | Explosions, mushroom clouds, shockwaves, smoke, sparkles; smoke over fallout zones (`FalloutField.ts`, kept by `TerrainLayer`)                                                |
+  | `NameLayer.ts`                                             | Player names, troop counts, flags, attack labels, gold popups (DOM)                                                                                                           |
 
   The helpers are `ProceduralMeshes.ts` (all models, built in code),
   `StatusBars.ts`, `PaletteView.ts`, `TerrainCodec.ts`,
@@ -540,10 +540,11 @@ ribbons). The facade's `uploadTileAndTrailState`, `uploadLiveTrailDelta`,
   clock as the ground track under it (a gradient's bands line up with the
   track's; a transition changes colour in step), composited over the
   scene at 85% opacity × the ribbon's taper, with a little extra emission
-  (×1.5) for the bloom. Without an effect, for SAM missiles and in the alt
-  view the ribbon is unchanged: the warm additive glow (one material,
-  premultiplied blending: alpha 0 adds, alpha > 0 is "over"). The bombs
-  themselves are unchanged (lot 3).
+  (×1.5) for the bloom. A SAM missile's ribbon is unchanged: the warm
+  additive glow (one material, premultiplied blending: alpha 0 adds,
+  alpha > 0 is "over"). Without an effect, and in the alt view, a nuke's
+  ribbon is a contrail behind a short glow and the bombs are capped on
+  screen (see "Lot 3: names close up, structure bases, bombs in flight").
 - **3D adaptation**: the trail is painted per tile by the ground shaders
   (`EFFECT_TRAILS_GLSL`), so it drapes on the relief and lies on the
   waves: on land, and on the coastal water the relief draws itself, by the
@@ -649,6 +650,492 @@ ribbons). The facade's `uploadTileAndTrailState`, `uploadLiveTrailDelta`,
   colour, on the ground and on the ribbon), the structures, warship, train
   and railway effects (blocks 2-5 are mirrored but unused), nuke explosion
   styles beyond the first colour, size and speed (FxLayer).
+
+## Readability at distance (lot 3)
+
+Zoomed out, who owns what reads at a glance (like the default renderer's
+flat map), the coasts are a thin line, the map no longer ends in a
+straight cut, and railways no longer read as borders. Close up (from ~5
+CSS px per tile; borders from 8) the look is the lot-2 one. The curves are
+pure helpers in `TerrainShading.ts` (`territoryLook`, `shoreViewScale`,
+`edgeReachTiles`, `apronWidthTiles`, `apronReachZoomScale`, `mirrorIntoMap`,
+`apronWarp`, `virtualLandReach`, `apronWaterMagnitude`, `apronFillFade`)
+and `RailTracks.ts` (`railStripLook`), unit-tested;
+the GLSL is in delimited `lot 3` blocks of `shaders/terrain.ts` and
+`shaders/water.ts`.
+
+- **Territories** (`territoryLook`, set by `TerrainLayer.update` from the
+  zoom at the screen centre, `FrameInfo.cssPxPerTile`, and the pixel
+  ratio). Strategy weight `far` = 1 − smoothstep(1.25, 5, zoom); the
+  border grows over 1.25-8.
+
+  | CSS px per tile          | Fill opacity | Border, CSS px (tiles) | Hillshade flattened on owned land | Alt-view fill |
+  | ------------------------ | ------------ | ---------------------- | --------------------------------- | ------------- |
+  | ≤ 1.25 (full map: 0.7)   | 0.82         | 2.4 (1, the maximum)   | 35%                               | 0.55          |
+  | 1.8 (default zoom)       | 0.81         | 2.4 (1)                | 33%                               | 0.54          |
+  | 3                        | 0.72         | 2.2 (0.74)             | 19%                               | 0.48          |
+  | 4                        | 0.63         | 2.0 (0.5)              | 6%                                | 0.43          |
+  | ≥ 5 (≥ 8 for the border) | 0.588        | 1.3 (0.2 minimum)      | 0                                 | 0.4           |
+
+  The fill opacity close up is `mapOverlay.territoryAlpha` (never
+  lowered); "flattened" means that share of the hillshade (sun +
+  hemisphere light and slope occlusion) is replaced by flat light on owned
+  tiles, so a territory reads as one colour while the relief still shows
+  (unowned land keeps all of it). At the default zoom the border is one
+  full tile, like the default renderer's.
+
+- **Alt view** (space). The ground is still desaturated, but owned land is
+  dimmed to 82% and unowned land to 50% (it was 60% for both), the
+  affiliation fill is 0.4-0.55 (above; was 0.3) or twice
+  `altView.fillAlpha` if larger, and the affiliation border colour is
+  lifted towards white (× 1.15 + 0.12): neutral (grey) territory and its
+  borders were nearly invisible on the darkened terrain, they now read as
+  lighter grey areas with light borders.
+- **No border along the map edge**: the shader's `ownerAt` clamps to the
+  map, so an edge tile's owner continues past it (the default renderer
+  draws a border there); the territory fill stops at the edge instead
+  (below), which keeps the playfield's limit readable.
+- **Map-edge apron** (`TerrainLayer`, `shaders/terrain.ts`). Around the
+  map, part of the terrain mesh (same draw call): a strip per edge sloping
+  from the edge vertices (never below `COAST_LIFT`) down to `COAST_LIFT`
+  over `APRON_SLOPE_TILES` (8), so land at the edge meets it without a
+  cliff, then flat to `apronWidthTiles` (World: (2 + 0.15 + 1) × 18 + 8 =
+  65 tiles). Picking is unchanged (rays off the map return NaN, as
+  before; the apron is not in the height field). The skirts stay under it.
+  - **Lookups**: the shader looks tiles up at the point mirrored at the map
+    border (`mirrorIntoMap`), so the land and coasts continue past the edge
+    (no stretched edge row), after warping the point more with the
+    distance past the edge (`apronWarp`: ± 0.45 × the distance, capped at
+    `APRON_WARP_CAP` 20 tiles, two value noises of a 40-tile period;
+    `APRON_WARP_GAIN` 0.9 keeps the mapping fold-free): near the edge the
+    land continues, farther out it is no recognisable mirror image (the
+    first version showed symmetric "Rorschach" islands).
+  - **Virtual coast** (`virtualLandReach`): the land reaches the mean reach
+    `edgeReachTiles` (0.9% of the longest side, 8-32 tiles; World 18, ~13 px
+    at full map) × 0.15-2 (two low-frequency octaves stretched over
+    `APRON_REACH_NOISE` [0.25, 0.75]) ± 0.15 (`APRON_RAGGED`, a finer
+    octave): along the edge some land dies at once and some runs far, so
+    the break-up no longer runs parallel to the edge at a constant
+    distance. Close up the mean reach shrinks (`apronReachZoomScale`: × 1 up
+    to 2 CSS px per tile, × `APRON_ZOOM_NEAR` 0.4 from 8): the made-up land
+    stays a fringe of a few dozen px instead of whole islands.
+  - **Fill**: the territory fill fades out within max(1.5 tiles, 6 device
+    px) past the edge (`apronFillFade`): the playfield's limit stays
+    readable, edge owners do not look bigger, and in the alt view the
+    affiliation colours stop at the grid's rectangle. No borders, trails,
+    grid or glow there.
+  - **Land**: it fades like a page margin, desaturated (up to 50%), dimmed
+    (20%) and blended into the sea (45%, + 30% just before the virtual
+    coast) with the distance; in the alt view it is dimmed a further 30%.
+  - **Water**: the mirrored water's magnitude, or past the virtual coast
+    its distance from it, whichever is deeper (`apronWaterMagnitude`): a
+    shelf like a real coast's (the same shallows and foam, narrowed zoomed
+    out by `shoreViewScale`), never the wide pale band of shallows the
+    first version drew along the whole edge; open sea within the mean
+    reach + 8 tiles of the coast, shaded as WaterLayer's off-map plane,
+    which takes over at the ring's rim (seamless).
+  - **Seam**: inside the map the relief's shading fades to flat over the
+    last `EDGE_FLAT_TILES` (3) tiles, so under tilt it meets the flat-lit
+    apron without a straight seam across the land.
+- **Railways** (`railStripLook`). The default renderer's RailroadPass
+  hides railways at `railMinZoom − railFadeRange` = 1 device px per tile
+  and below and fades them in linearly up to `railMinZoom` = 3 (render
+  settings `railroad`, read here as constants, checked by a test). The 3D
+  strips follow that fade × 1.5 (the strip is half a tile wide, the
+  default's line a full tile), times the lot-1 light → ballast ramp:
+  hidden at full map (0.7 CSS px per tile on a 1× screen: the strip mesh
+  is not drawn at all), 33% opacity at 1.8 (was 55%), the lot-1 look from
+  ~2.3 device px per tile (55% at 2.4, 67% at 3, opaque ballast at 5), so
+  the network still shows at the default zoom as a faint light line rather
+  than a border. On a 2× screen the same device px come at half the CSS
+  zoom. Rebuilds keep running while the strips are hidden. Differences
+  with the default: the 3D strip keeps its neutral light colour (the
+  default colours rails by owner: border colour, the local player's rail
+  colour), because `RailTracks` has no owner data.
+- **Costs** (GPU-independent; World map). Draw calls: unchanged by the
+  territory, halo and apron changes (the apron is in the terrain draw);
+  railways −1 draw call at and below 1 device px per tile. Triangles: the
+  apron adds 2 × (2 (cols − 1) + 2 (rows − 1)) + 16 = 6,016 (World, high
+  quality; 3,016 with `three_quality=low`); the hidden strips save their
+  ~2.5 triangles per piece (slack included). Texture memory:
+  none added. JS: `territoryLook` and three uniform writes per frame, the
+  apron's inner row refreshed with the skirt tops on terrain patches.
+  Per fragment, by static count: owned land, zoomed out: one more
+  `diffuseLight` (ALU, a uniform branch, skipped from 5 px per tile);
+  water: one smoothstep; apron fragments run the terrain shader instead
+  of the water plane's (which the apron hides): 5 value noises (20
+  hashes: 2 for the warp, 3 for the reach), the 4 terrain fetches the
+  terrain shader always does, the water shading, plus the land shading
+  where the virtual land is; no border fetches there. Map fragments: a
+  min and a smoothstep for the edge flattening (a normalize within 3
+  tiles of the edge). The edge tiles no longer test bounds in `ownerAt`.
+
+- **Measured** (headless, SwiftShader, 1920 × 1032, high quality; the
+  same recorded game state pushed through the facade before and after:
+  World, a seeded 50-bot + nations game recorded at tick 3,242 (44 players,
+  1.6k railway pieces) and at tick 19,405 (35k railway pieces)):
+
+  | View (CSS px per tile)      | Draw calls                     | Triangles                        | Railway strip triangles |
+  | --------------------------- | ------------------------------ | -------------------------------- | ----------------------- |
+  | Full map (0.7), 35k pieces  | 24 → 23                        | 1,135k → 1,053k                  | 87.9k → 0 (not drawn)   |
+  | 1.0, 35k pieces             | 25 → 24                        | 1,135k → 1,053k                  | 87.9k → 0               |
+  | 1.8 / 3 / 6, 35k pieces     | unchanged                      | +6.0k (apron)                    | unchanged               |
+  | Every view, 44-player state | −1 at full map, else unchanged | +6.0k (apron), −4.1k at full map | 4.1k → 0 at full map    |
+
+  Terrain triangles 1,006,000 → 1,012,016 at every zoom. GPU time needs a
+  real GPU (`three_perf=1`): the apron's fragments replace the sea plane's
+  around the map (similar cost), the rest is a few ALU per fragment.
+
+## Lot 3: names close up, structure bases, bombs in flight
+
+Visual fixes from the real-GPU test (brief items 1, 4 and 7). Nothing
+changes with the default renderer.
+
+### Names close up (`NameLayer.ts`)
+
+Names are world-sized like the default renderer's, so close up a big
+nation's label grew to hundreds of px (at zoom 11, "Benin" ~170 px tall and
+"466K" a quarter of the screen) and hid the models and the mushroom clouds.
+
+- Across `NAME_CLOSE_ZOOM` (4 → 6 CSS px per tile at the screen centre,
+  smoothstep) each label blends towards a capped line height,
+  `nameCapPx` = 4.5% of the canvas height clamped to 26-52 px (46 px on a
+  1032 px canvas), and towards an opacity of `NAME_CLOSE_ALPHA` (0.72; the
+  hovered owner stays opaque, disconnected players stay dimmed under it).
+  Labels already under the cap keep their size; a label only ever shrinks.
+- **At or below 4 px per tile nothing changes**: same sizes, no inline
+  opacity, same DOM writes (the strategic read is identical).
+- The whole label (name, troops, flag, status row, crown, verified badge)
+  is one scaled element, so its parts keep their proportions; the outline
+  stays constant on screen (`--k`). Gold popups get the same weight with an
+  em cap of `POPUP_CAP_EM_PX` (34 px). Attack labels were already constant
+  (17 px).
+- Cost: one smoothstep and a min per label and frame; one `opacity` write
+  when its 1/100 step changes (only while zooming through 4-6).
+
+### Structure bases (`ProceduralMeshes.ts`, `StructureLayer.ts`)
+
+The bases were wide plazas placed at the highest point under the footprint,
+so they floated above slopes on a dark foundation skirt and overhung the sea
+near coasts (img09).
+
+- **Smaller, by type and level** (`structurePad`): city 6.2 → 7.6 tiles
+  from level 1 to 6 (was 8.4 at every level; at levels 1-3 the towers are
+  slimmer, × 0.85, and every tower's roof stays ≥ 0.2 tile from the next,
+  so a city reads as a cluster, not one block), port quay 4.6 × 6.4 (was
+  5.7 × 7.3; its pier deck sits a little above the quay on longer posts,
+  so the posts show over the water), factory 8.2 × 5.3
+  (8.4 × 6.5), defense post an earthwork octagon of 6.6 (7.3), SAM launcher
+  a round pad of 5.4 / 6.1 / 6.8 by level (7.0-7.6), silo 6.5-6.75 (7.6).
+  Types stretched by level (`structureLevelScale`) stretch their pad too.
+  Colours vary by type (paving, quay stone, asphalt, earthwork, concrete).
+- **On land** (`fitPadOnLand`): the pad (model space, turned like the
+  model) is tested against the land tiles (`terrainByteAt`) at samples ≤ 0.8
+  tiles apart, 0.05 inside its edge. If it overhangs water the model moves
+  towards the land around its tile by 0.5 or `PAD_MAX_SHIFT` 1 tile (5
+  directions), or shrinks (scales 0.9 … 0.42), the largest scale first;
+  when nothing fits (a one-tile spit) the candidate with the least pad
+  area over water wins. The shift was up to 3.5 tiles at first: the model
+  then stood off the tile the player clicked and off-centre in its SAM /
+  defense range rings, so it is capped at a tile and the pad shrinks
+  instead. A port's quay is its pad (on land); its pier still reaches out
+  over the water. Icons stay on the structure's tile (default renderer
+  parity); level badges and progress bars glide from the icon to the model
+  (`statusAnchor`). Picking is unchanged (tile-based).
+- **On the relief** (`groundGrid` + the `conform` part material): the drawn
+  surface under the pad is sampled on a 3×3 grid (u, v ∈ {0, ½, 1} of the
+  pad; each node the mean of 5 samples a quarter cell apart), reduced to
+  its least-squares plane, tilted at most `PAD_TOP_MAX_SLOPE` (0.45 rise
+  per tile; `planarGrid`, closed form on the regular grid), and passed per
+  instance (`iGround0..2`, three vec3). The vertex shader moves every pad
+  vertex onto that plane at its own (u, v) (`aFooting`: (u, v, pad width,
+  pad depth) in model units) and tilts the pad top's normal to it; every
+  other part moves rigidly to the plane at its anchor's (u, v) (each city
+  tower, wall section, silo… stands where it is, upright; parts standing
+  on the pad reach down to `FOOTING_Y`, so no gap opens under them). The
+  pad is a flat slab following the slope: draped on the bilinear grid it
+  was creased like crumpled cardboard on rough ground. Its sides reach
+  1.6 tiles into the ground. The model is sunk by the plane's float over
+  the surface at the 85th percentile of the pad samples
+  (`PAD_FLOAT_QUANTILE`, at most `PAD_MAX_SINK` 0.5) plus `PAD_SINK`
+  (0.12): on smooth ground the pad's side shows as a thin curb; on rough
+  ground bumps cross the slab (it reads as set into the ground) and its
+  side shows over the deepest dips. The pad tops are split 2×2 (rect) or
+  fanned (round).
+- **Contact shadows** are sized to the pad (not the widest extent) and lie
+  on the pad's least-squares plane (`fitGroundPlane`, `BlobShadows.push`
+  with a slope); the fade band (models growing out of the ground at 2.5-5
+  px per tile) is unchanged.
+- **JS budget** (`PAD_PLACE_BUDGET_MS`, 1.5 ms): `updateStructures` fits new
+  structures within the budget and places the rest provisionally on their
+  tile (flat, full size), queued; the queue is drained within the same
+  budget per frame (at least one; 480 structures arriving at once are all
+  fitted within ~40 frames). A terrain change (water nuke) re-seats the
+  icons at once and queues every model.
+- **Measured** (`tests/client/three`, real World map, 480 structures of
+  every type and level, a third of them on shore tiles):
+
+  |                                                                    | before                   | after                                  |
+  | ------------------------------------------------------------------ | ------------------------ | -------------------------------------- |
+  | Pads with any sample over water                                    | 204 / 480                | 76 / 480                               |
+  | Pad area over water (sum)                                          | 4,260 tiles²             | 66 tiles²                              |
+  | Pad side above the relief (median / p95 / max)                     | 0.91 / 2.49 / 5.03 tiles | 0.32 / 0.58 / 1.19 tiles               |
+  | `updateStructures`, 480 new structures (jsdom, warm, idle machine) | 13-18 ms                 | 21-25 ms (≈10 fitted, the rest queued) |
+  | Steady `updateStructures`                                          | 0.18-0.22 ms             | 0.18-0.22 ms                           |
+  | Land fit per structure (median / p95 / max)                        | –                        | 0.02 / 0.3 / ~1.5 ms                   |
+
+  "After" is the final version: shifts capped at 1 tile (194 models
+  shifted, 152 shrunk; the 3.5-tile cap gave 57 / 480 and 48 tiles²) and
+  flat slabs (the bilinear drape gave a side of 0.30 / 0.40 / 0.58 tiles,
+  and terrain over 2.4% of the pad tops on average, 19% at the 95th
+  percentile; the slabs: 13.6% and 59%, on rough mountain sites).
+
+  Triangles per model: unchanged for cities, ports, factories and silos
+  (the pad is 24 triangles, as the former foundation + paving), −8 for
+  defense posts and SAM launchers; low-poly models +14 (the pad top is now
+  split to follow the ground). Per instance: +36 bytes (`iGround0..2`);
+  per vertex of the structure templates: +16 bytes (`aFooting`); per
+  vertex in the shader: a 2×2-cell bilinear lookup (≈15 ALU), plus 4 more
+  lookups for the pad tops' normals; no texture fetch. Counters
+  (`structures`): `padsShifted`, `padsShrunk`, `padPlaceMsMax`,
+  `padPlacePending`.
+
+### Bombs in flight (`UnitLayer.ts`, `ProceduralMeshes.ts`)
+
+A bomb flies up to 120 tiles high: close up the camera is not much higher,
+so a bomb crossing the tilted view was drawn hundreds of px long with its
+exhaust blooming into a large glow (img06 / img07), while from afar the
+trail was a sub-pixel line.
+
+- **Screen-size cap** (`nukeScreenCapPx`, `capScreenScale`): the model's
+  length is measured at its own depth and capped at 24 / 30 / 36 / 12 CSS px
+  (atom, hydrogen, MIRV, warhead) up to 2 px per tile, growing as
+  √(zoom / 2) to ×2 (from 8 px per tile). The 10 px minimum size still
+  applies far out. Counters (`units`): `nukesInFlight`,
+  `nukesScreenCapped`.
+- **Tamed exhaust**: `NUKE_FLAME_GLOW` 2.5 (was 4.5-4.8), the hydrogen
+  bomb's band 1.0 (was 1.7): just over the bloom threshold.
+- **Readable trail** (the ribbon of `TrailRenderer`): every nuke and MIRV
+  warhead keeps a ribbon; without a nuke-trail cosmetic it is now a
+  glowing exhaust at the head (`NUKE_HEAD_GLOW_PX` long, below; it was
+  fade^1.5 along the whole ribbon) and a light contrail behind it,
+  building up over the glow's length, tinted 45% with the owner's colour
+  (the default renderer's ground trail is the owner's colour), composited
+  over the scene (alpha 0.85; warheads 0.7 × `warheadContrailScale` with
+  a dimmer head, so a salvo reads as lines, not as a glowing sheet). The ribbon is at
+  least `NUKE_TRAIL_MIN_PX` (3.5) wide on screen at its head (warheads
+  `WARHEAD_TRAIL_MIN_PX`, 2), so it shows at full map. The additive glow
+  of every ribbon (SAM missiles too) now fades in the fog instead of being
+  mixed towards the fog colour (which added haze over the whole ribbon at
+  distance). Cosmetic nuke-trail effects and the SAM missiles' look are
+  otherwise unchanged.
+- **MIRV cap**: the first `MAX_FULL_WARHEAD_TRAILS` (64) live warheads get
+  a full trail (12 samples), later ones a short one
+  (`WARHEAD_SHORT_TRAIL_POINTS`, 4): every warhead still shows a trail, and
+  a 350-warhead salvo costs at most ~2.3k ribbon samples per frame instead
+  of ~4.2k. Counters: `trailRibbons`, `trailSamples`, `warheadTrails`.
+- **No glowing blobs zoomed out** (`unitGlowAtZoom`): the user's "big
+  glowing ellipses" at full map (img00) were bombs at their 10 px minimum
+  size whose exhaust and ribbon head crossed the bloom threshold. The unit
+  layer's emission (exhausts, shells) and the ribbons' additive glow are
+  scaled by `UNIT_GLOW_FAR` (0.45) up to 1.5 CSS px per tile, back to 1 at
+  4: the flame (luminance ~0.47 × 2.5 × 0.45) and the head (1.7 × 0.45)
+  stay under 1 where a bomb is a few px, and glow as before close up.
+- **Head glow of a fixed screen length**: the exhaust glow on the ribbon
+  runs `NUKE_HEAD_GLOW_PX` (16 CSS px, at the bomb's depth) behind its
+  tail, by distance along the ribbon; when the first segment is longer
+  (samples are 40 ms apart, a bomb flies ~10 tiles a tick), one vertex is
+  added there so the glow does not stretch over it (it did: a long glowing
+  streak behind the bomb).
+- **No kink behind the model**: trail samples are points of the bomb's
+  path (its centre without the model's lift); the ribbon is drawn with the
+  current lift, from the live tail through the samples farther than the
+  tail from the centre. Before, each sample kept the tail offset and lift
+  of its frame, and as the on-screen cap or the min-size boost changed
+  (zooming, or a bomb nearing the camera) the ribbon bent into a hairpin
+  just behind the model.
+- **Shockwave** (`FxLayer`, `SHOCKWAVE_COLOR`, `SHOCKWAVE_ALPHA`): the
+  pale ellipse around an impact in img06 was the default shockwave ring
+  (warm white at luminance ~2, opacity 0.85, a band ~7 tiles wide sweeping
+  1.5 × the blast radius in 1.5 s), which bloom spread into a glowing disc
+  over the territory and labels. It is now just over the bloom threshold
+  (luminance ~1.2) at opacity 0.6; size, band and timing are unchanged,
+  and a player's nuke-explosion cosmetic still sets its own ring. The
+  mushroom cloud, fireball and flashes are untouched.
+- **MIRV salvos** (`warheadContrailScale`): warhead contrails' opacity ×
+  √(6 / live warheads) (1 up to 6, at least 0.3), so a fan of converging
+  warheads adds up to lines, not a pale wedge at full map.
+- Cost: no draw call added (the ribbons are one mesh, as before); +4 floats
+  per ribbon vertex (`aSmoke`); per ribbon fragment one more tone-map +
+  fog evaluation where both the glow and the contrail are present; at
+  most one more vertex per bomb ribbon (the glow's end); a distance per
+  ribbon vertex in JS. The ribbon rebuild no longer allocates per frame
+  (the trail lists are reused).
+
+### Testing
+
+`NameLayer.test.ts` (close-up weight, cap, fade, whole-label scaling,
+identical below 4 px per tile, popups), `StructureBases.test.ts` (pad
+sizes by type and level, `aFooting`, the conform shader patch and its CPU
+twin, ground grid, land fit on coasts / strips / spits, ground plane,
+sloped shadows, layer integration on a coast and a slope, the placement
+budget and queue, terrain changes), `NukeFlight.test.ts` (cap helpers,
+tamed exhaust, contrail mirror, a bomb near the camera capped, trail width
+and contrail at full map, warhead trails past the cap).
+
+## Lot 3: fallout, water glints, smooth relief
+
+Items 5, 8 and 9 of the lot-3 feedback. The GLSL is in delimited `lot 3`
+blocks of `shaders/terrain.ts` and `shaders/water.ts`; the curves have
+TypeScript twins in `TerrainShading.ts`, unit-tested against the shader
+strings. Nothing changes without `?renderer=three`.
+
+### Fallout (`shaders/terrain.ts`, `FalloutField.ts`, `FxLayer.ts`)
+
+The fallout was a fluorescent green sheet (an albedo mix towards the
+fallout colour plus an emissive pulse) where the relief disappeared. It
+is now burnt ground that keeps the relief and the lighting: the block
+recolours the ground (over any territory fill, as the default renderer's
+`TerritoryPass` does) but never touches the normals, the slope darkening
+or the hillshade. Everything hangs on the tile's own fallout bit
+(`texelFetch` of the tile under the pixel), so the zone stays exact to
+the tile: no colour or glow outside it, and its edge is the tile edge.
+
+- **One hue family at every zoom**: warm ash grey following the ground's
+  own brightness (plains, rock, snow), darker than any territory; the
+  first version went from an olive moss far out to dark brown close up.
+- **Zoomed out** (`falloutLook`, `near` = 1 − smoothstep(0.18, 0.5,
+  tiles per device px)): the ash, darker (× 0.78), with a touch (10-22%) of
+  the sickly tint (the `mapOverlay.staleNuke*` colour mixed with a dull
+  yellow), mottled at a ~10-tile scale (one noise octave, faded before it
+  can alias), a faint glow (2.5% of the colour), and a **sickly
+  yellow-green rim** on the zone's own tiles next to clean ground
+  (`falloutRimTiles`: `FALLOUT_RIM_PX` 1.6 device px wide, 1-4 whole
+  tiles, 4 taps of the tile texture; strength `FALLOUT_RIM_FAR` 0.85 →
+  `FALLOUT_RIM_NEAR` 0.3 close up). At full map and at 1.8 the zone reads
+  at a glance as a scorched hazard zone, not as one more player or a
+  forest, in the alt view too (the rim over the dimmed ground), and its
+  outline is exact to the tile.
+- **Close up** (from ~3-5 px per tile): the ash with soft charred patches
+  (−16%, was −32%: it read as camouflage), fine ash dust (± 6%, a 0.4-tile
+  octave), wind-blown ash streaks (rotated world-space noise, so no tile
+  checker) and a faint sickly stain; the rim stays as a faint line. Then:
+  - **Hotspots** (`falloutHotspot`, `hotspotGlow`): at most one per
+    `FALLOUT_HOT_CELL` (16) tile cell of a rotated lattice, in 10% of the
+    cells (`FALLOUT_HOT_SHARE`; a few dozen on a screen-filling zone at 5
+    px per tile, ~5 at 11), radius 1.6-3.2 tiles (`FALLOUT_HOT_RADIUS`),
+    and only well inside the zone: the 4 tiles `FALLOUT_HOT_CLEAR` (6)
+    tiles from its centre must be fallout too (fetched only for pixels
+    inside a hotspot disc). A dim amber core (emissive ≤ ~0.8, at most a
+    touch of bloom) in a sickly halo darkening the ash, slowly breathing;
+    faded out over 0.25-0.5 tiles per px (they would shimmer) and on steep
+    flanks. The first version scattered a hotspot in 28% of 6-tile cells:
+    an even pepper of lime dots.
+  - **Embers** (`emberRadiusTiles`): on 2% of the fallout tiles plus 20% ×
+    the hotspot strength, from ~4-8 px per tile on: a flickering orange
+    disc of at least 1.3 device px (0.06-0.25 tile) whose centre lies
+    `EMBER_MARGIN` (0.25 tile) inside its tile, so it never leaves it.
+  - **Smoke** (`FalloutSmoke` in `FxLayer.ts`): `FALLOUT_SMOKE_SLOTS` (36,
+    18 at low quality) thin puffs (peak opacity 0.3) in one draw call with
+    the FX smoke material. Each slot loops forever in closed form over an
+    emitter (a random fallout tile of a dense cell in view), rising ~9
+    tiles, drifting downwind and growing over 7 s; it takes a new emitter
+    when its loop wraps (invisible then) or its emitter leaves the view. It
+    fades in between 1.2 and 2.4 CSS px per tile; nothing is drawn without
+    fallout in view.
+- **`FalloutField`** (pure data, kept by `TerrainLayer`): fallout tiles per
+  8 × 8-tile cell (dense, a smoke emitter, from 60% of its tiles), updated
+  in O(changed tiles) from the same `changedTiles` as the tile uploads (one
+  byte per tile keeps each tile's last fallout bit, so counts stay exact).
+  A full upload (first tick, a new buffer, context restore) is re-read row
+  by row, `FALLOUT_STEP_BUDGET_MS` (0.4 ms) of JS per frame, at least one
+  row (World: 2M tiles, 7-17 ms in all over ~20-40 frames, steps of 0.4-0.6
+  ms measured); changes landing meanwhile on rows not read yet are left to
+  the re-read. A tick costs O(changed tiles): ~1-1.7 ms once for a hydrogen
+  bomb's 26k tiles, ~0.3 ms for 20k scattered tiles that flip nothing.
+- **Bombs' ground tracks over fallout** (EffectTrails, lot 2): drawn at
+  35% and 75% desaturated on fallout tiles, so they no longer read as
+  green fallout streaks on the ash (the default renderer's neon sheet hid
+  them).
+- Costs: per fallout fragment 5 value-noise lookups (20 hashes), 2
+  hotspot hashes, 4 tile-texture fetches for the rim, and 4 more only
+  inside a hotspot disc (~1% of the zone); 3 ember hashes on the ~2-5% of
+  tiles holding an ember; one tile fetch where a ground track is drawn
+  (to dim it over fallout). Off fallout the block is skipped (a branch on the tile
+  bit; SwiftShader runs both sides). Smoke: +1 draw call and ≤ 36 quads
+  (72 triangles) while any puff shows, ≤ 0.2 ms JS per frame measured
+  headless (36 emitter picks: ~0.03 ms). Field: 2 MB of tile bytes plus 3
+  arrays of 31k cells (~0.3 MB) on World.
+
+### Water glints at mid zoom (`shaders/water.ts`)
+
+The "vermicelli" at ~4-8 px per tile were the sun's disc mirrored by the
+sum of the 5 wave octaves (13 down to 1.3 tiles): long, bright, repeating
+contours, a few dozen px wide. Now:
+
+- The reflected sky has no sun disc (`skyRadiance(dir, 0)`); the sun's
+  reflection is the glint lobe only.
+- The glint lobes see the waves' short octaves only: an octave leaves the
+  glints as its wavelength grows from 16 to 40 device px
+  (`glintWaveWeight`, `GLINT_WAVE_PX`), at a third of its slope.
+- A glitter layer scaled to the screen (`glitterSlope`, `glitterLevels`):
+  two value-noise octaves whose period follows the pixel footprint (around
+  `GLITTER_PX` = 5 device px), cross-faded over log2 of the footprint (no
+  popping while zooming), each rotated and offset by its absolute level and
+  drifting, so the glints are small sparkles at any zoom, never a pattern.
+- The wave phase is bent by a slow warp, so the crests of the 5 octaves no
+  longer line up as a lattice.
+- With the sparkles that small, the tight lobe is brighter (0.22, was
+  0.05). The glints still only show from ~4 px per tile, so the full-map
+  and default-zoom water is unchanged; close up, the waves, fresnel and
+  foam are those of lot 2.
+- Cost (water plane and coastal terrain fragments while glints show): 2
+  value-noise lookups with gradient (8 hashes), a few trig ops for the
+  warp; no texture fetch.
+
+### Smooth relief close up (`TerrainLayer.ts`, `shaders/terrain.ts`)
+
+At max zoom snow and rock showed angular cells: the relief mesh is a grid
+of `step` tiles (World: 2) with per-vertex normals (creases along its
+triangles), and the per-tile detail was a bilinear blend whose slope jumps
+at every tile edge. Close up only (weight `close`, from ~3-7 px per tile)
+the shading now uses C1 / C2 smooth versions; the geometry, and so the
+silhouettes, the projector and picking, is unchanged.
+
+- **Relief texture**: `TerrainLayer` keeps, per grid vertex, the slope
+  (dh/dx, dh/dz, the same central differences as the vertex normals) and
+  the height as RGBA16F (`cols × rows`, linear filtering; World: 1001 ×
+  501 = 3.8 MB), re-sent by rectangle with the normals it follows after a
+  terrain change. The shader samples it with a cubic B-spline in 4
+  bilinear fetches (`reliefSmooth`; `cubicBsplineTaps`, `reliefGridCoord`)
+  for the shading normal and the reference height of the concavity shade.
+- **Tile heights**: a quadratic B-spline over the 3 × 3 tiles around the
+  sample point (`tileBspline`; the bilinear 2 × 2 already fetched plus 5
+  tiles; `quadBsplineAt`) gives the detail slope (no jump at tile edges),
+  and the mean upland magnitude the rock and snow lines follow (smooth
+  contours instead of the tile staircase).
+- **Surface detail**: snow gets wind-combed ripples and a fine grain in its
+  bump normals, so the smooth relief does not read as plastic.
+- Cost (land fragments close up): +4 texture fetches (relief) + 5 tile
+  texel fetches, a 3 × 3 weight loop; zoomed out nothing (the branch is on
+  `close`).
+
+### Testing
+
+`TerrainSurfaces.test.ts` (fallout look by zoom, the rim's width, embers
+inside their tile, hotspots compact inside their cell and sparse, the
+fallout block mirrored (rim, hotspot clearance, one hue family) and never
+touching normals / ao / shading, ground tracks dimmed over fallout; grid coordinates, B-spline weights, the
+2-fetch cubic equal to the 4-tap one, the quadratic tile spline C1 where
+the bilinear blend jumps and exact on planes; glitter periods around 5 px
+at any zoom, no popping across levels, long wave octaves out of the
+glints, the water shader mirrors), `FalloutField.test.ts` (exact counts
+from changed tiles against brute force, dense cells incl. edge cells,
+bounded full re-read with ticks landing mid-way, emitters only on fallout
+tiles of dense cells in view, puff curves), `TerrainLayers.test.ts` (the
+relief texture matches the mesh normals and heights; the fallout field
+fed from the tile path) and `FxLayer.test.ts` (smoke only over fallout in
+view and close enough, within its slots, halved at low quality).
 
 ## Not drawn yet
 
@@ -786,7 +1273,10 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
     `glowMaskBuilds` and `glowSetUploads` (cumulative), `glowMaskTexels`
     (texels written per mask build, 3 passes); the territory cosmetics
     counters (see "Territory cosmetics") and the trail / effect palette
-    counters (see "Cosmetic effects").
+    counters (see "Cosmetic effects"); lot 3: `falloutTiles`,
+    `falloutDenseCells` (smoke emitters), `falloutRebuilding` (0 / 1: a
+    full re-read in progress), `falloutMsMax` (JS ms of the fallout field
+    per frame, max over 120 frames) and `reliefTextureMB`.
   - `overlay`: `spawnHalos`, `spawnVertices`, `spawnTriangles`,
     `spawnRebuilds`; `samVisible`, `samCircles`, `samArcs`,
     `samRingSegments` (8 triangles each), `samPendingCircles` (heights
@@ -799,16 +1289,22 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
     as icon and model, inside the fade band), `modelWeight` (0 = icons
     only, 1 = models only), `iconAlpha` (the icons' crossfade opacity) and
     `ghostIcons` (build ghost icons drawn: 0, 1, or 2 with an upgrade
-    target).
+    target); `padsShifted` and `padsShrunk` (models moved / shrunk to stay
+    on land), `padPlaceMsMax` (slowest placement, JS ms) and
+    `padPlacePending` (placements still queued).
   - `units`: the railway counters (`railPieces`, `railTriangles`, …, see
     "Performance notes"), `unitInstances`, `unitLodInstances`,
-    `unitCulled`, `unitTriangles`, `unitJsMs`, and `nukeEffectRibbons`
-    (nuke ribbons drawn in their owner's effect colours).
+    `unitCulled`, `unitTriangles`, `unitJsMs`, `nukeEffectRibbons`
+    (nuke ribbons drawn in their owner's effect colours), `nukesInFlight`,
+    `nukesScreenCapped`, `trailRibbons`, `trailSamples` and
+    `warheadTrails`.
   - `fx`: `glowParticles`, `smokeParticles`, `fireballs`, `decals`,
     `pendingEffects`, `liveEffects`, and `fillScreens` /
     `fillScreensMax` (last frame / max over 120 frames): the screen area
-    of the glow and smoke quads and fireballs over the viewport area, an
-    estimate of how many times each pixel is blended (decals left out).
+    of the glow and smoke quads (fallout puffs included) and fireballs
+    over the viewport area, an estimate of how many times each pixel is
+    blended (decals left out); `falloutPuffs` (fallout smoke puffs drawn)
+    and `falloutSmokeMs` (their JS time, last frame).
 
 ## Performance notes
 
@@ -875,7 +1371,10 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   blocks exceed half the live slots plus 2048).
 - Railway levels of detail: every piece (half a tile) is a flat
   2-triangle ballast strip, one draw call, never culled; below ~2 px per
-  tile it is light and half transparent so lines do not read as borders.
+  tile it is light and half transparent so lines do not read as borders,
+  and since lot 3 it fades out below ~2.3 device px per tile and is not
+  drawn at all from 1 down, like the default renderer (see "Readability at
+  distance").
   Sleepers and rails (16 triangles a piece, was 60) are added only for the
   blocks inside the view frustum whose nearest tile covers at least 6 CSS
   px (off again below 5), and never with `three_quality=low`. On a
@@ -950,6 +1449,37 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   one frame, no cell left queued; `uploadLiveTrailDelta` 0.3 ms per frame
   at most (all the ticks in between).
 
+- **Lot 3 in a headless late game** (the recorded World state of
+  "Readability at distance": tick 19,405, 1,480 units of which 394
+  structures, 897 trade ships and 182 trains, 35.1k railway pieces, pushed
+  through the facade; 1920 ×
+  1032, high quality; lot 2 = the same state and cameras at `00199ee`):
+
+  | View (CSS px per tile) | Draw calls lot 2 → lot 3 | Triangles lot 2 → lot 3 | Terrain | Units (rails incl.) | Structures |
+  | ---------------------- | ------------------------ | ----------------------- | ------- | ------------------- | ---------- |
+  | Full map (0.7)         | 24 → 23                  | 1,135k → 1,053k         | 1,012k  | 39.7k (strips off)  | 0.8k       |
+  | Default (1.8)          | 25 → 25                  | 1,114k → 1,120k         | 1,012k  | 106.6k              | 0.8k       |
+  | 5 (tilted 9°)          | – → 30                   | – → 1,123k              | 1,012k  | 107.4k              | 2.8k       |
+  | 11 (tilted 48°)        | – → 31                   | – → 1,202k              | 1,012k  | 185.3k              | 4.0k       |
+  | 20 (tilted 50°)        | – → 25                   | – → 1,144k              | 1,012k  | 130.1k              | 1.3k       |
+
+  The terrain's +6.0k triangles are the apron; no lot-3 change adds a draw
+  call outside the fallout smoke (+1 while puffs show) and no texture but
+  the relief texture (3.8 MB on World). Layer JS per frame stays within
+  the headless noise (SwiftShader frames take seconds; a shared CPU), with
+  two lot-3 sources worth a real-GPU look: the structure placement queue
+  (`padPlaceMsMax` up to 9.6 ms for a single fit under that load, 1.5 ms
+  budget per frame otherwise; 394 structures pushed at once leave ~350 in
+  the queue, drained a few per frame) and the fallout field's full
+  re-read after a full tile upload (`falloutMsMax` 4.4-7 ms headless, 0.4
+  ms budget per step). Hydrogen + atom bomb fallout scene (26,155 fallout
+  tiles, 391 dense cells): 20 draw calls at full map, 22-24 with the smoke
+  (35 of 36 puffs, 70 triangles, `falloutSmokeMs` ≤ 0.2); the embers are in
+  the terrain shader (~2% of the fallout tiles, ~520 here; no instances).
+  Bombs in flight (3 bombs + 24 warheads): 27 ribbons, 90-120 ribbon
+  samples (the head-glow split vertices included), draw calls unchanged
+  (23 at full map, 37 at 4, 31 at 11).
+
 - Names, troop counts and level badges are pooled DOM elements. The frame
   loop never reads layout, and troop text changes at most every 500 ms per
   label.
@@ -1000,7 +1530,28 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   budgets checked and a GPU copy converging to the live buffer, alt-view
   colours), `NukeRibbonEffect.test.ts` (ribbon colour selection and the
   per-vertex owners / switch fed to its shader) and
-  `EffectTrailsFacade.test.ts` (facade wiring).
+  `EffectTrailsFacade.test.ts` (facade wiring). Readability at distance
+  (lot 3): `TerrainShading.test.ts` (territory look curves: settings look
+  from 5 px per tile, full strategy look at full map, monotonic, a one-tile
+  border at 1.8; shore halo scale; apron size, mirror, warp, zoom scale,
+  virtual coast, fill fade and water magnitude; the GLSL constants against
+  the TS ones),
+  `TerrainLayers.test.ts` (the apron geometry: slope on the edge vertices,
+  flat ring, facing up, covering the ring once; the zoom-driven uniforms,
+  alt-view ground) and `RailTracks.test.ts` (`railStripLook` against the
+  default renderer's `railroad` settings, by device px; strips not drawn
+  while faded out, rebuilds still applied). Lot 3: `NameLayer.test.ts`
+  (close-up cap), `StructureBases.test.ts` (pads, land fit within a tile,
+  ground grid reduced to a tilt-capped plane, separate city towers, the
+  pier on posts, conform shader, placement budget) and `NukeFlight.test.ts`
+  (bombs' screen cap, contrails, warhead trails, glow under the bloom
+  threshold zoomed out, the trail straight behind the bomb while its size
+  changes and its glow ending within the screen length, warhead contrails
+  thinned by their number) and `FxLayer.test.ts` (the default shockwave
+  ring just over the bloom threshold). Fallout, water glints and smooth
+  relief (lot 3): `TerrainSurfaces.test.ts`, `FalloutField.test.ts` and
+  additions to `TerrainLayers.test.ts` / `FxLayer.test.ts` (see "Lot 3:
+  fallout, water glints, smooth relief").
 - Headless checks in `.claude/skills/run-openfront/`:
   - `three-shots.mjs`: screenshots at four zoom levels plus a click test
     while tilted.

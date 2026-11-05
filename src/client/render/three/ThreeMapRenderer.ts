@@ -312,6 +312,8 @@ export class ThreeMapRenderer implements MapRendererLike {
         () => new OverlayLayer(this.ctx, this.terrain),
       );
       this.fx = track("fx", () => new FxLayer(this.ctx));
+      // Lot 3: the fallout smoke rises from the terrain's fallout cells.
+      this.fx.setFallout(this.terrain.fallout);
       this.names = track("names", () => new NameLayer(this.ctx));
       this.frameLayers = [
         this.environment,

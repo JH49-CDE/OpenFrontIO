@@ -17,6 +17,11 @@
  * GLSL and uniforms as TerrainLayer's (EffectTrails.ts, shared; TerrainLayer
  * sends the uploads).
  *
+ * Off the map, TerrainLayer's apron (lot 3: the mirrored land past the
+ * edges, then open sea, `apronWidthTiles` wide) covers this plane with the
+ * same water shading; the plane shows beyond it. The shallow-water look
+ * narrows when zoomed out (`shoreViewScale` in shaders/water.ts).
+ *
  * Draw order: transparent queue with `renderOrder` -10 (before other
  * transparent objects, which should keep renderOrder >= 0), depth-writing,
  * pushed back slightly with a polygon offset so coastal relief at sea level

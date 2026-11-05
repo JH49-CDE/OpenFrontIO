@@ -178,8 +178,9 @@ describe("coordinate grid", () => {
     expect(t.plane.material.uniforms.uGridOn).toBe(t.u.uGridOn);
     // The terrain shader composites the overlay in its delimited block.
     expect(TERRAIN_FRAG).toContain("BEGIN surface overlay composite");
+    // Only on the map: not on the map-edge apron (lot 3).
     expect(TERRAIN_FRAG).toContain(
-      "if (uOverlayOn > 0.5 && (land || vWorld.y > 0.0))",
+      "if (uOverlayOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0))",
     );
     t.layer.dispose();
   });

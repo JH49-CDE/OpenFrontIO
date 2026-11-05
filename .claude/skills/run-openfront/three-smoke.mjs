@@ -26,7 +26,10 @@ fs.mkdirSync(out, { recursive: true });
 const RAF_MS = 3000;
 
 const shot = async (page, name) => {
-  await page.screenshot({ path: `${out}/${name}.png` });
+  // A whole-map frame takes ~25-35 s under SwiftShader since lot 3 (the map
+  // edge apron and the close-up relief shading): Playwright's default 30 s
+  // screenshot timeout is too tight.
+  await page.screenshot({ path: `${out}/${name}.png`, timeout: 120_000 });
   const kb = Math.round(fs.statSync(`${out}/${name}.png`).size / 1024);
   console.log(`screenshot ${out}/${name}.png (${kb} KB)`);
 };

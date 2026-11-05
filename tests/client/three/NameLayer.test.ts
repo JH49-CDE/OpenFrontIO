@@ -6,16 +6,26 @@ import { createRenderSettings } from "../../../src/client/render/gl/RenderSettin
 import type { HeightField } from "../../../src/client/render/three/HeightField";
 import {
   bonusPopupText,
+  closeUpLineHeightPx,
+  closeUpNameAlpha,
+  closeUpPopupEmPx,
   conquestPopupText,
   formatPopupGold,
   lerpFactor,
   LINE_PER_EM,
   MAX_POPUPS,
+  NAME_CAP_MAX_PX,
+  NAME_CAP_MIN_PX,
+  NAME_CLOSE_ALPHA,
+  NAME_CLOSE_ZOOM,
   NAME_CULL_FRACTION,
+  nameCapPx,
+  nameCloseUpWeight,
   nameEmTiles,
   NameLayer,
   nameLineHeightTiles,
   nameShade,
+  POPUP_CAP_EM_PX,
   popupAlpha,
   quantizeLog2,
   shownNameLineHeightPx,
@@ -467,3 +477,138 @@ describe("NameLayer DOM", () => {
     ).toBeLessThanOrEqual(MAX_POPUPS);
   });
 });
+
+describe("close-up cap (lot 3)", () => {
+  it("leaves the strategic zooms alone and caps from 4 to 6 px per tile", () => {
+    expect(NAME_CLOSE_ZOOM).toEqual([4, 6]);
+    for (const z of [0.3, 0.7, 1.8, 3, 3.99, 4]) {
+      expect(nameCloseUpWeight(z)).toBe(0);
+      // Identical sizes and opacity at and below 4 px per tile.
+      expect(closeUpLineHeightPx(170, z, 1032)).toBe(170);
+      expect(closeUpLineHeightPx(12, z, 1032)).toBe(12);
+      expect(closeUpNameAlpha(z, false)).toBe(1);
+      expect(closeUpPopupEmPx(120, z)).toBe(120);
+    }
+    expect(nameCloseUpWeight(5)).toBeCloseTo(0.5);
+    expect(nameCloseUpWeight(6)).toBe(1);
+    expect(nameCloseUpWeight(20)).toBe(1);
+    // Monotonic in between.
+    let prev = 0;
+    for (let z = 4; z <= 6; z += 0.125) {
+      const w = nameCloseUpWeight(z);
+      expect(w).toBeGreaterThanOrEqual(prev);
+      prev = w;
+    }
+  });
+
+  it("caps the line height to a fraction of the canvas height", () => {
+    // img05 / img06: "Benin" ~170 px tall at zoom 11 on a 1032 px canvas.
+    expect(nameCapPx(1032)).toBeCloseTo(0.045 * 1032);
+    expect(nameCapPx(300)).toBe(NAME_CAP_MIN_PX);
+    expect(nameCapPx(4000)).toBe(NAME_CAP_MAX_PX);
+    expect(closeUpLineHeightPx(170, 11, 1032)).toBeCloseTo(nameCapPx(1032));
+    // Half way through the band: half way to the cap.
+    const cap = nameCapPx(1032);
+    expect(closeUpLineHeightPx(170, 5, 1032)).toBeCloseTo(
+      170 + (cap - 170) / 2,
+    );
+    // Small names (under the cap) keep their size; nothing ever grows.
+    expect(closeUpLineHeightPx(30, 11, 1032)).toBe(30);
+    for (const z of [4.5, 5, 6, 9, 20]) {
+      for (const h of [10, 40, 80, 300]) {
+        expect(closeUpLineHeightPx(h, z, 1032)).toBeLessThanOrEqual(h);
+      }
+    }
+    // Fade: NAME_CLOSE_ALPHA close up, none for the hovered owner.
+    expect(closeUpNameAlpha(11, false)).toBeCloseTo(NAME_CLOSE_ALPHA);
+    expect(closeUpNameAlpha(11, true)).toBe(1);
+    // Popups: the same weight, a fixed em cap.
+    expect(closeUpPopupEmPx(66, 11)).toBeCloseTo(POPUP_CAP_EM_PX);
+    expect(closeUpPopupEmPx(20, 11)).toBe(20);
+  });
+
+  it("scales the whole label (name, troops, flag, status) and fades it close up", () => {
+    const ctx = makeCtx();
+    const layer = new NameLayer(ctx);
+    layer.addPlayers([player("a", 1, { flag: "/flags/x.svg" })]);
+    const names = new Map<string, NameEntry>([
+      ["a", { playerID: "a", x: 10, y: 20, size: 46 }],
+    ]);
+    const status = new Map<number, PlayerStatusData>([
+      [1, { ...noStatus(), crown: true }],
+    ]);
+    layer.updateNames(names, new Map([[1, state(1, 466_000)]]), false, status);
+    // em 54 tiles → line 40.5 tiles.
+    const lineTiles = nameLineHeightTiles(46);
+    expect(lineTiles).toBeCloseTo(40.5);
+
+    // Strategic zoom (3 px per tile): world-sized, no inline opacity.
+    layer.update(frame(0, { cssPxPerTile: 3 }), projector(3));
+    const el = labels(ctx)[0];
+    const scaleOf = () =>
+      Number(/scale\(([\d.]+)\)/.exec(el.style.transform)![1]);
+    const base = BASE_LINE();
+    expect(scaleOf()).toBeCloseTo((lineTiles * 3) / base, 3);
+    expect(el.style.opacity).toBe("");
+
+    // Zoom 11 (tilted view): capped at 4.5% of the 800 px canvas, faded.
+    layer.update(frame(16, { cssPxPerTile: 11 }), projector(11));
+    expect(scaleOf()).toBeCloseTo(nameCapPx(800) / base, 3);
+    expect(Number(el.style.opacity)).toBeCloseTo(NAME_CLOSE_ALPHA, 2);
+    // Flag, troops and the status row are children of the scaled root.
+    for (const sel of [".ofn-flag", ".ofn-troops", ".ofn-status"]) {
+      expect(el.querySelector(sel)).not.toBeNull();
+    }
+    expect(el.querySelector(".ofn-status")!.children.length).toBe(1);
+    // Hovered: the cap stays, the fade goes.
+    layer.update(
+      frame(32, { cssPxPerTile: 11, highlightOwner: 1 }),
+      projector(11),
+    );
+    expect(el.style.opacity).toBe("");
+    // Back to the strategic view: exactly as before.
+    layer.update(frame(48, { cssPxPerTile: 3 }), projector(3));
+    expect(scaleOf()).toBeCloseTo((lineTiles * 3) / base, 3);
+    expect(el.style.opacity).toBe("");
+    layer.dispose();
+  });
+
+  it("keeps disconnected players dimmed under the fade", () => {
+    const ctx = makeCtx();
+    const layer = new NameLayer(ctx);
+    layer.addPlayers([player("a", 1)]);
+    layer.updateNames(
+      new Map([["a", { playerID: "a", x: 10, y: 20, size: 20 }]]),
+      new Map([[1, state(1, 100)]]),
+      false,
+      new Map([[1, { ...noStatus(), disconnected: true }]]),
+    );
+    layer.update(frame(0, { cssPxPerTile: 2 }), projector(2));
+    const el = labels(ctx)[0];
+    expect(el.classList.contains("ofn-dim")).toBe(true);
+    expect(el.style.opacity).toBe("");
+    layer.update(frame(16, { cssPxPerTile: 12 }), projector(12));
+    expect(Number(el.style.opacity)).toBeCloseTo(0.55 * NAME_CLOSE_ALPHA, 2);
+    layer.dispose();
+  });
+});
+
+/** Design line height of the labels (CSS px before the per-frame scale). */
+function BASE_LINE(): number {
+  return 32 * LINE_PER_EM;
+}
+
+function noStatus(): PlayerStatusData {
+  return {
+    crown: false,
+    traitor: false,
+    disconnected: false,
+    alliance: false,
+    allianceReq: false,
+    target: false,
+    embargo: false,
+    nukeActive: false,
+    nukeTargetsMe: false,
+    inDoomsdayClock: false,
+  } as PlayerStatusData;
+}

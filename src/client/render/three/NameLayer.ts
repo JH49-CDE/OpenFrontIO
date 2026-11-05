@@ -33,6 +33,15 @@
  * is measured by projecting a point one tile east: the camera never yaws, so
  * world X stays parallel to the screen and the difference is exactly
  * focalPx / depth — tilted / distant labels shrink naturally.
+ *
+ * Close-up cap (lot 3): from NAME_CLOSE_ZOOM[0] (4 CSS px per tile) to
+ * NAME_CLOSE_ZOOM[1] (6) the labels blend towards a capped line height
+ * (`nameCapPx`: 4.5% of the canvas height, 26-52 px) and an opacity of
+ * NAME_CLOSE_ALPHA, so close up they no longer hide the models and the
+ * mushroom clouds; gold popups get the same treatment (POPUP_CAP_EM_PX).
+ * At or below 4 px per tile the sizes, opacity and DOM writes are exactly
+ * as before. The whole label (name, troops, flag, status row, crown) is
+ * one scaled element, so its parts keep their proportions.
  */
 
 import { renderTroops } from "@openfront/engine-lib/Format";
@@ -73,6 +82,8 @@ export const TROOP_REFRESH_MS = 500;
 const TROOP_STAGGER_SLOTS = 5;
 const TROOP_STAGGER_MS = 100;
 const NAME_SHADE_NATION = 0.3;
+/** Opacity of disconnected players' labels (`.ofn-dim`). */
+const DIM_ALPHA = 0.55;
 const NAME_SHADE_BOT = 0.4;
 /** Visible outline of names, screen px (a centred stroke is twice that). */
 const NAME_OUTLINE_PX = 1.4;
@@ -108,6 +119,27 @@ export const MAX_POPUPS = 48;
 
 /** Steps per octave of the `--k` quantisation (~6% steps). */
 const K_STEPS_PER_OCTAVE = 12;
+
+/**
+ * Close-up cap (lot 3). Names are world-sized like the default renderer's,
+ * so close up (tilted view) a big nation's label grew to hundreds of px
+ * and hid the models and the mushroom clouds. Across this zoom range (CSS px
+ * per tile at the screen centre) the labels blend towards a capped
+ * on-screen size and a lower opacity; at or below its start nothing changes
+ * (the strategic read is identical).
+ */
+export const NAME_CLOSE_ZOOM: readonly [number, number] = [4, 6];
+/** Capped line height = this fraction of the canvas height (CSS px)... */
+export const NAME_CAP_FRACTION = 0.045;
+/** ...within these bounds (CSS px). */
+export const NAME_CAP_MIN_PX = 26;
+export const NAME_CAP_MAX_PX = 52;
+/** Opacity of names once fully in the close-up range (not when hovered). */
+export const NAME_CLOSE_ALPHA = 0.72;
+/** Close up, gold popups keep at most this em (CSS px). */
+export const POPUP_CAP_EM_PX = 34;
+/** Opacity steps written to the DOM (1/100). */
+const ALPHA_STEPS = 100;
 
 // Status flags (bit mask) in NamePass's icon order.
 export const STATUS_CROWN = 1 << 0;
@@ -161,6 +193,57 @@ export function shownNameLineHeightPx(
   if (targeted) return threshold;
   if (hovered) return lineHeightPx;
   return 0;
+}
+
+/**
+ * Weight of the close-up treatment at a zoom (CSS px per tile at the screen
+ * centre): 0 up to NAME_CLOSE_ZOOM[0], smoothstep to 1 at NAME_CLOSE_ZOOM[1].
+ */
+export function nameCloseUpWeight(cssPxPerTile: number): number {
+  const [z0, z1] = NAME_CLOSE_ZOOM;
+  if (!(cssPxPerTile > z0)) return 0;
+  const t = Math.min(1, (cssPxPerTile - z0) / (z1 - z0));
+  return t * t * (3 - 2 * t);
+}
+
+/** Largest line height (CSS px) of a fully capped name on this canvas. */
+export function nameCapPx(cssHeight: number): number {
+  const v = NAME_CAP_FRACTION * (cssHeight > 0 ? cssHeight : 0);
+  return Math.min(NAME_CAP_MAX_PX, Math.max(NAME_CAP_MIN_PX, v));
+}
+
+/**
+ * Line height (CSS px) a name is drawn at once the close-up cap applies:
+ * `lineHeightPx` unchanged at weight 0 or when it is already under the
+ * cap, else blended towards the cap by the weight. Never larger than the
+ * world-sized line, so a label only shrinks.
+ */
+export function closeUpLineHeightPx(
+  lineHeightPx: number,
+  cssPxPerTile: number,
+  cssHeight: number,
+): number {
+  const k = nameCloseUpWeight(cssPxPerTile);
+  if (k <= 0) return lineHeightPx;
+  const cap = nameCapPx(cssHeight);
+  if (!(lineHeightPx > cap)) return lineHeightPx;
+  return lineHeightPx + (cap - lineHeightPx) * k;
+}
+
+/** Opacity of names at a zoom (1 for the hovered owner). */
+export function closeUpNameAlpha(
+  cssPxPerTile: number,
+  hovered: boolean,
+): number {
+  if (hovered) return 1;
+  return 1 - (1 - NAME_CLOSE_ALPHA) * nameCloseUpWeight(cssPxPerTile);
+}
+
+/** Popup em (CSS px) after the close-up cap, same weight as the names. */
+export function closeUpPopupEmPx(emPx: number, cssPxPerTile: number): number {
+  const k = nameCloseUpWeight(cssPxPerTile);
+  if (k <= 0 || !(emPx > POPUP_CAP_EM_PX)) return emPx;
+  return emPx + (POPUP_CAP_EM_PX - emPx) * k;
 }
 
 /** Frame-rate independent exponential approach factor, t = 1 - e^(-k·dt). */
@@ -352,7 +435,7 @@ function layerCss(): string {
 .ofn-emoji{flex:none;font-size:${(ICON_PX * 0.9).toFixed(2)}px;line-height:${icon}px;
   -webkit-text-stroke-width:0;}
 .ofn-traitor .ofn-name,.ofn-traitor .ofn-troops{color:#8a1010;}
-.ofn-dim{opacity:.55;}
+.ofn-dim{opacity:${DIM_ALPHA};}
 .ofn-hover{text-shadow:0 0 calc(var(--k,1) * ${HOVER_GLOW_PX}px) rgba(255,255,255,.75),
   0 0 calc(var(--k,1) * 2px) rgba(255,255,255,.9);}
 .ofn-world-text{color:#fff;-webkit-text-stroke-color:rgba(0,0,0,.9);
@@ -405,6 +488,8 @@ interface NameLabel {
   troopText: string | null;
   lastTransform: string;
   lastK: number;
+  /** Inline opacity written (close-up fade; "" = none, the CSS decides). */
+  lastOpacity: string;
   classKey: string;
 }
 
@@ -525,6 +610,7 @@ export class NameLayer {
         troopText: null,
         lastTransform: "",
         lastK: 0,
+        lastOpacity: "",
         classKey: "",
       });
     }
@@ -673,16 +759,23 @@ export class NameLayer {
       const hovered =
         frame.highlightOwner > 0 &&
         frame.highlightOwner === label.static.smallID;
-      const lineH = shownNameLineHeightPx(
+      const shownH = shownNameLineHeightPx(
         nameLineHeightTiles(label.curSize) * pxPerTile,
         frame.cssWidth,
         (label.status & STATUS_TARGET) !== 0,
         hovered,
       );
-      if (lineH <= 0) {
+      if (shownH <= 0) {
         this.hideLabel(label);
         continue;
       }
+      // Close up: capped on screen and faded a little (whole label: name,
+      // troops, flag, status row and crown scale together).
+      const lineH = closeUpLineHeightPx(
+        shownH,
+        frame.cssPxPerTile,
+        frame.cssHeight,
+      );
 
       const dom = label.dom ?? this.createLabelDom(label);
       if (label.staticDirty) this.applyStatic(label, dom);
@@ -702,11 +795,34 @@ export class NameLayer {
         label.lastK = k;
         dom.root.style.setProperty("--k", k.toFixed(4));
       }
+      this.applyOpacity(label, dom, frame.cssPxPerTile, hovered);
       if (!label.shown) {
         label.shown = true;
         dom.root.style.display = "block";
       }
     }
+  }
+
+  /**
+   * Close-up fade: an inline opacity only while it is below 1, so the
+   * strategic zooms keep the CSS as before (`.ofn-dim` for disconnected
+   * players, which the fade multiplies).
+   */
+  private applyOpacity(
+    label: NameLabel,
+    dom: LabelDom,
+    cssPxPerTile: number,
+    hovered: boolean,
+  ): void {
+    const a = closeUpNameAlpha(cssPxPerTile, hovered);
+    let opacity = "";
+    if (a < 1) {
+      const dim = (label.status & STATUS_DISCONNECTED) !== 0 ? DIM_ALPHA : 1;
+      opacity = (Math.round(a * dim * ALPHA_STEPS) / ALPHA_STEPS).toString();
+    }
+    if (opacity === label.lastOpacity) return;
+    label.lastOpacity = opacity;
+    dom.root.style.opacity = opacity;
   }
 
   private hideLabel(label: NameLabel): void {
@@ -944,7 +1060,10 @@ export class NameLayer {
         view.text = popup.text;
         view.el.textContent = popup.text;
       }
-      const emPx = Math.max(POPUP_EM_TILES * pxPerTile, POPUP_MIN_EM_PX);
+      const emPx = closeUpPopupEmPx(
+        Math.max(POPUP_EM_TILES * pxPerTile, POPUP_MIN_EM_PX),
+        frame.cssPxPerTile,
+      );
       const scale = emPx / BASE_EM_PX;
       // Rise in screen space so it reads as "up" at any camera tilt.
       const riseY = (elapsed / 1000) * popup.rise * pxPerTile;

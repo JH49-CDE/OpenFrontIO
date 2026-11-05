@@ -4,7 +4,13 @@
  *
  * Geometry: the HeightField grid (bounded vertex count) plus vertical
  * "skirts" down the four map edges, so a tilted view never looks under the
- * relief. Cells that hold any land tile are kept at or above
+ * relief, plus an apron around the map (lot 3, `apronWidthTiles` wide): a
+ * strip per edge sloping from the edge vertices down to `COAST_LIFT` over
+ * `APRON_SLOPE_TILES` (so land at the edge meets it without a cliff), then
+ * flat. On it the shader continues the land past the border as its mirror
+ * image, breaking up into the sea along a noisy virtual coast, so the map
+ * no longer ends in a straight cut (the water beyond matches WaterLayer's
+ * plane). Cells that hold any land tile are kept at or above
  * `COAST_LIFT` (the grid is a low-pass of the tiles, so thin land would
  * otherwise sink under the water plane): coastlines are then decided per
  * tile by the shader, and where the relief rises above sea level over water
@@ -64,11 +70,22 @@
  * The layer is also the `ReliefSurface` overlays drape on: `surfaceAt`
  * interpolates the relief mesh's own triangles (coast lift included),
  * clamped to sea level, so draped geometry matches what is drawn.
+ *
+ * Lot 3:
+ * - Relief texture (item 9): the grid's slope and height per vertex
+ *   (RGBA16F, `cols × rows`), kept with the normals. Close up the shader
+ *   shades with its cubic B-spline instead of the mesh's per-vertex
+ *   normals, which creased along the triangles (angular cells on snow at
+ *   max zoom); the geometry, and so picking, is unchanged.
+ * - Fallout field (item 5, `FalloutField`): fallout tiles per 8×8-tile
+ *   cell, updated from the same changed tiles as the uploads (FxLayer's
+ *   fallout smoke reads it).
  */
 
 import * as THREE from "three";
 import type { TerrainRect, UnitState } from "../types";
 import { EffectTrails } from "./EffectTrails";
+import { FalloutField } from "./FalloutField";
 import type { GridRange, HeightField } from "./HeightField";
 import { environmentUniforms } from "./SceneEnvironment";
 import { TERRAIN_FRAG, TERRAIN_VERT } from "./shaders/terrain";
@@ -86,10 +103,16 @@ import {
   waterColorKey,
 } from "./TerrainResources";
 import {
+  ALT_GROUND_FREE,
+  ALT_GROUND_OWNED,
+  apronReachZoomScale,
+  apronWidthTiles,
   COAST_LIFT,
   computeCellLand,
+  edgeReachTiles,
   hexToSrgb01,
   type Rgb,
+  territoryLook,
   vertexTouchesLand,
 } from "./TerrainShading";
 import { TerritoryCosmetics } from "./TerritoryCosmetics";
@@ -98,8 +121,18 @@ import type { FrameInfo, ReliefSurface, ThreeLayerContext } from "./types";
 
 /** Size of the relation matrix (frame/derive/RelationMatrix.ts). */
 const RELATION_SIZE = 1024;
-/** Target border width in CSS px (clamped to [MIN_BORDER_TILES, 1] tile). */
+/**
+ * Target border width in CSS px close up (clamped to [MIN_BORDER_TILES, 1]
+ * tile); zoomed out it grows (`territoryLook`, lot 3).
+ */
 const BORDER_CSS_PX = 1.3;
+/**
+ * Width (tiles) of the apron's slope from the edge vertices down to
+ * COAST_LIFT; flat from there to the rim.
+ */
+export const APRON_SLOPE_TILES = 8;
+/** Apron triangles besides the slope quads: 4 corner patches, the ring. */
+const APRON_EXTRA_TRIANGLES = 8 + 8;
 /**
  * Thinnest border, in tiles: zoomed in, borders grow with the zoom (the 2D
  * renderer's are a full tile) so they stay readable on busy relief.
@@ -180,6 +213,14 @@ function createTerrainUniforms() {
     uBorderPx: f1(BORDER_CSS_PX),
     uMinBorder: f1(MIN_BORDER_TILES),
     uBorderGlow: f1(BORDER_GLOW),
+    // Lot 3: territory look by zoom (`territoryLook`) and the map-edge apron.
+    uFarFlatten: f1(0),
+    uAltGroundOwned: f1(ALT_GROUND_OWNED),
+    uAltGroundFree: f1(ALT_GROUND_FREE),
+    uEdgeReach: f1(16),
+    // Lot 3: the relief texture (smooth shading close up).
+    uRelief: { value: null as THREE.Texture | null },
+    uReliefGrid: { value: new THREE.Vector3(1, 2, 2) },
   };
 }
 type TerrainUniforms = ReturnType<typeof createTerrainUniforms> & WaterUniforms;
@@ -241,11 +282,33 @@ export class TerrainLayer implements ReliefSurface {
   private readonly skirts: SkirtEdge[] = [];
   private readonly skirtVertexCount: number;
   private readonly skirtBottomY: number;
+  /** First apron vertex (after the skirts) and the apron width, tiles. */
+  private readonly apronBase: number;
+  readonly apronWidth: number;
+  /** Mean reach (tiles) of the land past the map edge (`edgeReachTiles`). */
+  private readonly edgeReach: number;
+  /** Apron slope columns ([inner, foot] pairs) per edge, like `skirts`. */
+  private readonly apronEdges: SkirtEdge[] = [];
+  /** Zoom (CSS px per tile) and pixel ratio of the last frame. */
+  private zoom = 1.8;
+  private dpr = 1;
   private readonly cellsX: number;
   private readonly cellsY: number;
   private readonly cellLand: Uint8Array;
   /** HeightField version the relief geometry was last built from. */
   private reliefVersion = -1;
+  /**
+   * Relief texture (lot 3): per grid vertex (dh/dx, dh/dz, y, 0) as half
+   * floats, linear-filtered; rows re-sent with the normals they follow.
+   */
+  private readonly reliefData: Uint16Array;
+  private readonly reliefTex: THREE.DataTexture;
+  private readonly reliefUploader: TextureRectUploader;
+  /** Fallout tiles per cell (lot 3, FxLayer's smoke). */
+  readonly fallout: FalloutField;
+  /** JS ms of the fallout field per frame (`perf` only), last window. */
+  private readonly recentFalloutMs: Float32Array | null;
+  private falloutMsPending = 0;
 
   constructor(private readonly ctx: ThreeLayerContext) {
     const hf = ctx.heightField;
@@ -256,6 +319,8 @@ export class TerrainLayer implements ReliefSurface {
     const perf = ctx.settings.perf === true;
     this.recentCalls = perf ? new Int32Array(PERF_WINDOW) : null;
     this.recentTexels = perf ? new Int32Array(PERF_WINDOW) : null;
+    this.recentFalloutMs = perf ? new Float32Array(PERF_WINDOW) : null;
+    this.fallout = new FalloutField(this.W, this.H);
 
     // ---- Textures ----
     this.terrainBytes = TerrainByteTexture.acquire(ctx);
@@ -281,9 +346,26 @@ export class TerrainLayer implements ReliefSurface {
     this.gridCount = hf.cols * hf.rows;
     this.skirtVertexCount = 2 * (2 * hf.cols + 2 * hf.rows);
     this.skirtBottomY = -(hf.seabedDepth + SKIRT_EXTRA_DEPTH);
-    const vertexCount = this.gridCount + this.skirtVertexCount;
+    this.apronBase = this.gridCount + this.skirtVertexCount;
+    this.apronWidth = apronWidthTiles(this.W, this.H);
+    // Slope columns (2 per skirt column), 4 slope-foot corners, 4 rim corners.
+    const vertexCount = this.apronBase + this.skirtVertexCount + 8;
     this.positions = new Float32Array(vertexCount * 3);
     this.normals = new Float32Array(vertexCount * 3);
+    this.reliefData = new Uint16Array(this.gridCount * 4);
+    this.reliefTex = new THREE.DataTexture(
+      this.reliefData,
+      hf.cols,
+      hf.rows,
+      THREE.RGBAFormat,
+      THREE.HalfFloatType,
+    );
+    this.reliefTex.minFilter = THREE.LinearFilter;
+    this.reliefTex.magFilter = THREE.LinearFilter;
+    this.reliefTex.generateMipmaps = false;
+    this.reliefTex.flipY = false;
+    this.reliefTex.colorSpace = THREE.NoColorSpace;
+    this.reliefUploader = new TextureRectUploader(this.reliefTex);
     this.buildStaticGeometry();
     this.refreshRelief(null);
     this.geometry.setAttribute(
@@ -306,6 +388,10 @@ export class TerrainLayer implements ReliefSurface {
     this.u.uPalette.value = ctx.palette.texture;
     this.u.uMapSize.value.set(this.W, this.H);
     this.u.uHeightScale.value = hf.heightScale;
+    this.edgeReach = edgeReachTiles(this.W, this.H);
+    this.u.uEdgeReach.value = this.edgeReach;
+    this.u.uRelief.value = this.reliefTex;
+    this.u.uReliefGrid.value.set(hf.step, hf.cols, hf.rows);
     this.refreshColors();
     this.refreshOverlaySettings();
     this.overlay = new SurfaceOverlay(
@@ -476,10 +562,17 @@ export class TerrainLayer implements ReliefSurface {
     ) {
       setTextureData(tex, tileState);
       this.uploadAllTiles();
+      // The fallout field re-reads the buffer over the next frames.
+      this.fallout.reset(tileState);
       return;
     }
     // Sent by the next frames' `update` (flushTiles).
     this.tileQueue.markTiles(changedTiles);
+    const t0 = this.recentFalloutMs !== null ? performance.now() : 0;
+    this.fallout.applyChanges(tileState, changedTiles);
+    if (this.recentFalloutMs !== null) {
+      this.falloutMsPending += performance.now() - t0;
+    }
   }
 
   /** Spawn phase on: queued tiles are all sent on the next frame. */
@@ -496,6 +589,8 @@ export class TerrainLayer implements ReliefSurface {
    */
   perfStats(): Record<string, number> {
     const max = (a: Int32Array | null) => (a === null ? 0 : Math.max(...a));
+    const maxF = (a: Float32Array | null) =>
+      a === null ? 0 : Math.round(Math.max(...a) * 1000) / 1000;
     return {
       ...this.overlay.perfStats(),
       ...this.cosmetics.perfStats(),
@@ -509,6 +604,12 @@ export class TerrainLayer implements ReliefSurface {
       uploadCallsTotal: this.callsTotal,
       texelsTotal: this.texelsTotal,
       fullUploads: this.fullUploads,
+      // Lot 3: fallout field (FxLayer's smoke) and the relief texture.
+      falloutTiles: this.fallout.total,
+      falloutDenseCells: this.fallout.denseCells,
+      falloutRebuilding: this.fallout.rebuilding ? 1 : 0,
+      falloutMsMax: maxF(this.recentFalloutMs),
+      reliefTextureMB: this.reliefData.byteLength / (1 << 20),
     };
   }
 
@@ -551,6 +652,18 @@ export class TerrainLayer implements ReliefSurface {
 
   update(frame: FrameInfo): void {
     this.flushTiles();
+    // A running full re-read of the fallout bits: a few rows per frame.
+    if (this.fallout.rebuilding) {
+      const t0 = this.recentFalloutMs !== null ? performance.now() : 0;
+      this.fallout.step();
+      if (this.recentFalloutMs !== null) {
+        this.falloutMsPending += performance.now() - t0;
+      }
+    }
+    if (this.recentFalloutMs !== null) {
+      this.recentFalloutMs[this.recentIndex] = this.falloutMsPending;
+      this.falloutMsPending = 0;
+    }
     // After the tile uploads: the glow mask reads the tile texture.
     this.overlay.update(frame, this.ctx.renderer);
     // Same switch as the default renderer (debug GUI; on by default).
@@ -564,7 +677,8 @@ export class TerrainLayer implements ReliefSurface {
     u.uHighlightOwner.value = frame.highlightOwner;
     u.uLocalPlayer.value = frame.localPlayerID;
     u.uAltView.value = frame.altView ? 1 : 0;
-    u.uBorderPx.value = BORDER_CSS_PX * (frame.dpr > 0 ? frame.dpr : 1);
+    this.zoom = frame.cssPxPerTile;
+    this.dpr = frame.dpr > 0 ? frame.dpr : 1;
     this.refreshOverlaySettings();
     const key = waterColorKey(this.ctx.renderSettings.terrain);
     if (key !== this.waterKey) this.refreshColors();
@@ -580,6 +694,7 @@ export class TerrainLayer implements ReliefSurface {
     this.material.dispose();
     this.tileTex.dispose();
     this.relTex.dispose();
+    this.reliefTex.dispose();
     this.terrainBytes.release();
   }
 
@@ -653,15 +768,25 @@ export class TerrainLayer implements ReliefSurface {
     this.waterKey = waterColorKey(t);
   }
 
-  /** Territory look from `renderSettings.mapOverlay` / affiliation (cheap). */
+  /**
+   * Territory look from `renderSettings.mapOverlay` / affiliation and the
+   * last frame's zoom (cheap, every frame).
+   */
   private refreshOverlaySettings(): void {
     const s = this.ctx.renderSettings;
     const o = s.mapOverlay;
     const a = s.affiliation;
     const u = this.u;
-    // Same opacity as the default renderer: with neutral tone mapping the
-    // fills read as in 2D, and the hillshade still shows through.
-    u.uFillAlpha.value = Math.min(1, Math.max(0, o.territoryAlpha));
+    // Close up: the default renderer's opacity (with neutral tone mapping
+    // the fills read as in 2D, and the hillshade still shows through).
+    // Zoomed out the fill and borders strengthen and owned land is lit
+    // partly flat, so who owns what reads at a glance (lot 3).
+    const look = territoryLook(this.zoom, o.territoryAlpha);
+    u.uFillAlpha.value = look.fillAlpha;
+    u.uBorderPx.value = look.borderCssPx * this.dpr;
+    u.uFarFlatten.value = look.flatten;
+    // The made-up land past the map edge shrinks to a fringe close up.
+    u.uEdgeReach.value = this.edgeReach * apronReachZoomScale(this.zoom);
     u.uFillSaturation.value = o.territorySaturation;
     u.uHighlightFill.value = o.highlightFillBrighten;
     u.uHighlightBorder.value = o.highlightBrighten;
@@ -678,8 +803,12 @@ export class TerrainLayer implements ReliefSurface {
     u.uAffAlly.value.set(a.allyR, a.allyG, a.allyB);
     u.uAffNeutral.value.set(a.neutralR, a.neutralG, a.neutralB);
     u.uAffEnemy.value.set(a.enemyR, a.enemyG, a.enemyB);
-    // The alt view dims the terrain, so its fill can be stronger.
-    u.uAltFillAlpha.value = Math.min(1, Math.max(0.3, 2 * s.altView.fillAlpha));
+    // The alt view dims the terrain, so its fill can be stronger than the
+    // default's (twice `altView.fillAlpha`, more when zoomed out).
+    u.uAltFillAlpha.value = Math.min(
+      1,
+      Math.max(look.altFillAlpha, 2 * s.altView.fillAlpha),
+    );
   }
 
   // ---- Geometry ----
@@ -730,12 +859,64 @@ export class TerrainLayer implements ReliefSurface {
       base += 2 * e.n;
     }
 
+    // Apron (lot 3): per edge, [inner, foot] columns under the skirt
+    // columns: inner on the edge vertex (height set by refreshRelief, at
+    // least COAST_LIFT), foot APRON_SLOPE_TILES further out at COAST_LIFT;
+    // then the slope-foot corners and the rim corners, flat at COAST_LIFT.
+    // Normals point up (the shader lights the apron flat).
+    const A = this.apronWidth;
+    const S = APRON_SLOPE_TILES;
+    let av = this.apronBase;
+    const setApron = (v: number, x: number, y: number, z: number) => {
+      pos[v * 3] = x;
+      pos[v * 3 + 1] = y;
+      pos[v * 3 + 2] = z;
+      this.normals[v * 3] = 0;
+      this.normals[v * 3 + 1] = 1;
+      this.normals[v * 3 + 2] = 0;
+    };
+    for (const sk of this.skirts) {
+      this.apronEdges.push({ grid: sk.grid, base: av, nx: sk.nx, nz: sk.nz });
+      for (let q = 0; q < sk.grid.length; q++) {
+        const g = sk.grid[q] * 3;
+        setApron(av++, pos[g], COAST_LIFT, pos[g + 2]);
+        setApron(av++, pos[g] + sk.nx * S, COAST_LIFT, pos[g + 2] + sk.nz * S);
+      }
+    }
+    const footCorner = av;
+    const rimCorner = av + 4;
+    const corners = [
+      [0, 0],
+      [this.W, 0],
+      [this.W, this.H],
+      [0, this.H],
+    ];
+    for (let k = 0; k < 4; k++) {
+      const dx = corners[k][0] === 0 ? -1 : 1;
+      const dz = corners[k][1] === 0 ? -1 : 1;
+      setApron(
+        footCorner + k,
+        corners[k][0] + dx * S,
+        COAST_LIFT,
+        corners[k][1] + dz * S,
+      );
+      setApron(
+        rimCorner + k,
+        corners[k][0] + dx * A,
+        COAST_LIFT,
+        corners[k][1] + dz * A,
+      );
+    }
+
     // Index: grid cells, counter-clockwise seen from above (+Y), then skirt
-    // quads facing outwards.
+    // quads facing outwards, then the apron (slope quads, corner patches and
+    // the flat ring's 4 trapezoids, all facing up).
     const cells = (cols - 1) * (rows - 1);
     let skirtQuads = 0;
     for (const s of this.skirts) skirtQuads += s.grid.length - 1;
-    const index = new Uint32Array((cells + skirtQuads) * 6);
+    const index = new Uint32Array(
+      (cells + 2 * skirtQuads) * 6 + APRON_EXTRA_TRIANGLES * 3,
+    );
     let o = 0;
     for (let j = 0; j < rows - 1; j++) {
       for (let i = 0; i < cols - 1; i++) {
@@ -779,6 +960,47 @@ export class TerrainLayer implements ReliefSurface {
           index[o++] = bb;
         }
       }
+    }
+    // Apron triangles, wound counter-clockwise seen from above (normal +Y):
+    // checked per triangle with the y of (b - a) × (c - a) in x / z.
+    const tri = (a: number, b: number, c: number) => {
+      const ax = pos[a * 3];
+      const az = pos[a * 3 + 2];
+      const ny =
+        (pos[b * 3 + 2] - az) * (pos[c * 3] - ax) -
+        (pos[b * 3] - ax) * (pos[c * 3 + 2] - az);
+      index[o++] = a;
+      index[o++] = ny > 0 ? b : c;
+      index[o++] = ny > 0 ? c : b;
+    };
+    for (const e of this.apronEdges) {
+      for (let q = 0; q < e.grid.length - 1; q++) {
+        const ia = e.base + 2 * q;
+        tri(ia, ia + 1, ia + 3);
+        tri(ia, ia + 3, ia + 2);
+      }
+    }
+    // Corner patches: the map corner's inner vertex, the two slope feet next
+    // to it and the slope-foot corner. Edges: north, south (along +X), west,
+    // east (along +Z).
+    const [north, south, west, east] = this.apronEdges;
+    const first = (e: SkirtEdge) => e.base;
+    const last = (e: SkirtEdge) => e.base + 2 * (e.grid.length - 1);
+    const patches: [number, number, number][] = [
+      [first(north), first(west), footCorner],
+      [last(north), first(east), footCorner + 1],
+      [last(south), last(east), footCorner + 2],
+      [first(south), last(west), footCorner + 3],
+    ];
+    for (const [a, b, corner] of patches) {
+      tri(a, a + 1, corner);
+      tri(a, corner, b + 1);
+    }
+    // Flat ring: slope-foot rectangle to the rim rectangle.
+    for (let k = 0; k < 4; k++) {
+      const n = (k + 1) % 4;
+      tri(footCorner + k, rimCorner + k, rimCorner + n);
+      tri(footCorner + k, rimCorner + n, footCorner + n);
     }
     this.geometry.setIndex(new THREE.BufferAttribute(index, 1));
   }
@@ -835,13 +1057,34 @@ export class TerrainLayer implements ReliefSurface {
       }
     }
     this.computeNormals(nRange);
-    // Skirt tops follow the edge vertices (a few thousand: just redo all).
+    // Skirt tops follow the edge vertices (a few thousand: just redo all),
+    // and so does the apron's inner row (never below COAST_LIFT).
     for (const s of this.skirts) {
       for (let q = 0; q < s.grid.length; q++) {
         pos[(s.base + 2 * q) * 3 + 1] = pos[s.grid[q] * 3 + 1];
       }
     }
+    for (const e of this.apronEdges) {
+      for (let q = 0; q < e.grid.length; q++) {
+        pos[(e.base + 2 * q) * 3 + 1] = Math.max(
+          COAST_LIFT,
+          pos[e.grid[q] * 3 + 1],
+        );
+      }
+    }
 
+    // Relief texture rows of the recomputed normals (all of it at first).
+    if (r === null) {
+      this.reliefTex.needsUpdate = true;
+    } else {
+      this.reliefUploader.upload(
+        this.ctx.renderer,
+        nRange.i0,
+        nRange.j0,
+        nRange.i1 - nRange.i0 + 1,
+        nRange.j1 - nRange.j0 + 1,
+      );
+    }
     const position = this.geometry.getAttribute("position") as
       | THREE.BufferAttribute
       | undefined;
@@ -856,19 +1099,25 @@ export class TerrainLayer implements ReliefSurface {
           nRange.j0 * cols * 3,
           (nRange.j1 - nRange.j0 + 1) * cols * 3,
         );
-        attr.addUpdateRange(this.gridCount * 3, this.skirtVertexCount * 3);
+        // Skirts and the apron's slope columns right after them.
+        attr.addUpdateRange(this.gridCount * 3, 2 * this.skirtVertexCount * 3);
       }
       attr.needsUpdate = true;
     }
   }
 
-  /** Grid normals from central differences of the displayed heights. */
+  /**
+   * Grid normals from central differences of the displayed heights, and the
+   * relief texture's texels (the same slope, and the height) over `r`.
+   */
   private computeNormals(r: GridRange): void {
     const hf = this.hf;
     const cols = hf.cols;
     const rows = hf.rows;
     const pos = this.positions;
     const nrm = this.normals;
+    const rel = this.reliefData;
+    const half = THREE.DataUtils.toHalfFloat;
     for (let j = r.j0; j <= r.j1; j++) {
       const jm = j > 0 ? j - 1 : j;
       const jp = j < rows - 1 ? j + 1 : j;
@@ -891,6 +1140,10 @@ export class TerrainLayer implements ReliefSurface {
         nrm[k] = -gx * inv;
         nrm[k + 1] = inv;
         nrm[k + 2] = -gz * inv;
+        const t = (j * cols + i) * 4;
+        rel[t] = half(gx);
+        rel[t + 1] = half(gz);
+        rel[t + 2] = half(pos[k + 1]);
       }
     }
   }

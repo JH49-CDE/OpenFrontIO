@@ -17,10 +17,18 @@
  * - Heading = atan2 of the motion, exponentially smoothed per unit.
  * - Boats float at sea level with a gentle bob / roll; trains sit on the
  *   terrain, pitched along the slope; nukes fly an altitude profile (see
- *   `nukeAltitude`) pitched along their 3D velocity and leave a glowing
- *   additive ribbon trail; a nuke whose owner has a nuke-trail cosmetic
- *   effect gets a ribbon in the effect's colours instead (the effect
- *   palette of EffectTrails.ts, same colours as its ground track).
+ *   `nukeAltitude`) pitched along their 3D velocity and leave a ribbon
+ *   trail: a short glowing exhaust at the head and a light contrail behind
+ *   it (lot 3); a nuke whose owner has a nuke-trail cosmetic effect gets a
+ *   ribbon in the effect's colours instead (the effect palette of
+ *   EffectTrails.ts, same colours as its ground track).
+ * - In-flight bombs (lot 3): a bomb flies up to 120 tiles high, much closer
+ *   to the camera than the ground, so its on-screen length is capped at its
+ *   own depth (`nukeScreenCapPx`, `capScreenScale`), and its ribbon is at
+ *   least NUKE_TRAIL_MIN_PX wide (warheads WARHEAD_TRAIL_MIN_PX) so the
+ *   trail reads at every zoom. MIRV
+ *   warheads beyond the first MAX_FULL_WARHEAD_TRAILS get a short trail
+ *   (WARHEAD_SHORT_TRAIL_POINTS samples) to bound the per-frame work.
  * - Every model is scaled up to at least `settings.unitMinScreenPx` CSS px.
  * - Boats and trains get a soft contact shadow (`BlobShadows`), shifted
  *   away from the sun.
@@ -138,6 +146,98 @@ export function minScreenScale(
   const px = cssPxPerTile * sizeTiles;
   if (!(px > 0)) return maxScale;
   return Math.min(maxScale, Math.max(1, minPx / px));
+}
+
+/**
+ * In-flight bombs: largest on-screen length (CSS px) of each nuke model at
+ * up to 2 px per tile, measured at the model's own depth. Above that zoom
+ * the cap grows as √(zoom / 2), up to ×NUKE_CAP_ZOOM_GAIN_MAX.
+ */
+export const NUKE_SCREEN_CAP_PX: Readonly<
+  Partial<Record<UnitMeshKind, number>>
+> = {
+  atomBomb: 24,
+  hydrogenBomb: 30,
+  mirv: 36,
+  mirvWarhead: 12,
+};
+export const NUKE_CAP_ZOOM_GAIN_MAX = 2;
+/** Bomb ribbons are at least this wide on screen (CSS px) at their head... */
+export const NUKE_TRAIL_MIN_PX = 3.5;
+/** ...MIRV warheads' this wide. */
+export const WARHEAD_TRAIL_MIN_PX = 2;
+/**
+ * A bomb's exhaust glow on its ribbon runs this far (CSS px, at the bomb's
+ * depth) behind its tail, whatever the sample spacing.
+ */
+export const NUKE_HEAD_GLOW_PX = 16;
+/** MIRV warheads with a full trail; later ones get a short one. */
+export const MAX_FULL_WARHEAD_TRAILS = 64;
+/** Samples of a short warhead trail (a streak of ~0.15 s). */
+export const WARHEAD_SHORT_TRAIL_POINTS = 4;
+
+/** On-screen length cap (CSS px) of a nuke model at a zoom; ∞ for others. */
+export function nukeScreenCapPx(
+  kind: UnitMeshKind,
+  cssPxPerTile: number,
+): number {
+  const base = NUKE_SCREEN_CAP_PX[kind];
+  if (base === undefined) return Infinity;
+  const gain = Math.sqrt(Math.max(0, cssPxPerTile) / 2);
+  return base * Math.min(NUKE_CAP_ZOOM_GAIN_MAX, Math.max(1, gain));
+}
+
+/**
+ * Zoomed out, the units' emission (bombs' and SAM missiles' exhausts,
+ * shells) and the trails' additive glow are scaled by this, so nothing
+ * crosses the bloom threshold (luminance 1) where a model is a few px: a
+ * bloomed exhaust read as a big glowing ellipse at full map (img00). Full
+ * from UNIT_GLOW_ZOOM[1] CSS px per tile on.
+ */
+export const UNIT_GLOW_FAR = 0.45;
+export const UNIT_GLOW_ZOOM: readonly [number, number] = [1.5, 4];
+export function unitGlowAtZoom(cssPxPerTile: number): number {
+  const t = Math.min(
+    1,
+    Math.max(
+      0,
+      (cssPxPerTile - UNIT_GLOW_ZOOM[0]) /
+        (UNIT_GLOW_ZOOM[1] - UNIT_GLOW_ZOOM[0]),
+    ),
+  );
+  return UNIT_GLOW_FAR + (1 - UNIT_GLOW_FAR) * t * t * (3 - 2 * t);
+}
+
+/**
+ * MIRV warheads converge by the dozen: their contrails' opacity is scaled
+ * by √(WARHEAD_CONTRAIL_REF / live warheads) (at most 1, at least
+ * WARHEAD_CONTRAIL_MIN), so a salvo's fan adds up to lines, not a pale
+ * wedge.
+ */
+export const WARHEAD_CONTRAIL_REF = 6;
+export const WARHEAD_CONTRAIL_MIN = 0.3;
+export function warheadContrailScale(liveWarheads: number): number {
+  if (liveWarheads <= WARHEAD_CONTRAIL_REF) return 1;
+  return Math.max(
+    WARHEAD_CONTRAIL_MIN,
+    Math.sqrt(WARHEAD_CONTRAIL_REF / liveWarheads),
+  );
+}
+
+/**
+ * `scale`, reduced so that a model `lengthTiles` long is at most `capPx`
+ * CSS px on screen where one tile spans `pxPerTile` (its depth).
+ */
+export function capScreenScale(
+  scale: number,
+  lengthTiles: number,
+  pxPerTile: number,
+  capPx: number,
+): number {
+  if (!(pxPerTile > 0) || !(lengthTiles > 0) || !Number.isFinite(capPx)) {
+    return scale;
+  }
+  return Math.min(scale, capPx / (lengthTiles * pxPerTile));
 }
 
 /** Apex height (tiles) of a nuke arc spanning `span` tiles. */
@@ -302,6 +402,17 @@ interface TrailStyle {
   color: readonly [number, number, number];
   /** Fraction of the owner colour mixed into the trail colour. */
   ownerMix: number;
+  /**
+   * Contrail behind the head (nukes): linear colour, opacity and owner mix,
+   * composited "over" the scene; the additive glow then stays at the head.
+   */
+  smoke?: {
+    color: readonly [number, number, number];
+    alpha: number;
+    ownerMix: number;
+  };
+  /** Minimum on-screen width of the ribbon's head (CSS px), nukes. */
+  minPx?: number;
 }
 
 interface KindInfo {
@@ -320,6 +431,24 @@ interface KindInfo {
 }
 
 const WARM_TRAIL = [1.7, 1.0, 0.45] as const;
+/**
+ * Nuke contrail: a light grey (linear) tinted with the owner's colour (the
+ * default renderer's nuke trail on the ground is the owner's colour), so
+ * a bomb's trail also says whose it is; light enough to stand out on
+ * land of the owner's own colour.
+ */
+const CONTRAIL = {
+  color: [0.92, 0.9, 0.86],
+  alpha: 0.85,
+  ownerMix: 0.45,
+} as const;
+/**
+ * MIRV warheads come by the dozen to hundreds and converge: fainter
+ * contrails and a dimmer head, so together they read as lines, not as a
+ * glowing sheet.
+ */
+const WARHEAD_CONTRAIL = { ...CONTRAIL, alpha: 0.7 } as const;
+const WARHEAD_HEAD = [0.95, 0.56, 0.26] as const;
 
 const KIND_INFO: Readonly<Record<UnitMeshKind, KindInfo>> = {
   transport: {
@@ -347,25 +476,53 @@ const KIND_INFO: Readonly<Record<UnitMeshKind, KindInfo>> = {
     motion: "nuke",
     tauMs: 110,
     flight: NukeFlight.Arc,
-    trail: { points: 40, width: 0.9, color: WARM_TRAIL, ownerMix: 0.3 },
+    trail: {
+      points: 40,
+      width: 0.9,
+      color: WARM_TRAIL,
+      ownerMix: 0.3,
+      smoke: CONTRAIL,
+      minPx: NUKE_TRAIL_MIN_PX,
+    },
   },
   hydrogenBomb: {
     motion: "nuke",
     tauMs: 110,
     flight: NukeFlight.Arc,
-    trail: { points: 40, width: 1.3, color: WARM_TRAIL, ownerMix: 0.3 },
+    trail: {
+      points: 40,
+      width: 1.3,
+      color: WARM_TRAIL,
+      ownerMix: 0.3,
+      smoke: CONTRAIL,
+      minPx: NUKE_TRAIL_MIN_PX,
+    },
   },
   mirv: {
     motion: "nuke",
     tauMs: 130,
     flight: NukeFlight.Climb,
-    trail: { points: 40, width: 1.6, color: WARM_TRAIL, ownerMix: 0.3 },
+    trail: {
+      points: 40,
+      width: 1.6,
+      color: WARM_TRAIL,
+      ownerMix: 0.3,
+      smoke: CONTRAIL,
+      minPx: NUKE_TRAIL_MIN_PX,
+    },
   },
   mirvWarhead: {
     motion: "nuke",
     tauMs: 80,
     flight: NukeFlight.Dive,
-    trail: { points: 12, width: 0.45, color: WARM_TRAIL, ownerMix: 0.3 },
+    trail: {
+      points: 12,
+      width: 0.45,
+      color: WARHEAD_HEAD,
+      ownerMix: 0.3,
+      smoke: WARHEAD_CONTRAIL,
+      minPx: WARHEAD_TRAIL_MIN_PX,
+    },
   },
   shell: { motion: "shell", tauMs: 0 },
   samMissile: {
@@ -500,6 +657,8 @@ const TRAIL_SAMPLE_MS = 40;
 const TRAIL_FADE_MS = 700;
 /** Floats per trail sample: x, y, z, side.x, side.z. */
 const TRAIL_STRIDE = 5;
+/** Contrail trails: the additive exhaust glow falls off as fade^this. */
+const SMOKE_GLOW_EXPONENT = 5;
 /** Opacity of a nuke ribbon in its owner's effect colours, at its head. */
 export const RIBBON_EFFECT_OPACITY = 0.85;
 /** Extra emission of an effect-coloured ribbon (bloom), × its colour. */
@@ -507,11 +666,13 @@ export const RIBBON_EFFECT_GLOW = 0.5;
 
 /**
  * What a ribbon fragment writes before tone mapping and fog (TS mirror of
- * RIBBON_FRAG): the default trail colour added (`alpha` 0: additive), or,
- * for a nuke whose owner (`effectOwner`, 0 for other missiles) has a
- * nuke-trail effect, the effect's colour at world (x, z) and time `t` (s),
- * linear, composited over the scene at `RIBBON_EFFECT_OPACITY ×
- * intensity`. Both are premultiplied (rgb already × alpha for the effect).
+ * RIBBON_FRAG): the default trail colour added (`alpha` 0: additive) plus,
+ * for a nuke's contrail (`smoke`, lot 3), its colour composited over the
+ * scene at its opacity; or, for a nuke whose owner (`effectOwner`, 0 for
+ * other missiles) has a nuke-trail effect, the effect's colour at world
+ * (x, z) and time `t` (s), linear, composited over the scene at
+ * `RIBBON_EFFECT_OPACITY × intensity`, instead of both. All premultiplied
+ * (rgb already × alpha for what is composited over).
  */
 export function ribbonFragment(
   base: Rgb,
@@ -522,12 +683,20 @@ export function ribbonFragment(
   x: number,
   z: number,
   t: number,
+  smoke: { rgb: Rgb; alpha: number } | null = null,
 ): { rgb: Rgb; alpha: number } {
   const e =
     effectsOn && effectOwner > 0 && effect !== null
       ? effectColorAt(effect, effectOwner, NUKE_TRAIL_BLOCK, x, z, t)
       : null;
-  if (e === null) return { rgb: [base[0], base[1], base[2]], alpha: 0 };
+  if (e === null) {
+    const a = smoke === null ? 0 : Math.min(1, Math.max(0, smoke.alpha));
+    const s = smoke?.rgb ?? [0, 0, 0];
+    return {
+      rgb: [base[0] + s[0] * a, base[1] + s[1] * a, base[2] + s[2] * a],
+      alpha: a,
+    };
+  }
   const a = Math.min(1, Math.max(0, intensity)) * RIBBON_EFFECT_OPACITY;
   const k = (1 + RIBBON_EFFECT_GLOW) * a;
   const lin = srgbToLinearRgb(e);
@@ -535,14 +704,17 @@ export function ribbonFragment(
 }
 
 const RIBBON_VERT = /* glsl */ `
-attribute vec3 aColor;  // default trail colour x intensity (linear)
+attribute vec3 aColor;  // additive glow: default trail colour x intensity (linear)
+attribute vec4 aSmoke;  // contrail colour (linear) and opacity, composited over
 attribute vec2 aEffect; // (effect owner smallID, 0 = none; intensity)
 varying vec3 vColor;
+varying vec4 vSmoke;
 varying vec2 vEffect;
 varying vec3 vWorld;
 #include <fog_pars_vertex>
 void main() {
   vColor = aColor;
+  vSmoke = aSmoke;
   vEffect = aEffect;
   vec4 world = modelMatrix * vec4(position, 1.0);
   vWorld = world.xyz;
@@ -556,6 +728,7 @@ const RIBBON_FRAG = /* glsl */ `
 ${FRAG_OUTPUT}
 ${EFFECT_COLOR_GLSL}
 varying vec3 vColor;
+varying vec4 vSmoke;
 varying vec2 vEffect;
 varying vec3 vWorld;
 #include <fog_pars_fragment>
@@ -567,22 +740,48 @@ vec3 srgbToLinear(vec3 c) {
 }
 
 void main() {
-  // Default: added (alpha 0 with ONE / ONE_MINUS_SRC_ALPHA blending), as the
-  // former additive MeshBasicMaterial. A nuke-trail effect: its colour
-  // (block 1, same bands as the ground track below), composited over.
-  vec3 rgb = vColor;
-  float a = 0.0;
+  // Default: the glow added (alpha 0 with ONE / ONE_MINUS_SRC_ALPHA
+  // blending), as the former additive MeshBasicMaterial, plus a nuke's
+  // contrail composited over (premultiplied). A nuke-trail effect: its
+  // colour (block 1, same bands as the ground track below), composited
+  // over, instead of both.
+  vec3 glow = vColor;
+  vec3 over = vSmoke.rgb;
+  float a = clamp(vSmoke.a, 0.0, 1.0);
   int owner = int(vEffect.x + 0.5);
   vec3 e;
   if (owner > 0 && effectColor(owner, EFFECT_BLOCK_ROWS, vWorld.xz, e)) {
+    glow = vec3(0.0);
     a = clamp(vEffect.y, 0.0, 1.0) * ${RIBBON_EFFECT_OPACITY.toFixed(3)};
-    rgb = srgbToLinear(e) * ${(1 + RIBBON_EFFECT_GLOW).toFixed(3)};
+    over = srgbToLinear(e) * ${(1 + RIBBON_EFFECT_GLOW).toFixed(3)};
   }
-  gl_FragColor = vec4(rgb, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
-  #include <fog_fragment>
-  gl_FragColor = a > 0.0 ? vec4(gl_FragColor.rgb * a, a) : vec4(gl_FragColor.rgb, 0.0);
+  vec3 overOut = vec3(0.0);
+  if (a > 0.0) {
+    gl_FragColor = vec4(over, 1.0);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+    {
+    #include <fog_fragment>
+    }
+    overOut = gl_FragColor.rgb * a;
+  }
+  vec3 glowOut = vec3(0.0);
+  if (glow.r + glow.g + glow.b > 0.0) {
+    gl_FragColor = vec4(glow, 1.0);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+    glowOut = gl_FragColor.rgb;
+    // Added light fades out in the fog (mixing it towards the fog colour
+    // would add haze over the whole ribbon).
+    #ifdef USE_FOG
+      #ifdef FOG_EXP2
+        glowOut *= exp(-fogDensity * fogDensity * vFogDepth * vFogDepth);
+      #else
+        glowOut *= 1.0 - smoothstep(fogNear, fogFar, vFogDepth);
+      #endif
+    #endif
+  }
+  gl_FragColor = vec4(glowOut + overOut, a);
 }
 `;
 
@@ -601,18 +800,49 @@ interface Trail {
   liveZ: number;
   liveSX: number;
   liveSZ: number;
+  /**
+   * Samples are points of the missile's path (its centre without the
+   * model's lift); drawn raised by `lift` (the current model's), skipping
+   * the `skip` newest ones that lie ahead of the live tail (lot 3: a
+   * model whose on-screen cap changes no longer kinks its trail).
+   */
+  lift: number;
+  skip: number;
+  /**
+   * Length (tiles) of a nuke's head glow behind its tail: a fixed length
+   * on screen (NUKE_HEAD_GLOW_PX); 0 = over the first samples (SAMs).
+   * `split` = 1 adds a vertex at that distance on a longer first segment
+   * (its fraction `splitAt`), so the glow does not stretch over it.
+   */
+  glowLen: number;
+  split: number;
+  splitAt: number;
   /** Half width at the head, tiles. */
   halfWidth: number;
   color: THREE.Color;
+  /** Contrail colour (linear) and opacity at the head; null = none. */
+  smoke: THREE.Color | null;
+  smokeAlpha: number;
+  /** A MIRV warhead's trail (counted against MAX_FULL_WARHEAD_TRAILS). */
+  warhead: boolean;
   /** Owner whose nuke-trail effect colours the ribbon (0 = none). */
   effectOwner: number;
   diedMs: number;
+}
+
+/** Vertices of a trail's ribbon: live tail (+ split vertex) + samples. */
+function drawnVertices(t: Trail): number {
+  return t.count - t.skip + (t.live ? 1 + t.split : 0);
 }
 
 /**
  * All nuke / SAM trails as one ribbon mesh, rebuilt every frame. Each trail
  * is a strip of quads from the missile's tail back through its samples,
  * tapering and fading to black (= invisible under additive blending).
+ * A nuke's trail also carries a light contrail composited over the scene
+ * (premultiplied alpha), building up just behind the exhaust and thinning
+ * out with age, while its glow stays at the head (lot 3: a readable trail
+ * rather than a long glowing streak that bloom widens).
  * Ribbons lie flat (their width is horizontal) so they read from above.
  * A nuke's ribbon takes its owner's nuke-trail effect colours when they have
  * one (outside the alt view), composited over the scene and fading the same
@@ -626,17 +856,26 @@ class TrailRenderer {
   private positions = new Float32Array(0);
   private colors = new Float32Array(0);
   private effect = new Float32Array(0);
+  private smoke = new Float32Array(0);
   private index = new Uint32Array(0);
   private posAttr = new THREE.BufferAttribute(this.positions, 3);
   private colAttr = new THREE.BufferAttribute(this.colors, 3);
+  private smokeAttr = new THREE.BufferAttribute(this.smoke, 4);
   private effAttr = new THREE.BufferAttribute(this.effect, 2);
   private idxAttr = new THREE.BufferAttribute(this.index, 1);
   private vertCap = 0;
   private indexCap = 0;
   private readonly live = new Set<Trail>();
   private dying: Trail[] = [];
+  /** Live then dying trails of the current update (reused). */
+  private readonly all: Trail[] = [];
   /** Live / dying nuke ribbons drawn in effect colours (last update). */
   effectRibbons = 0;
+  /** Live MIRV warhead trails (full or short). */
+  liveWarheads = 0;
+  /** Ribbons and samples drawn on the last update (perf counters). */
+  ribbons = 0;
+  samples = 0;
 
   constructor(
     parent: THREE.Object3D,
@@ -672,8 +911,17 @@ class TrailRenderer {
     this.ensure(1024, 3072);
   }
 
-  /** A trail; `effectOwner` > 0 colours it by that owner's nuke effect. */
-  create(style: TrailStyle, owner: THREE.Color, effectOwner = 0): Trail {
+  /**
+   * A trail; `effectOwner` > 0 colours it by that owner's nuke effect;
+   * `points` overrides the style's sample count (short warhead trails).
+   */
+  create(
+    style: TrailStyle,
+    owner: THREE.Color,
+    effectOwner = 0,
+    warhead = false,
+    points = style.points,
+  ): Trail {
     // style colour × mix(1, owner, ownerMix): a warm glow with a hint of
     // the owner's colour.
     const k = style.ownerMix;
@@ -682,9 +930,21 @@ class TrailRenderer {
       style.color[1] * (1 - k + owner.g * k),
       style.color[2] * (1 - k + owner.b * k),
     );
+    let smoke: THREE.Color | null = null;
+    if (style.smoke !== undefined) {
+      const m = style.smoke.ownerMix;
+      const c = style.smoke.color;
+      smoke = new THREE.Color(
+        c[0] * (1 - m) + owner.r * m,
+        c[1] * (1 - m) + owner.g * m,
+        c[2] * (1 - m) + owner.b * m,
+      );
+    }
+    const max = Math.max(2, Math.floor(points));
+    if (warhead) this.liveWarheads++;
     const trail: Trail = {
-      pts: new Float32Array(style.points * TRAIL_STRIDE),
-      max: style.points,
+      pts: new Float32Array(max * TRAIL_STRIDE),
+      max,
       count: 0,
       head: -1,
       lastSampleMs: -Infinity,
@@ -694,8 +954,16 @@ class TrailRenderer {
       liveZ: 0,
       liveSX: 0,
       liveSZ: 1,
+      lift: 0,
+      skip: 0,
+      glowLen: 0,
+      split: 0,
+      splitAt: 0,
       halfWidth: style.width / 2,
       color,
+      smoke,
+      smokeAlpha: style.smoke?.alpha ?? 0,
+      warhead,
       effectOwner,
       diedMs: 0,
     };
@@ -706,14 +974,20 @@ class TrailRenderer {
   /** The missile is gone: keep the trail fading out for a moment. */
   retire(trail: Trail, nowMs: number): void {
     if (!this.live.delete(trail)) return;
+    if (trail.warhead) this.liveWarheads--;
     trail.live = false;
+    trail.split = 0;
     trail.diedMs = nowMs;
     this.dying.push(trail);
   }
 
   /**
-   * Moves the live head to (x, y, z) (world) and stores a sample every
-   * TRAIL_SAMPLE_MS. `heading` (tile-space radians) orients the ribbon width.
+   * Moves the missile to path point (x, y, z) (world: its centre without
+   * the model's `lift`), its tail `back` tiles behind along the unit
+   * forward vector (fx, fy, fz) and `lift` above, and stores a path sample
+   * every TRAIL_SAMPLE_MS. `heading` (tile-space radians) orients the
+   * ribbon width. The ribbon runs from the live tail back through the
+   * samples farther than `back` from the missile's centre.
    */
   track(
     trail: Trail,
@@ -721,29 +995,72 @@ class TrailRenderer {
     x: number,
     y: number,
     z: number,
+    fx: number,
+    fy: number,
+    fz: number,
+    back: number,
+    lift: number,
     heading: number,
     halfWidth: number,
+    glowLen = 0,
   ): void {
-    trail.liveX = x;
-    trail.liveY = y;
-    trail.liveZ = z;
+    const tx = x - fx * back;
+    const ty = y - fy * back;
+    const tz = z - fz * back;
+    trail.liveX = tx;
+    trail.liveY = ty + lift;
+    trail.liveZ = tz;
+    trail.lift = lift;
     // Horizontal perpendicular of the heading (cos h, 0, sin h).
     trail.liveSX = -Math.sin(heading);
     trail.liveSZ = Math.cos(heading);
     trail.halfWidth = halfWidth;
-    if (nowMs - trail.lastSampleMs < TRAIL_SAMPLE_MS) return;
-    trail.lastSampleMs = nowMs;
-    trail.head = (trail.head + 1) % trail.max;
-    trail.count = Math.min(trail.max, trail.count + 1);
-    const o = trail.head * TRAIL_STRIDE;
-    trail.pts[o] = x;
-    trail.pts[o + 1] = y;
-    trail.pts[o + 2] = z;
-    trail.pts[o + 3] = trail.liveSX;
-    trail.pts[o + 4] = trail.liveSZ;
+    if (nowMs - trail.lastSampleMs >= TRAIL_SAMPLE_MS) {
+      trail.lastSampleMs = nowMs;
+      trail.head = (trail.head + 1) % trail.max;
+      trail.count = Math.min(trail.max, trail.count + 1);
+      const o = trail.head * TRAIL_STRIDE;
+      trail.pts[o] = x;
+      trail.pts[o + 1] = y;
+      trail.pts[o + 2] = z;
+      trail.pts[o + 3] = trail.liveSX;
+      trail.pts[o + 4] = trail.liveSZ;
+    }
+    // The newest samples still within the model (closer to its centre than
+    // its tail) are not drawn.
+    let skip = 0;
+    const b2 = back * back;
+    while (skip < trail.count) {
+      const o = ((trail.head - skip + trail.max) % trail.max) * TRAIL_STRIDE;
+      const dx = trail.pts[o] - x;
+      const dy = trail.pts[o + 1] - y;
+      const dz = trail.pts[o + 2] - z;
+      if (dx * dx + dy * dy + dz * dz >= b2) break;
+      skip++;
+    }
+    trail.skip = skip;
+    trail.glowLen = glowLen;
+    trail.split = 0;
+    if (glowLen > 0 && skip < trail.count) {
+      const o = ((trail.head - skip + trail.max) % trail.max) * TRAIL_STRIDE;
+      const seg = Math.hypot(
+        trail.pts[o] - tx,
+        trail.pts[o + 1] - ty,
+        trail.pts[o + 2] - tz,
+      );
+      if (seg > 1.05 * glowLen) {
+        trail.split = 1;
+        trail.splitAt = glowLen / seg;
+      }
+    }
   }
 
-  update(nowMs: number, altView: boolean): void {
+  /**
+   * Rebuilds the ribbons. `glowScale` scales the additive glow
+   * (`unitGlowAtZoom`); warhead contrails are thinned out by their number
+   * (`warheadContrailScale`).
+   */
+  update(nowMs: number, altView: boolean, glowScale = 1): void {
     // Effects stay off in the alt view (strategic overlay), as the ground
     // trails and the default renderer's spiral ribbons.
     const palette = this.effects.effects;
@@ -751,36 +1068,50 @@ class TrailRenderer {
     this.effectsOn.value = effectsOn ? 1 : 0;
     const effectData = effectsOn ? palette.data : null;
     let effectRibbons = 0;
-    this.dying = this.dying.filter((t) => nowMs - t.diedMs < TRAIL_FADE_MS);
+    // Drop the trails done fading (in place: no allocation per frame).
+    let kept = 0;
+    for (const t of this.dying) {
+      if (nowMs - t.diedMs < TRAIL_FADE_MS) this.dying[kept++] = t;
+    }
+    this.dying.length = kept;
     let verts = 0;
     let indices = 0;
-    const all: Trail[] = [];
+    const all = this.all;
+    all.length = 0;
     for (const t of this.live) all.push(t);
     for (const t of this.dying) all.push(t);
     for (const t of all) {
-      const n = t.count + (t.live ? 1 : 0);
+      const n = drawnVertices(t);
       if (n < 2) continue;
       verts += 2 * n;
       indices += 6 * (n - 1);
     }
+    const warheadSmoke = warheadContrailScale(this.liveWarheads);
     if (indices === 0) {
       this.mesh.visible = false;
       this.effectRibbons = 0;
+      this.ribbons = 0;
+      this.samples = 0;
       return;
     }
     this.ensure(verts, indices);
     const pos = this.positions;
     const col = this.colors;
+    const smk = this.smoke;
     const eff = this.effect;
+    let ribbons = 0;
     const idx = this.index;
     let v = 0;
     let ii = 0;
     for (const t of all) {
-      const n = t.count + (t.live ? 1 : 0);
+      const n = drawnVertices(t);
       if (n < 2) continue;
       const life = t.live ? 1 : 1 - (nowMs - t.diedMs) / TRAIL_FADE_MS;
+      const smokeAlpha = t.smokeAlpha * (t.warhead ? warheadSmoke : 1);
       const base = v;
       const owner = t.effectOwner;
+      const smoke = t.smoke;
+      ribbons++;
       if (
         effectData !== null &&
         owner > 0 &&
@@ -788,29 +1119,70 @@ class TrailRenderer {
       ) {
         effectRibbons++;
       }
-      for (let k = 0; k < n; k++) {
+      // Samples drawn, and the index span the taper / fade run over (the
+      // live tail counts as index 0, as before).
+      const drawn = t.count - t.skip;
+      const span = Math.max(1, t.live ? drawn : drawn - 1);
+      const split = t.live ? t.split : 0;
+      // Head glow by distance along the ribbon (tiles), when set.
+      let dist = 0;
+      let px = 0;
+      let py = 0;
+      let pz = 0;
+      for (let j = 0; j < n; j++) {
         let x: number, y: number, z: number, sx: number, sz: number;
-        if (t.live && k === 0) {
+        /** Index along the ribbon (fractional for the split vertex). */
+        let kf: number;
+        if (t.live && j === 0) {
           x = t.liveX;
           y = t.liveY;
           z = t.liveZ;
           sx = t.liveSX;
           sz = t.liveSZ;
+          kf = 0;
+        } else if (split === 1 && j === 1) {
+          // Where the head glow ends on a long first segment.
+          const o = ((t.head - t.skip + t.max) % t.max) * TRAIL_STRIDE;
+          const f = t.splitAt;
+          x = t.liveX + (t.pts[o] - t.liveX) * f;
+          y = t.liveY + (t.pts[o + 1] + t.lift - t.liveY) * f;
+          z = t.liveZ + (t.pts[o + 2] - t.liveZ) * f;
+          sx = t.liveSX + (t.pts[o + 3] - t.liveSX) * f;
+          sz = t.liveSZ + (t.pts[o + 4] - t.liveSZ) * f;
+          kf = f;
         } else {
-          const age = t.live ? k - 1 : k;
+          const i = j - (t.live ? 1 + split : 0);
+          const age = i + t.skip;
           const o = ((t.head - age + t.max) % t.max) * TRAIL_STRIDE;
           x = t.pts[o];
-          y = t.pts[o + 1];
+          y = t.pts[o + 1] + t.lift;
           z = t.pts[o + 2];
           sx = t.pts[o + 3];
           sz = t.pts[o + 4];
+          kf = t.live ? i + 1 : i;
         }
-        const fade = 1 - k / (n - 1);
+        if (j > 0) dist += Math.hypot(x - px, y - py, z - pz);
+        px = x;
+        py = y;
+        pz = z;
+        const fade = Math.max(0, 1 - kf / span);
         const hw = t.halfWidth * (0.25 + 0.75 * fade);
         const intensity = fade * Math.sqrt(fade) * life;
-        const r = t.color.r * intensity;
-        const g = t.color.g * intensity;
-        const b = t.color.b * intensity;
+        // With a contrail the exhaust glow stays at the head: over
+        // `glowLen` tiles (a fixed length on screen), else over the first
+        // samples.
+        let glow = intensity;
+        if (smoke !== null) {
+          if (t.glowLen > 0) {
+            const g = Math.max(0, 1 - dist / t.glowLen);
+            glow = g * g * life;
+          } else {
+            glow = Math.pow(fade, SMOKE_GLOW_EXPONENT) * life;
+          }
+        }
+        const r = t.color.r * glow * glowScale;
+        const g = t.color.g * glow * glowScale;
+        const b = t.color.b * glow * glowScale;
         const p = v * 3;
         pos[p] = x - sx * hw;
         pos[p + 1] = y;
@@ -824,6 +1196,22 @@ class TrailRenderer {
         const q = v * 2;
         eff[q] = eff[q + 2] = owner;
         eff[q + 1] = eff[q + 3] = intensity;
+        const o4 = v * 4;
+        if (smoke !== null) {
+          // Builds up behind the exhaust (over the head glow's length, or
+          // the first samples), then thins.
+          const build =
+            t.glowLen > 0
+              ? Math.min(1, dist / t.glowLen)
+              : Math.min(1, kf / 1.5);
+          const a = smokeAlpha * Math.pow(fade, 0.7) * build * life;
+          smk[o4] = smk[o4 + 4] = smoke.r;
+          smk[o4 + 1] = smk[o4 + 5] = smoke.g;
+          smk[o4 + 2] = smk[o4 + 6] = smoke.b;
+          smk[o4 + 3] = smk[o4 + 7] = a;
+        } else {
+          for (let c = 0; c < 8; c++) smk[o4 + c] = 0;
+        }
         v += 2;
       }
       for (let k = 0; k < n - 1; k++) {
@@ -838,11 +1226,14 @@ class TrailRenderer {
     }
     publishRange(this.posAttr, v * 3);
     publishRange(this.colAttr, v * 3);
+    publishRange(this.smokeAttr, v * 4);
     publishRange(this.effAttr, v * 2);
     publishRange(this.idxAttr, ii);
     this.mesh.geometry.setDrawRange(0, ii);
     this.mesh.visible = true;
     this.effectRibbons = effectRibbons;
+    this.ribbons = ribbons;
+    this.samples = v / 2;
   }
 
   dispose(): void {
@@ -851,6 +1242,8 @@ class TrailRenderer {
     this.material.dispose();
     this.live.clear();
     this.dying = [];
+    this.all.length = 0;
+    this.liveWarheads = 0;
   }
 
   /** Grows the buffers (doubling) by swapping in a fresh geometry. */
@@ -861,17 +1254,26 @@ class TrailRenderer {
     this.positions = new Float32Array(this.vertCap * 3);
     this.colors = new Float32Array(this.vertCap * 3);
     this.effect = new Float32Array(this.vertCap * 2);
+    this.smoke = new Float32Array(this.vertCap * 4);
     this.index = new Uint32Array(this.indexCap);
     const g = new THREE.BufferGeometry();
     this.posAttr = new THREE.BufferAttribute(this.positions, 3);
     this.colAttr = new THREE.BufferAttribute(this.colors, 3);
+    this.smokeAttr = new THREE.BufferAttribute(this.smoke, 4);
     this.effAttr = new THREE.BufferAttribute(this.effect, 2);
     this.idxAttr = new THREE.BufferAttribute(this.index, 1);
-    for (const a of [this.posAttr, this.colAttr, this.effAttr, this.idxAttr]) {
+    for (const a of [
+      this.posAttr,
+      this.colAttr,
+      this.smokeAttr,
+      this.effAttr,
+      this.idxAttr,
+    ]) {
       a.setUsage(THREE.DynamicDrawUsage);
     }
     g.setAttribute("position", this.posAttr);
     g.setAttribute("aColor", this.colAttr);
+    g.setAttribute("aSmoke", this.smokeAttr);
     g.setAttribute("aEffect", this.effAttr);
     g.setIndex(this.idxAttr);
     const old = this.mesh.geometry;
@@ -919,6 +1321,8 @@ export class UnitLayer {
   private culledUnits = 0;
   private unitTriangles = 0;
   private unitJsMs = 0;
+  private nukes = 0;
+  private nukesCapped = 0;
 
   // Scratch objects (no per-frame allocation).
   private readonly frustum = new THREE.Frustum();
@@ -1049,7 +1453,9 @@ export class UnitLayer {
     const zoom = frame.cssPxPerTile;
     const minPx = this.ctx.settings.unitMinScreenPx;
     const hf = this.ctx.heightField;
-    this.glow.value = 1 + 0.1 * Math.sin(t * 23) + 0.07 * Math.sin(t * 37);
+    const glowScale = unitGlowAtZoom(zoom);
+    this.glow.value =
+      (1 + 0.1 * Math.sin(t * 23) + 0.07 * Math.sin(t * 37)) * glowScale;
     const barFade = smoothstep(BAR_FADE_ZOOM[0], BAR_FADE_ZOOM[1], zoom);
     const pulse = 1 + 0.15 * Math.sin(t * 4);
 
@@ -1070,6 +1476,8 @@ export class UnitLayer {
     let drawn = 0;
     let lods = 0;
     let culled = 0;
+    let nukes = 0;
+    let nukesCapped = 0;
 
     for (const b of this.batches.values()) b.begin();
     this.rings.begin();
@@ -1101,12 +1509,16 @@ export class UnitLayer {
       );
 
       const len = UNIT_MESH_LENGTH[tr.kind];
-      const scale = minScreenScale(minPx, zoom, len);
+      let scale = minScreenScale(minPx, zoom, len);
+      /** CSS px per tile at the unit (nukes only: its own depth). */
+      let pxPerTileHere = 0;
       let wy = 0;
       let pitch = 0;
       let roll = 0;
       let yaw = -tr.heading;
       let stretch = 1;
+      /** Height of the model above its path (nukes), tiles. */
+      let lift = 0;
 
       switch (info.motion) {
         case "boat": {
@@ -1141,7 +1553,21 @@ export class UnitLayer {
           } else {
             alt = nukeAltitude(NukeFlight.Climb, dO, 0, 0);
           }
-          wy = hf.surfaceAt(x, y) + alt.altitude + 0.6 * scale;
+          const air = hf.surfaceAt(x, y) + alt.altitude;
+          // Cap the on-screen length at the bomb's own depth: high up it is
+          // much closer to the camera than the ground the zoom refers to.
+          const depth = x * fwd.x + air * fwd.y + y * fwd.z - camDepth;
+          pxPerTileHere = depth > 1e-3 ? focalPx / depth : Infinity;
+          scale = capScreenScale(
+            scale,
+            len,
+            pxPerTileHere,
+            nukeScreenCapPx(tr.kind, zoom),
+          );
+          nukes++;
+          if (scale < minScreenScale(minPx, zoom, len)) nukesCapped++;
+          lift = 0.6 * scale;
+          wy = air + lift;
           pitch = Math.atan(alt.slope);
           break;
         }
@@ -1175,23 +1601,48 @@ export class UnitLayer {
       tr.worldY = wy;
 
       if (info.trail !== undefined) {
-        // Nukes (TrailManager's nuke trails) take their owner's effect.
-        tr.trail ??= this.trails.create(
-          info.trail,
-          tr.color,
-          info.motion === "nuke" ? tr.owner : 0,
-        );
+        if (tr.trail === null) {
+          // Nukes (TrailManager's nuke trails) take their owner's effect.
+          // MIRV warheads past the first MAX_FULL_WARHEAD_TRAILS still get
+          // a trail, a short one.
+          const warhead = tr.kind === "mirvWarhead";
+          const short =
+            warhead && this.trails.liveWarheads >= MAX_FULL_WARHEAD_TRAILS;
+          tr.trail = this.trails.create(
+            info.trail,
+            tr.color,
+            info.motion === "nuke" ? tr.owner : 0,
+            warhead,
+            short ? WARHEAD_SHORT_TRAIL_POINTS : info.trail.points,
+          );
+        }
         // Trail starts at the missile's tail: centre − forward·(len/2).
         const cp = Math.cos(pitch);
         const back = (len / 2) * scale * 0.9;
+        let halfWidth = info.trail.width * 0.5 * scale;
+        if (info.motion === "nuke" && pxPerTileHere > 0) {
+          // Readable at every zoom: at least `minPx` wide.
+          halfWidth = Math.max(
+            halfWidth,
+            (0.5 * (info.trail.minPx ?? 0)) / pxPerTileHere,
+          );
+        }
         this.trails.track(
           tr.trail,
           now,
-          x - Math.cos(tr.heading) * cp * back,
-          wy - Math.sin(pitch) * back,
-          y - Math.sin(tr.heading) * cp * back,
+          x,
+          wy - lift,
+          y,
+          Math.cos(tr.heading) * cp,
+          Math.sin(pitch),
+          Math.sin(tr.heading) * cp,
+          back,
+          lift,
           tr.heading,
-          info.trail.width * 0.5 * scale,
+          halfWidth,
+          info.motion === "nuke" && pxPerTileHere > 0
+            ? NUKE_HEAD_GLOW_PX / pxPerTileHere
+            : 0,
         );
       }
 
@@ -1262,11 +1713,13 @@ export class UnitLayer {
     this.rings.end();
     this.shadows.end();
     this.bars.end();
-    this.trails.update(now, frame.altView);
+    this.trails.update(now, frame.altView, glowScale);
     this.drawnUnits = drawn;
     this.lodUnits = lods;
     this.culledUnits = culled;
     this.unitTriangles = tris;
+    this.nukes = nukes;
+    this.nukesCapped = nukesCapped;
     this.unitJsMs = performance.now() - t0;
     this.rails.update(frame);
   }
@@ -1295,6 +1748,11 @@ export class UnitLayer {
       unitTriangles: this.unitTriangles,
       unitJsMs: this.unitJsMs,
       nukeEffectRibbons: this.trails.effectRibbons,
+      nukesInFlight: this.nukes,
+      nukesScreenCapped: this.nukesCapped,
+      trailRibbons: this.trails.ribbons,
+      trailSamples: this.trails.samples,
+      warheadTrails: this.trails.liveWarheads,
     };
   }
 

@@ -25,6 +25,28 @@
  * and structures marked for deletion (red, blinking). Every model stands on
  * a soft contact shadow.
  *
+ * Bases (lot 3): every model stands on a pad (`structurePad`, by type and
+ * level) that is
+ * - on land: `fitPadOnLand` shifts the model up to PAD_MAX_SHIFT tiles off
+ *   its tile towards the land around it, or shrinks it (down to 42%), until
+ *   the pad covers land tiles only (a port's pier still reaches out over
+ *   the water, its quay is the pad);
+ * - on the relief: `groundGrid` samples the drawn surface under the pad on
+ *   a 3×3 grid reduced to its least-squares plane, tilted at most
+ *   PAD_TOP_MAX_SLOPE (`planarGrid`); the `conform` part material lays every
+ *   pad vertex on it (`iGround0..2`: a flat slab, no crease) and moves each
+ *   building rigidly onto it where it stands, the whole model sunk by the
+ *   plane's float over the surface (at PAD_FLOAT_QUANTILE of the pad's
+ *   samples) plus PAD_SINK, so on a slope no tall foundation skirt shows.
+ *   The contact shadow lies on the pad's least-squares plane
+ *   (`fitGroundPlane`).
+ * - within a JS budget: past PAD_PLACE_BUDGET_MS per `updateStructures`,
+ *   new structures stand provisionally on their tile and are fitted from a
+ *   queue, within the same budget per frame (all of them after a terrain
+ *   change).
+ * Icons stay on their tile at the lot-2 anchor (the highest point under the
+ * footprint); level badges and bars glide from there to the model's top.
+ *
  * Status (parity with BarPass / StructureLevelPass):
  * - a progress bar (`StatusBars`): deletion countdown, construction
  *   progress or missile readiness (silo / SAM), from `structureProgress`,
@@ -90,6 +112,8 @@ import {
   setOwnerColor,
   shadowOffset,
   STRUCTURE_FOOTPRINT,
+  structurePad,
+  type StructurePad,
   structureVariant,
   triangleCount,
 } from "./ProceduralMeshes";
@@ -277,6 +301,423 @@ export function structureProgress(
   return null;
 }
 
+/** Pad samples lie this far inside its edge (tiles), at most this far apart. */
+const PAD_INSET = 0.05;
+const PAD_SAMPLE_STEP = 0.8;
+/** Scales tried, largest first, to fit a pad on land. */
+export const PAD_FIT_SCALES: readonly number[] = [
+  1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.42,
+];
+/**
+ * Shifts (tiles) tried towards the land around a structure, so a model
+ * sits at most PAD_MAX_SHIFT off its tile: it stays on the tile the player
+ * clicked (and centred in its SAM / defense range rings); past that the
+ * pad shrinks instead.
+ */
+const PAD_SHIFTS: readonly number[] = [0.5, 1];
+export const PAD_MAX_SHIFT = 1;
+/** Directions tried around the land direction (radians). */
+const PAD_SHIFT_ANGLES: readonly number[] = [0, 0.5, -0.5, 1, -1];
+/**
+ * JS budget (ms) of the land fits per call: `updateStructures` places new
+ * structures fully within it and provisionally (on their tile) past it;
+ * the provisional ones, and every structure after a terrain change, are
+ * fitted from a queue within the same budget per frame.
+ */
+export const PAD_PLACE_BUDGET_MS = 1.5;
+/** Steepest plane a contact shadow is tilted to (rise per tile). */
+export const PAD_MAX_SLOPE = 0.45;
+/**
+ * A model is lowered until its pad floats over the drawn surface (the 3×3
+ * grid's bilinear surface vs the relief) at no more than 1 −
+ * PAD_FLOAT_QUANTILE of its samples, by at most this...
+ */
+export const PAD_MAX_SINK = 0.5;
+export const PAD_FLOAT_QUANTILE = 0.85;
+/** ...plus this (tiles): the pad's side shows as a thin curb. */
+export const PAD_SINK = 0.12;
+/**
+ * Steepest pad top (rise per tile): the 3×3 ground grid a pad is draped on
+ * is reduced to its least-squares plane, tilted at most this much
+ * (`planarGrid`), so a pad is a flat slab following the slope (no crease
+ * across it); its sides reach into the ground.
+ */
+export const PAD_TOP_MAX_SLOPE = 0.45;
+
+/**
+ * Sample points (model space, tiles) covering a pad: a grid (rect) or rings
+ * (round) at most `step` apart, `inset` inside its edge; the centre first.
+ */
+export function padSamplePoints(
+  pad: StructurePad,
+  inset = PAD_INSET,
+  step = PAD_SAMPLE_STEP,
+): Float32Array {
+  const key = `${pad.x0},${pad.x1},${pad.z0},${pad.z1},${pad.round},${inset},${step}`;
+  let pts = SAMPLE_CACHE.get(key);
+  if (pts === undefined) {
+    pts = buildPadSamples(pad, inset, step);
+    // Pads come in a few dozen shapes (type × level).
+    if (SAMPLE_CACHE.size > 256) SAMPLE_CACHE.clear();
+    SAMPLE_CACHE.set(key, pts);
+  }
+  return pts;
+}
+
+const SAMPLE_CACHE = new Map<string, Float32Array>();
+
+function buildPadSamples(
+  pad: StructurePad,
+  inset: number,
+  step: number,
+): Float32Array {
+  const cx = (pad.x0 + pad.x1) / 2;
+  const cz = (pad.z0 + pad.z1) / 2;
+  const pts: number[] = [cx, cz];
+  if (pad.round) {
+    const r = Math.max(0, (pad.x1 - pad.x0) / 2 - inset);
+    const rings = Math.max(1, Math.ceil(r / step));
+    for (let k = 1; k <= rings; k++) {
+      const rr = (r * k) / rings;
+      const n = Math.max(6, Math.ceil((2 * Math.PI * rr) / step));
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * 2 * Math.PI;
+        pts.push(cx + rr * Math.cos(a), cz + rr * Math.sin(a));
+      }
+    }
+    return new Float32Array(pts);
+  }
+  const x0 = Math.min(cx, pad.x0 + inset);
+  const x1 = Math.max(cx, pad.x1 - inset);
+  const z0 = Math.min(cz, pad.z0 + inset);
+  const z1 = Math.max(cz, pad.z1 - inset);
+  const nx = Math.max(1, Math.ceil((x1 - x0) / step));
+  const nz = Math.max(1, Math.ceil((z1 - z0) / step));
+  for (let j = 0; j <= nz; j++) {
+    for (let i = 0; i <= nx; i++) {
+      pts.push(x0 + ((x1 - x0) * i) / nx, z0 + ((z1 - z0) * j) / nz);
+    }
+  }
+  return new Float32Array(pts);
+}
+
+/** Where a pad fits: model offset off the tile (tiles), scale, water hits. */
+export interface PadFit {
+  dx: number;
+  dz: number;
+  scale: number;
+  /** Pad samples still over water (0 = all on land). */
+  water: number;
+}
+
+/**
+ * Fits a structure's pad (model space, turned by `rotY` like the model) on
+ * land around tile centre (x, y): the largest of PAD_FIT_SCALES for which
+ * the pad covers land tiles only, centred on the tile or shifted (0.5 to
+ * PAD_MAX_SHIFT tiles, the tile staying under the pad) towards the land
+ * around it. When nothing fits (a 1-tile spit), the
+ * candidate with the least pad area over water (samples over water ×
+ * scale²).
+ */
+export function fitPadOnLand(
+  isLandAt: (x: number, y: number) => boolean,
+  x: number,
+  y: number,
+  rotY: number,
+  pad: StructurePad,
+): PadFit {
+  const pts = padSamplePoints(pad);
+  const c = Math.cos(rotY);
+  const s = Math.sin(rotY);
+  const water = (ox: number, oz: number, sc: number, limit: number) => {
+    let w = 0;
+    for (let i = 0; i < pts.length; i += 2) {
+      const px = pts[i];
+      const pz = pts[i + 1];
+      if (
+        !isLandAt(
+          x + ox + sc * (px * c + pz * s),
+          y + oz + sc * (pz * c - px * s),
+        )
+      ) {
+        if (++w >= limit) return w;
+      }
+    }
+    return w;
+  };
+  // Direction towards the land around the tile.
+  let lx = 0;
+  let lz = 0;
+  for (let k = 0; k < 16; k++) {
+    const a = (k * Math.PI) / 8;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    for (const r of [1.5, 3, 4.5, 6]) {
+      if (isLandAt(x + ca * r, y + sa * r)) {
+        lx += ca;
+        lz += sa;
+      }
+    }
+  }
+  const len = Math.hypot(lx, lz);
+  const half = Math.min(pad.x1 - pad.x0, pad.z1 - pad.z0) / 2;
+  let best: PadFit = {
+    dx: 0,
+    dz: 0,
+    scale: PAD_FIT_SCALES[PAD_FIT_SCALES.length - 1],
+    water: Infinity,
+  };
+  let bestArea = Infinity;
+  const consider = (dx: number, dz: number, sc: number, w: number) => {
+    if (w * sc * sc < bestArea) {
+      bestArea = w * sc * sc;
+      best = { dx, dz, scale: sc, water: w };
+    }
+  };
+  for (const sc of PAD_FIT_SCALES) {
+    // Counting stops once a candidate cannot beat the best one.
+    const limit = Math.ceil(bestArea / (sc * sc));
+    const w0 = water(0, 0, sc, limit);
+    if (w0 === 0) return { dx: 0, dz: 0, scale: sc, water: 0 };
+    consider(0, 0, sc, w0);
+    if (len < 1e-6) continue;
+    const maxShift = Math.min(PAD_MAX_SHIFT, half * sc);
+    for (const d of PAD_SHIFTS) {
+      if (d > maxShift + 1e-9) break;
+      for (const ang of PAD_SHIFT_ANGLES) {
+        const ca = Math.cos(ang);
+        const sa = Math.sin(ang);
+        const ux = (lx * ca - lz * sa) / len;
+        const uz = (lx * sa + lz * ca) / len;
+        const w = water(ux * d, uz * d, sc, limit);
+        if (w === 0) return { dx: ux * d, dz: uz * d, scale: sc, water: 0 };
+        consider(ux * d, uz * d, sc, w);
+      }
+    }
+  }
+  return best;
+}
+
+/** A pad's ground plane: height at its centre, world gradient, sink. */
+export interface GroundPlane {
+  height: number;
+  gx: number;
+  gz: number;
+  /** How far the plane must drop for the pad to float nowhere (tiles). */
+  sink: number;
+}
+
+/**
+ * Least-squares plane through the surface under a pad centred at world
+ * (cx, cz), turned by `rotY`, scaled by `scale`: its height at the centre
+ * and gradient (capped at PAD_MAX_SLOPE), and how far it must drop for the
+ * pad to lie on or under the surface at every sample (capped at
+ * PAD_MAX_SINK).
+ */
+export function fitGroundPlane(
+  surfaceAt: (x: number, z: number) => number,
+  cx: number,
+  cz: number,
+  rotY: number,
+  pad: StructurePad,
+  scale: number,
+): GroundPlane {
+  const pts = padSamplePoints(pad, 0);
+  const n = pts.length / 2;
+  const c = Math.cos(rotY);
+  const s = Math.sin(rotY);
+  const dx = new Float64Array(n);
+  const dz = new Float64Array(n);
+  const h = new Float64Array(n);
+  let mx = 0;
+  let mz = 0;
+  let mh = 0;
+  for (let i = 0; i < n; i++) {
+    const px = pts[2 * i];
+    const pz = pts[2 * i + 1];
+    dx[i] = scale * (px * c + pz * s);
+    dz[i] = scale * (pz * c - px * s);
+    h[i] = surfaceAt(cx + dx[i], cz + dz[i]);
+    mx += dx[i];
+    mz += dz[i];
+    mh += h[i];
+  }
+  mx /= n;
+  mz /= n;
+  mh /= n;
+  let sxx = 0;
+  let sxz = 0;
+  let szz = 0;
+  let sxh = 0;
+  let szh = 0;
+  for (let i = 0; i < n; i++) {
+    const ex = dx[i] - mx;
+    const ez = dz[i] - mz;
+    const eh = h[i] - mh;
+    sxx += ex * ex;
+    sxz += ex * ez;
+    szz += ez * ez;
+    sxh += ex * eh;
+    szh += ez * eh;
+  }
+  const det = sxx * szz - sxz * sxz;
+  let gx = 0;
+  let gz = 0;
+  if (det > 1e-9) {
+    gx = (sxh * szz - szh * sxz) / det;
+    gz = (szh * sxx - sxh * sxz) / det;
+  }
+  const g = Math.hypot(gx, gz);
+  if (g > PAD_MAX_SLOPE) {
+    gx *= PAD_MAX_SLOPE / g;
+    gz *= PAD_MAX_SLOPE / g;
+  }
+  const a = mh - gx * mx - gz * mz;
+  let lowest = 0;
+  for (let i = 0; i < n; i++) {
+    lowest = Math.min(lowest, h[i] - (a + gx * dx[i] + gz * dz[i]));
+  }
+  return { height: a, gx, gz, sink: Math.min(PAD_MAX_SINK, -lowest) };
+}
+
+/**
+ * Bilinear interpolation of a 3×3 grid (row-major, rows by v) at (u, v) in
+ * [0, 1]², on each of its 2×2 cells (TS twin of the conform shader's
+ * `conformGround`).
+ */
+export function groundGridAt(g: ArrayLike<number>, u: number, v: number) {
+  const tu = Math.min(1, Math.max(0, u)) * 2;
+  const tv = Math.min(1, Math.max(0, v)) * 2;
+  const row = (r: number) =>
+    tu < 1
+      ? g[3 * r] + (g[3 * r + 1] - g[3 * r]) * tu
+      : g[3 * r + 1] + (g[3 * r + 2] - g[3 * r + 1]) * (tu - 1);
+  return tv < 1
+    ? row(0) + (row(1) - row(0)) * tv
+    : row(1) + (row(2) - row(1)) * (tv - 1);
+}
+
+/**
+ * The ground under a pad placed at world (cx, cz), turned by `rotY`,
+ * scaled by `scale`: its height at the pad's centre, and in `out` the
+ * heights relative to it on a 3×3 grid (u, v ∈ {0, ½, 1} of the pad's
+ * model-space rectangle, rows by v) — what the conform material drapes
+ * the pad on. Each node is the mean of the drawn surface at the node and
+ * a quarter of a cell around it; the grid is then reduced to its
+ * least-squares plane, tilted at most PAD_TOP_MAX_SLOPE (`planarGrid`), so
+ * the pad is a flat slab (no crease) and buildings stand level on it. Also
+ * how far the plane floats above the drawn
+ * surface at the pad's samples, at the PAD_FLOAT_QUANTILE (capped at
+ * PAD_MAX_SINK): the layer sinks the pad by that much, so it floats
+ * nowhere on smooth ground and only over the deepest dips of rough
+ * ground, rather than vanishing under the bumps.
+ */
+export function groundGrid(
+  surfaceAt: (x: number, z: number) => number,
+  cx: number,
+  cz: number,
+  rotY: number,
+  pad: StructurePad,
+  scale: number,
+  out: Float32Array = new Float32Array(9),
+): { centre: number; float: number } {
+  const c = Math.cos(rotY);
+  const s = Math.sin(rotY);
+  const w = pad.x1 - pad.x0;
+  const d = pad.z1 - pad.z0;
+  const at = (lx: number, lz: number) =>
+    surfaceAt(cx + scale * (lx * c + lz * s), cz + scale * (lz * c - lx * s));
+  const ox = w / 8;
+  const oz = d / 8;
+  for (let j = 0; j < 3; j++) {
+    for (let i = 0; i < 3; i++) {
+      const x = pad.x0 + (w * i) / 2;
+      const z = pad.z0 + (d * j) / 2;
+      out[3 * j + i] =
+        (at(x, z) +
+          at(x - ox, z) +
+          at(x + ox, z) +
+          at(x, z - oz) +
+          at(x, z + oz)) /
+        5;
+    }
+  }
+  const centre = out[4] + planarGrid(out, w * scale, d * scale);
+  const pts = padSamplePoints(pad, 0);
+  const n = pts.length / 2;
+  if (FLOAT_SCRATCH.length < n) FLOAT_SCRATCH = new Float64Array(2 * n);
+  const above = FLOAT_SCRATCH.subarray(0, n);
+  for (let i = 0; i < n; i++) {
+    const px = pts[2 * i];
+    const pz = pts[2 * i + 1];
+    const u = (px - pad.x0) / w;
+    const v = (pz - pad.z0) / d;
+    above[i] = centre + groundGridAt(out, u, v) - at(px, pz);
+  }
+  above.sort();
+  const q = above[Math.floor(PAD_FLOAT_QUANTILE * (n - 1))];
+  return { centre, float: Math.min(PAD_MAX_SINK, Math.max(0, q)) };
+}
+
+let FLOAT_SCRATCH = new Float64Array(256);
+
+/**
+ * Replaces a 3×3 ground grid (row-major, rows by v; u, v ∈ {0, ½, 1} of a
+ * pad `worldW` × `worldD` tiles) by its least-squares plane, its slope
+ * capped at PAD_TOP_MAX_SLOPE, relative to the plane's height at the
+ * centre (so out[4] = 0); returns that height relative to the old out[4].
+ * On a regular 3×3 grid the fit is closed-form: the mean, and per axis
+ * (Σ last column − Σ first column) / 3 per unit of u (rows for v).
+ */
+export function planarGrid(
+  out: Float32Array,
+  worldW: number,
+  worldD: number,
+): number {
+  let mean = 0;
+  for (let k = 0; k < 9; k++) mean += out[k];
+  mean /= 9;
+  let su = (out[2] + out[5] + out[8] - out[0] - out[3] - out[6]) / 3;
+  let sv = (out[6] + out[7] + out[8] - out[0] - out[1] - out[2]) / 3;
+  const g = Math.hypot(
+    su / Math.max(worldW, 1e-6),
+    sv / Math.max(worldD, 1e-6),
+  );
+  if (g > PAD_TOP_MAX_SLOPE) {
+    su *= PAD_TOP_MAX_SLOPE / g;
+    sv *= PAD_TOP_MAX_SLOPE / g;
+  }
+  const rel = mean - out[4];
+  for (let j = 0; j < 3; j++) {
+    for (let i = 0; i < 3; i++) {
+      out[3 * j + i] = su * (i / 2 - 0.5) + sv * (j / 2 - 0.5);
+    }
+  }
+  return rel;
+}
+
+/**
+ * The pad of a structure at a level: `structurePad` of its model variant,
+ * stretched like the model (`structureLevelScale`) for the types whose
+ * model does not change with the level.
+ */
+export function levelPad(
+  type: string,
+  variant: number,
+  level: number,
+): StructurePad {
+  const pad = structurePad(type, variant);
+  const [lx] = structureLevelScale(type, level);
+  if (lx === 1) return pad;
+  return {
+    x0: pad.x0 * lx,
+    x1: pad.x1 * lx,
+    z0: pad.z0 * lx,
+    z1: pad.z1 * lx,
+    round: pad.round,
+  };
+}
+
 interface StructureInst {
   id: number;
   type: string;
@@ -290,8 +731,27 @@ interface StructureInst {
   /** Tile centre. */
   x: number;
   y: number;
-  /** World Y of the ground under the footprint. */
+  /** Icon anchor: the highest point under the footprint (lot 2). */
+  iconY: number;
+  /** Model centre (world x / z): the tile centre, or shifted onto land. */
+  cx: number;
+  cz: number;
+  /** Model scale that keeps the pad on land (1 = full size). */
+  fit: number;
+  /** World Y of the model origin: the pad's ground plane, sunk. */
   ground: number;
+  /** The plane's height at the centre before sinking (contact shadow). */
+  base: number;
+  /** The plane's world gradient (dY/dX, dY/dZ): contact shadow. */
+  gx: number;
+  gz: number;
+  /** Ground under the pad, 3×3, relative to the centre (conform). */
+  grid: Float32Array;
+  /** Pad extent and centre in model space (tiles, at fit 1). */
+  padW: number;
+  padD: number;
+  padCx: number;
+  padCz: number;
   /** Rotation about +Y (radians). */
   rotY: number;
   /** performance.now() when first seen under construction. */
@@ -302,6 +762,8 @@ interface StructureInst {
   /** Model height (tiles) at scale 1, for anchoring labels and bars. */
   top: number;
   label: LevelLabel | null;
+  /** Waiting in the placement queue (fitted on land later). */
+  queued: boolean;
   /** Inside the view frustum (last visibility pass); culled when false. */
   inView: boolean;
   /** Atlas column of the icon (-1: none) and its index in `icons`. */
@@ -351,6 +813,15 @@ export class StructureLayer {
   /** Model weight the current matrices were written for. */
   private matrixWeight = 0;
   private culled = 0;
+  /** Pad placement cost (JS ms, max over the layer's life) and outcomes. */
+  private placeMsMax = 0;
+  /** Structures still to fit on land (see PAD_PLACE_BUDGET_MS). */
+  private placeQueue: StructureInst[] = [];
+  private placeHead = 0;
+  /** A queued placement changed a model: rebuild next frame. */
+  private placementDirty = false;
+  private padsShifted = 0;
+  private padsShrunk = 0;
   private readonly icons: StructureIcons;
   /**
    * The build ghost as an icon (StructurePass's ghost: alpha 0.5, tinted),
@@ -385,6 +856,8 @@ export class StructureLayer {
     glyphs: true,
   };
   /** `statusAnchor` results (scratch). */
+  private anchorX = 0;
+  private anchorZ = 0;
   private anchorY = 0;
   private anchorLift = 0;
   private anchorPx = 0;
@@ -426,6 +899,7 @@ export class StructureLayer {
       glow: this.glow,
       roughness: 0.75,
       metalness: 0.04,
+      conform: true,
     });
     this.shadows = new BlobShadows(this.group, "structure-shadows");
     this.icons = new StructureIcons(this.group, ctx.renderSettings);
@@ -457,6 +931,7 @@ export class StructureLayer {
 
   updateStructures(units: ReadonlyMap<number, UnitState>): void {
     const stamp = ++this.stamp;
+    const deadline = performance.now() + PAD_PLACE_BUDGET_MS;
     const W = this.ctx.mapWidth;
     const now = performance.now();
     const hf = this.ctx.heightField;
@@ -471,13 +946,25 @@ export class StructureLayer {
           type: u.unitType,
           owner: u.ownerID,
           level: u.level,
-          variant: 1,
+          variant: structureVariant(u.unitType, u.level),
           underConstruction: false,
           marked: false,
           progress: null,
           x,
           y,
+          iconY: 0,
+          cx: x,
+          cz: y,
+          fit: 1,
           ground: 0,
+          base: 0,
+          gx: 0,
+          gz: 0,
+          grid: new Float32Array(9),
+          padW: 0,
+          padD: 0,
+          padCx: 0,
+          padCz: 0,
           rotY: 0,
           ucSinceMs: now,
           stamp,
@@ -485,24 +972,31 @@ export class StructureLayer {
           index: -1,
           top: 1,
           label: null,
+          queued: false,
           inView: true,
           iconCol: iconAtlasColumn(u.unitType),
           icon: -1,
         };
-        this.place(inst, hf);
+        this.placeWithin(inst, hf, deadline);
         this.insts.set(u.id, inst);
       }
       if (u.underConstruction && !inst.underConstruction) inst.ucSinceMs = now;
       inst.underConstruction = u.underConstruction;
       inst.marked = u.markedForDeletion !== false;
       inst.owner = u.ownerID;
-      inst.level = u.level;
-      inst.variant = structureVariant(u.unitType, u.level);
+      if (inst.level !== u.level) {
+        // A new level changes the pad (size, model): fit it again.
+        inst.level = u.level;
+        inst.variant = structureVariant(u.unitType, u.level);
+        this.placeWithin(inst, hf, deadline);
+      }
       inst.stamp = stamp;
     }
     for (const [id, inst] of this.insts) {
       if (inst.stamp !== stamp) {
         this.releaseLabel(inst);
+        if (inst.cx !== inst.x || inst.cz !== inst.y) this.padsShifted--;
+        if (inst.fit < 1) this.padsShrunk--;
         this.insts.delete(id);
       }
     }
@@ -580,6 +1074,7 @@ export class StructureLayer {
     this.altView =
       frame.altView && this.ctx.renderSettings.altView.recolorStructures;
     this.localPlayer = frame.localPlayerID;
+    this.drainPlaceQueue();
     this.updateModels(frame);
     this.updateIcons(frame);
     this.updateGhostIcon(frame);
@@ -614,6 +1109,12 @@ export class StructureLayer {
       iconAlpha: Math.round(this.iconAlpha * 1000) / 1000,
       // Build ghost icons drawn (0, 1, or 2 with an upgrade target).
       ghostIcons: this.ghostIcons.drawn ? this.ghostIcons.count : 0,
+      // Pads (lot 3): models moved off their tile / shrunk to stay on land,
+      // and the slowest placement (fit on land + ground plane), JS ms.
+      padsShifted: this.padsShifted,
+      padsShrunk: this.padsShrunk,
+      padPlaceMsMax: Math.round(this.placeMsMax * 1000) / 1000,
+      padPlacePending: this.placeQueue.length - this.placeHead,
     };
   }
 
@@ -651,20 +1152,26 @@ export class StructureLayer {
     this.weight = models ? modelWeightAt(zoom, band) : 0;
 
     if (hf.version !== this.heightVersion) {
-      // Terrain changed (water nuke): re-seat every structure and icon.
+      // Terrain changed (water nuke): re-seat every icon now, and queue
+      // every model for a new fit on land and relief (a few per frame).
       this.heightVersion = hf.version;
-      for (const inst of this.insts.values()) this.place(inst, hf);
-      this.models = models;
-      if (models) this.updateVisibility(frame);
-      this.rebuild(now);
+      for (const inst of this.insts.values()) {
+        this.placeIcon(inst, hf);
+        this.queuePlace(inst);
+      }
       this.rebuildIcons();
-      return;
     }
     const lod = structureLodAt(zoom, this.lod, low);
     // No models, nothing to cull: skip the frustum test of every structure.
     const viewChanged = models && this.updateVisibility(frame);
     if (!models) this.culled = 0;
-    if (models !== this.models || lod !== this.lod || viewChanged) {
+    if (
+      models !== this.models ||
+      lod !== this.lod ||
+      viewChanged ||
+      this.placementDirty
+    ) {
+      this.placementDirty = false;
       const stale = this.colorsStale();
       this.models = models;
       this.lod = lod;
@@ -737,14 +1244,14 @@ export class StructureLayer {
     let culled = 0;
     for (const inst of this.insts.values()) {
       const fp = STRUCTURE_FOOTPRINT[inst.type] ?? 6;
-      const k = minScreenScale(minPx, frame.cssPxPerTile, fp) * 1.2;
+      const k = minScreenScale(minPx, frame.cssPxPerTile, fp) * 1.2 * inst.fit;
       const half = 0.5 * inst.top * k;
       const r = Math.hypot(0.75 * fp * k, half) + 2;
       const inView = sphereInFrustum(
         planes,
-        inst.x,
+        inst.cx,
         inst.ground + half,
-        inst.y,
+        inst.cz,
         r,
       );
       if (!inView) culled++;
@@ -847,7 +1354,7 @@ export class StructureLayer {
       const c = this.iconColorsFor(inst);
       inst.icon = icons.push(
         inst.x,
-        inst.ground,
+        inst.iconY,
         inst.y,
         inst.iconCol,
         c.fill,
@@ -912,22 +1419,26 @@ export class StructureLayer {
   }
 
   /**
-   * Status anchor of `inst` this frame into `anchorY` (world Y), `anchorLift`
-   * (CSS px above its projection) and `anchorPx` (on-screen width, CSS px):
-   * the top of the icon when zoomed out, the top of the model when zoomed
-   * in, blended by the model weight so labels and bars glide between them.
+   * Status anchor of `inst` this frame into `anchorX` / `anchorY` /
+   * `anchorZ` (world), `anchorLift` (CSS px above its projection) and
+   * `anchorPx` (on-screen width, CSS px): the top of the icon (on its tile)
+   * when zoomed out, the top of the model (which may sit off the tile, on
+   * land) when zoomed in, blended by the model weight so labels and bars
+   * glide between them.
    */
   private statusAnchor(inst: StructureInst): void {
     const w = this.weight;
     const iconPx = inst.iconCol >= 0 ? this.iconPx[inst.iconCol] : 0;
-    let top = inst.ground;
+    let top = inst.iconY;
     let modelPx = 0;
     if (w > 0) {
       const [k, t] = this.anchor(inst);
       top = t;
       modelPx = (STRUCTURE_FOOTPRINT[inst.type] ?? 6) * k * this.lastZoom;
     }
-    this.anchorY = inst.ground + (top - inst.ground) * w;
+    this.anchorX = inst.x + (inst.cx - inst.x) * w;
+    this.anchorZ = inst.y + (inst.cz - inst.y) * w;
+    this.anchorY = inst.iconY + (top - inst.iconY) * w;
     this.anchorLift = ICON_TOP * iconPx * (1 - w);
     this.anchorPx = iconPx * 2 * ICON_TOP * (1 - w) + modelPx * w;
   }
@@ -947,9 +1458,9 @@ export class StructureLayer {
         this.statusAnchor(inst);
         const { w, h } = barSize(this.anchorPx, 0.6, 20, 80);
         this.bars.bar(
-          inst.x,
+          this.anchorX,
           this.anchorY,
-          inst.y,
+          this.anchorZ,
           0,
           this.anchorLift + h / 2 + 4,
           w,
@@ -971,7 +1482,9 @@ export class StructureLayer {
         continue;
       }
       this.statusAnchor(inst);
-      const ndc = this.v.set(inst.x, this.anchorY, inst.y).project(cam);
+      const ndc = this.v
+        .set(this.anchorX, this.anchorY, this.anchorZ)
+        .project(cam);
       const visible =
         ndc.z < 1 && Math.abs(ndc.x) < 1.05 && Math.abs(ndc.y) < 1.05;
       if (!visible) {
@@ -1020,6 +1533,7 @@ export class StructureLayer {
         this.lastNowMs / 1000,
       );
     }
+    k *= inst.fit;
     const fx = modelFadeScaleX(this.weight);
     const fy = modelFadeScaleY(this.weight);
     const [, ly] = structureLevelScale(inst.type, inst.level);
@@ -1067,8 +1581,89 @@ export class StructureLayer {
     l.el.style.display = on ? "block" : "none";
   }
 
-  /** Ground height (highest point under the footprint) and orientation. */
-  private place(inst: StructureInst, hf: HeightField): void {
+  /**
+   * Places `inst` fully while `deadline` (performance.now()) is not past;
+   * after it, provisionally on its tile (no fit on land), queued for the
+   * fit.
+   */
+  private placeWithin(
+    inst: StructureInst,
+    hf: HeightField,
+    deadline: number,
+  ): void {
+    if (performance.now() < deadline) {
+      this.place(inst, hf);
+      return;
+    }
+    this.placeProvisional(inst, hf);
+    this.queuePlace(inst);
+  }
+
+  /**
+   * Cheap placement until the queue fits `inst`: its icon anchor, a model
+   * on its tile at full size, flat, at the ground there.
+   */
+  private placeProvisional(inst: StructureInst, hf: HeightField): void {
+    this.placeIcon(inst, hf);
+    this.orient(inst, hf);
+    if (inst.cx !== inst.x || inst.cz !== inst.y) this.padsShifted--;
+    if (inst.fit < 1) this.padsShrunk--;
+    inst.cx = inst.x;
+    inst.cz = inst.y;
+    inst.fit = 1;
+    inst.grid.fill(0);
+    inst.base = hf.surfaceAt(inst.x, inst.y);
+    inst.gx = 0;
+    inst.gz = 0;
+    inst.ground = inst.base - PAD_SINK;
+  }
+
+  /** Orientation and pad extent of `inst` (model space). */
+  private orient(inst: StructureInst, hf: HeightField): StructurePad {
+    // Model +X maps to tile heading h with rotY = −h (three's Y rotation
+    // turns +X towards −Z, i.e. north).
+    inst.rotY =
+      inst.type === UT_PORT
+        ? -waterHeading(hf, inst.x, inst.y)
+        : ((hash(inst.id) & 3) * Math.PI) / 2;
+    const pad = levelPad(inst.type, inst.variant, inst.level);
+    inst.padW = pad.x1 - pad.x0;
+    inst.padD = pad.z1 - pad.z0;
+    inst.padCx = (pad.x0 + pad.x1) / 2;
+    inst.padCz = (pad.z0 + pad.z1) / 2;
+    return pad;
+  }
+
+  private queuePlace(inst: StructureInst): void {
+    if (inst.queued) return;
+    inst.queued = true;
+    this.placeQueue.push(inst);
+  }
+
+  /**
+   * Fits queued structures on land and relief within PAD_PLACE_BUDGET_MS
+   * (at least one); a change makes the next `updateModels` rebuild.
+   */
+  private drainPlaceQueue(): void {
+    const q = this.placeQueue;
+    if (this.placeHead >= q.length) return;
+    const hf = this.ctx.heightField;
+    const deadline = performance.now() + PAD_PLACE_BUDGET_MS;
+    do {
+      const inst = q[this.placeHead++];
+      inst.queued = false;
+      if (this.insts.get(inst.id) !== inst) continue;
+      this.place(inst, hf);
+      this.placementDirty = true;
+    } while (this.placeHead < q.length && performance.now() < deadline);
+    if (this.placeHead >= q.length) {
+      q.length = 0;
+      this.placeHead = 0;
+    }
+  }
+
+  /** Icon anchor: the highest point under the footprint (lot 2). */
+  private placeIcon(inst: StructureInst, hf: HeightField): void {
     const r = (STRUCTURE_FOOTPRINT[inst.type] ?? 6) * 0.3;
     let ground = hf.surfaceAt(inst.x, inst.y);
     for (const [dx, dy] of [
@@ -1079,13 +1674,54 @@ export class StructureLayer {
     ]) {
       ground = Math.max(ground, hf.surfaceAt(inst.x + dx, inst.y + dy));
     }
-    inst.ground = ground;
-    // Model +X maps to tile heading h with rotY = −h (three's Y rotation
-    // turns +X towards −Z, i.e. north).
-    inst.rotY =
-      inst.type === UT_PORT
-        ? -waterHeading(hf, inst.x, inst.y)
-        : ((hash(inst.id) & 3) * Math.PI) / 2;
+    inst.iconY = ground;
+  }
+
+  /**
+   * Icon anchor, orientation, and the model's place: its pad fitted on land,
+   * then on the relief (see the file comment).
+   */
+  private place(inst: StructureInst, hf: HeightField): void {
+    const t0 = performance.now();
+    this.placeIcon(inst, hf);
+    const pad = this.orient(inst, hf);
+    const fit = fitPadOnLand(
+      (x, y) => isLand(hf.terrainByteAt(x, y)),
+      inst.x,
+      inst.y,
+      inst.rotY,
+      pad,
+    );
+    const wasShifted = inst.cx !== inst.x || inst.cz !== inst.y;
+    const wasShrunk = inst.fit < 1;
+    inst.cx = inst.x + fit.dx;
+    inst.cz = inst.y + fit.dz;
+    inst.fit = fit.scale;
+    const plane = fitGroundPlane(
+      (x, z) => hf.surfaceAt(x, z),
+      inst.cx,
+      inst.cz,
+      inst.rotY,
+      pad,
+      fit.scale,
+    );
+    inst.base = plane.height;
+    inst.gx = plane.gx;
+    inst.gz = plane.gz;
+    const g = groundGrid(
+      (x, z) => hf.surfaceAt(x, z),
+      inst.cx,
+      inst.cz,
+      inst.rotY,
+      pad,
+      fit.scale,
+      inst.grid,
+    );
+    inst.ground = g.centre - g.float - PAD_SINK;
+    const shifted = fit.dx !== 0 || fit.dz !== 0;
+    this.padsShifted += (shifted ? 1 : 0) - (wasShifted ? 1 : 0);
+    this.padsShrunk += (fit.scale < 1 ? 1 : 0) - (wasShrunk ? 1 : 0);
+    this.placeMsMax = Math.max(this.placeMsMax, performance.now() - t0);
   }
 
   /**
@@ -1118,6 +1754,7 @@ export class StructureLayer {
         this.m,
         this.colorFor(inst),
         this.shadeFor(inst, now),
+        inst.grid,
       );
       if (inst.underConstruction || inst.marked) this.animated.push(inst);
     }
@@ -1125,7 +1762,10 @@ export class StructureLayer {
     this.writeShadows();
   }
 
-  /** One soft shadow per drawn model, shifted away from the sun. */
+  /**
+   * One soft shadow per drawn model, the size of its pad, shifted away from
+   * the sun and lying on the pad's ground plane.
+   */
   private writeShadows(): void {
     const sh = this.shadows;
     sh.begin();
@@ -1133,22 +1773,28 @@ export class StructureLayer {
     const fy = modelFadeScaleY(this.matrixWeight);
     for (const inst of this.insts.values()) {
       if (inst.batch === null) continue;
-      const base = minScreenScale(
-        this.ctx.settings.structureMinScreenPx,
-        this.matrixZoom,
-        STRUCTURE_FOOTPRINT[inst.type] ?? 6,
-      );
-      const size =
-        (STRUCTURE_FOOTPRINT[inst.type] ?? 6) * base * fx * SHADOW_SIZE;
+      const base =
+        minScreenScale(
+          this.ctx.settings.structureMinScreenPx,
+          this.matrixZoom,
+          STRUCTURE_FOOTPRINT[inst.type] ?? 6,
+        ) * inst.fit;
+      const k = base * fx;
+      const c = Math.cos(inst.rotY);
+      const s = Math.sin(inst.rotY);
       const [ox, oz] = shadowOffset(0.3 * inst.top * base * fy);
+      const dx = k * (inst.padCx * c + inst.padCz * s) + ox;
+      const dz = k * (inst.padCz * c - inst.padCx * s) + oz;
       sh.push(
-        inst.x + ox,
-        inst.ground + SHADOW_LIFT,
-        inst.y + oz,
-        size,
-        size,
+        inst.cx + dx,
+        inst.base + inst.gx * dx + inst.gz * dz + SHADOW_LIFT,
+        inst.cz + dz,
+        inst.padW * k * SHADOW_SIZE,
+        inst.padD * k * SHADOW_SIZE,
         inst.rotY,
         SHADOW_ALPHA,
+        inst.gx,
+        inst.gz,
       );
     }
     sh.end();
@@ -1183,7 +1829,7 @@ export class StructureLayer {
       STRUCTURE_FOOTPRINT[inst.type] ?? 6,
     );
     const [lx, ly] = structureLevelScale(inst.type, inst.level);
-    let k = base;
+    let k = base * inst.fit;
     if (this.highlight?.has(inst.type)) k *= 1.2;
     if (inst.underConstruction) {
       k *= constructionScale(now - inst.ucSinceMs, now / 1000);
@@ -1191,7 +1837,7 @@ export class StructureLayer {
     // Growing out of the ground while the icons fade (fade band).
     const fx = modelFadeScaleX(this.matrixWeight);
     const fy = modelFadeScaleY(this.matrixWeight);
-    this.p.set(inst.x, inst.ground, inst.y);
+    this.p.set(inst.cx, inst.ground, inst.cz);
     this.q.setFromAxisAngle(this.up, inst.rotY);
     this.s.set(k * lx * fx, k * ly * fy, k * lx * fx);
     this.m.compose(this.p, this.q, this.s);
@@ -1298,6 +1944,8 @@ export class StructureLayer {
       this.material,
       `structures-${bkey}`,
       32,
+      0,
+      true,
     );
     this.batches.set(bkey, batch);
     this.batchTris.set(bkey, triangleCount(template));

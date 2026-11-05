@@ -43,13 +43,17 @@ vec3 diffuseLight(vec3 n) {
 }
 
 // Sky radiance along a unit direction: horizon haze -> zenith blue, with a
-// soft glow and a small disc around the sun.
-vec3 skyColor(vec3 dir) {
+// soft glow and (sunDisc = 1) a small disc around the sun.
+vec3 skyRadiance(vec3 dir, float sunDisc) {
   float e = clamp(dir.y, 0.0, 1.0);
   vec3 c = mix(uSkyHorizon, uSkyZenith, pow(e, 0.55));
   float s = max(dot(dir, uSunDir), 0.0);
-  c += uSunTint * (0.25 * pow(s, 24.0) + 4.0 * pow(s, 1200.0));
+  c += uSunTint * (0.25 * pow(s, 24.0) + sunDisc * 4.0 * pow(s, 1200.0));
   return c;
+}
+
+vec3 skyColor(vec3 dir) {
+  return skyRadiance(dir, 1.0);
 }
 
 vec3 srgbToLinear(vec3 c) {
@@ -84,6 +88,23 @@ float valueNoise(vec2 p) {
   float e = hash12(c + ivec2(1, 1));
   return mix(mix(a, b, u.x), mix(d, e, u.x), u.y);
 }
+
+// Value noise with its analytic gradient: (n, dn/dx, dn/dy).
+vec3 valueNoiseD(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = p - i;
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  vec2 du = 6.0 * f * (1.0 - f);
+  ivec2 c = ivec2(i);
+  float a = hash12(c);
+  float b = hash12(c + ivec2(1, 0));
+  float d = hash12(c + ivec2(0, 1));
+  float e = hash12(c + ivec2(1, 1));
+  float k = a - b - d + e;
+  return vec3(
+    a + (b - a) * u.x + (d - a) * u.y + k * u.x * u.y,
+    du * (vec2(b - a, d - a) + k * u.yx));
+}
 `;
 
 /**
@@ -106,6 +127,18 @@ float waterDepth01(float mag) {
   return sqrt(clamp(mag / 12.0, 0.0, 1.0));
 }
 
+// ---- BEGIN lot 3: shore halo width (TerrainShading.shoreViewScale) ----
+// Factor on the water magnitude for the shallow look only (seabed showing
+// through, shallow tint, see-through shelf): 1 close up (a tile over ~3 px),
+// 3 once a tile is under ~0.7 px, so the coastal halo is a thin band at full
+// map instead of ~7 tiles of yellow-green glow. Foam, waves and the seabed
+// geometry keep the true magnitude. Callers: shadeWater (body + opacity),
+// the seabed colour in terrain.ts (shadeWaterTile) and WATER_FRAG.
+float shoreViewScale(float tpp) {
+  return 1.0 + 2.0 * smoothstep(0.3, 1.4, tpp);
+}
+// ---- END lot 3: shore halo width
+
 // Seabed albedo: sand at the coast -> dark floor offshore.
 vec3 seabedAlbedo(float mag) {
   return mix(uSeabedShallow, uWaterDeep * 0.35, waterDepth01(mag));
@@ -114,24 +147,58 @@ vec3 seabedAlbedo(float mag) {
 // Slope (dh/dx, dh/dz) of one travelling sine wave h = A sin(k (dir.p - c t)),
 // A = steep * lambda, so |slope| = 2 pi steep. The octave fades out while its
 // wavelength shrinks from ~8 to ~3 pixels: no shimmer when zoomed out.
-vec2 waveSlope1(vec2 p, float t, vec2 dir, float lambda, float steep, float speed, float tpp) {
+// zw (lot 3, item 8): the same slope for the glints, kept only while the
+// wavelength is under ~16-40 px on screen (glintWaveWeight): the long
+// octaves' highlight contours were the big repeating "vermicelli".
+vec4 waveSlope1(vec2 p, float t, vec2 dir, float lambda, float steep, float speed, float tpp) {
   float fade = 1.0 - smoothstep(0.12, 0.33, tpp / lambda);
-  if (fade <= 0.0) return vec2(0.0);
+  if (fade <= 0.0) return vec4(0.0);
   float k = 6.2831853 / lambda;
   float phase = k * (dot(dir, p) - speed * t);
-  return dir * (6.2831853 * steep * fade * cos(phase));
+  vec2 s = dir * (6.2831853 * steep * fade * cos(phase));
+  return vec4(s, s * (1.0 - smoothstep(16.0, 40.0, lambda / tpp)));
 }
 
-vec2 waveSlope(vec2 p, float t, float tpp) {
+// xy: slope of the surface (reflection, fresnel); zw: its share for the
+// glints (lot 3, item 8). The phase is bent by a slow warp (cheap trig), so
+// the crests of the 5 octaves do not repeat as a lattice.
+vec4 waveSlope(vec2 p, float t, float tpp) {
   // Slow large-scale modulation so the wave pattern does not look tiled.
   float swell = 0.65 + 0.7 * valueNoise(p * 0.035 + vec2(t * 0.013, -t * 0.009));
-  vec2 g = waveSlope1(p, t, vec2(0.832, 0.555), 13.0, 0.010, 1.10, tpp);
-  g += waveSlope1(p, t, vec2(-0.447, 0.894), 7.3, 0.012, 0.85, tpp);
-  g += waveSlope1(p, t, vec2(0.970, -0.243), 4.1, 0.014, 0.65, tpp);
-  g += waveSlope1(p, t, vec2(-0.781, -0.625), 2.3, 0.013, 0.50, tpp);
-  g += waveSlope1(p, t, vec2(0.196, 0.981), 1.3, 0.011, 0.38, tpp);
+  vec2 pw = p + 2.2 * vec2(
+    sin(dot(p, vec2(0.071, 0.046)) + t * 0.05),
+    sin(dot(p, vec2(-0.052, 0.083)) - t * 0.04));
+  vec4 g = waveSlope1(pw, t, vec2(0.832, 0.555), 13.0, 0.010, 1.10, tpp);
+  g += waveSlope1(pw, t, vec2(-0.447, 0.894), 7.3, 0.012, 0.85, tpp);
+  g += waveSlope1(pw, t, vec2(0.970, -0.243), 4.1, 0.014, 0.65, tpp);
+  g += waveSlope1(pw, t, vec2(-0.781, -0.625), 2.3, 0.013, 0.50, tpp);
+  g += waveSlope1(pw, t, vec2(0.196, 0.981), 1.3, 0.011, 0.38, tpp);
   return g * (swell * uWaveStrength);
 }
+
+// ---- BEGIN lot 3: glitter scaled to the screen (item 8; TerrainShading
+// glitterLevel / GLITTER_*). Slope (dimensionless) of a glitter layer whose
+// period follows the pixel footprint: two value-noise octaves around
+// GLITTER_PX device px, cross-faded over log2 of the footprint (no popping
+// while zooming), each rotated and offset by its absolute level (a level
+// looks the same in either slot) and drifting, so the glints are small
+// sparkles at any zoom, never a repeating pattern.
+vec2 glitterSlope(vec2 p, float t, float tpp) {
+  float L = log2(max(tpp, 1e-4) * 5.0);
+  float k = floor(L);
+  float fr = L - k;
+  vec2 s = vec2(0.0);
+  for (int i = 0; i < 2; i++) {
+    float lvl = k + float(i);
+    float a = lvl * 2.39996;
+    mat2 R = mat2(cos(a), sin(a), -sin(a), cos(a));
+    vec2 q = R * (p * exp2(-lvl)) + vec2(lvl * 17.31 + t * 0.23, lvl * 7.73 - t * 0.19);
+    vec3 n = valueNoiseD(q);
+    s += (i == 0 ? 1.0 - fr : fr) * (transpose(R) * n.yz);
+  }
+  return s;
+}
+// ---- END lot 3: glitter
 
 // Foam. Zoomed out: a crisp light band over the shoreline water tiles
 // (bilinear mag up to ~0.45), like the default renderer's lighter shore
@@ -162,25 +229,40 @@ float foamAmount(vec2 p, float mag, float t, float tpp) {
 // Water surface colour (linear) and opacity at p. V = unit vector from the
 // surface to the camera.
 vec4 shadeWater(vec2 p, float mag, vec3 V, float tpp, float t) {
-  float d = waterDepth01(mag);
+  // Shallow look narrowed when zoomed out (lot 3, shoreViewScale).
+  float d = waterDepth01(mag * shoreViewScale(tpp));
   // Calmer near the coast and when zoomed out.
   float calm = mix(0.4, 1.0, smoothstep(0.0, 3.0, mag))
     * mix(1.0, 0.45, smoothstep(0.3, 1.5, tpp));
-  vec2 slope = waveSlope(p, t, tpp) * calm;
+  vec4 slopes = waveSlope(p, t, tpp) * calm;
+  vec2 slope = slopes.xy;
   vec3 n = normalize(vec3(-slope.x, 1.0, -slope.y));
 
   float ndv = clamp(dot(n, V), 0.0, 1.0);
   float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
   vec3 body = mix(uWaterShallow, uWaterDeep, d) * diffuseLight(UP);
-  vec3 col = mix(body, skyColor(reflect(-V, n)), fres);
+  // Lot 3 (item 8): the reflected sky without the sun's disc. Mirrored by
+  // the summed sines, the disc drew the big repeating "vermicelli" at mid
+  // zoom; the sun's reflection is the glint lobe below, scaled to the
+  // screen.
+  vec3 col = mix(body, skyRadiance(reflect(-V, n), 0.0), fres);
 
-  // Sun glints (tight lobe) and a soft sheen (wide lobe), Blinn-Phong.
-  // Kept faint and only at close zoom (faded out from ~30 down to ~4 px per
-  // tile): brighter sparkles read as noise on the sea.
+  // Sun glints (tight lobe) and a soft sheen (wide lobe), Blinn-Phong, only
+  // at close zoom (faded out from ~30 down to ~4 px per tile). Lot 3 (item
+  // 8): the lobes see the waves' short octaves only (slopes.zw, a third of
+  // their slope) plus the glitter layer, so the sun's reflection is a field
+  // of sparkles of a few px at any zoom instead of long repeating contours;
+  // with them that small, the tight lobe can be brighter (0.22, was 0.05).
   vec3 h = normalize(V + uSunDir);
-  float ndh = max(dot(n, h), 0.0);
-  float glint = (0.05 * pow(ndh, 700.0) + 0.04 * pow(ndh, 60.0))
-    * (1.0 - smoothstep(0.03, 0.25, tpp));
+  float glintOn = 1.0 - smoothstep(0.03, 0.25, tpp);
+  float glint = 0.0;
+  if (glintOn > 0.0) {
+    vec2 gs = 0.35 * slopes.zw + 0.28 * calm * uWaveStrength * glitterSlope(p, t, tpp);
+    vec3 ng = normalize(vec3(-gs.x, 1.0, -gs.y));
+    vec3 nb = normalize(vec3(-slopes.z, 1.0, -slopes.w));
+    glint = (0.22 * pow(max(dot(ng, h), 0.0), 700.0)
+      + 0.04 * pow(max(dot(nb, h), 0.0), 60.0)) * glintOn;
+  }
   col += uSunIrradiance * (glint * INV_PI);
 
   float foam = foamAmount(p, mag, t, tpp);
@@ -273,7 +355,7 @@ void main() {
   vec2 hit = p - V.xz * (depth / max(V.y, 0.05));
   vec2 sd = max(-hit, hit - size); // > 0 outside the map
   float composite = dOut > 0.0 ? 1.0 : smoothstep(-2.0, 0.0, max(sd.x, sd.y));
-  col = mix(col, mix(seabedAlbedo(mag) * diffuseLight(UP), wtr.rgb, wtr.a), composite);
+  col = mix(col, mix(seabedAlbedo(mag * shoreViewScale(tpp)) * diffuseLight(UP), wtr.rgb, wtr.a), composite);
   alpha = mix(alpha, 1.0, composite);
   col *= mix(1.0, 0.6, uAltView);
 

@@ -49,6 +49,13 @@
  * Particle colours are linear HDR. The bloom threshold is 1.0 (luminance),
  * so only values above that glow: flashes and fire peak around 3-4, the
  * young cloud and embers sit just above 1, cooled smoke stays below.
+ *
+ * Fallout smoke (lot 3, item 5; `FalloutSmoke`): a fixed pool of
+ * `FALLOUT_SMOKE_SLOTS` puffs, each looping (closed form, no spawning) over
+ * a random fallout tile of a dense fallout cell in view (TerrainLayer's
+ * `FalloutField`, set with `setFallout`), drawn with the smoke material in
+ * one more draw call; nothing is drawn below ~1.2 px per tile or without
+ * fallout in view.
  */
 
 import * as THREE from "three";
@@ -70,6 +77,15 @@ import {
   UT_TRAIN,
   UT_WARSHIP,
 } from "../types/UnitType";
+import {
+  FALLOUT_SMOKE_BIRTH_MS,
+  FALLOUT_SMOKE_LIFE_MS,
+  FALLOUT_SMOKE_SLOTS,
+  type FalloutField,
+  type FalloutPuff,
+  falloutPuff,
+  falloutSmokeZoomFade,
+} from "./FalloutField";
 import type { FrameInfo, ThreeLayerContext } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -107,6 +123,13 @@ export const FX_LIFETIME_MS: Readonly<Record<FxKind, number>> = {
 export const SHOCKWAVE_RADIUS_FACTOR = 1.5;
 /** Default shockwave duration (render-settings default), ms. */
 const SHOCKWAVE_MS = 1500;
+/**
+ * Default shockwave ring colour (linear HDR) and peak opacity: just over
+ * the bloom threshold (lot 3: it was [2.4, 1.9, 1.4] at 0.85, a pale
+ * glowing disc over ~150 tiles of territory and labels for 1.5 s).
+ */
+export const SHOCKWAVE_COLOR: [number, number, number] = [1.45, 1.2, 0.95];
+export const SHOCKWAVE_ALPHA = 0.6;
 /** Height (tiles above the surface) of SAM interceptions. */
 export const INTERCEPT_ALTITUDE = 25;
 /** Mushroom-cap height as a multiple of the nuke's visual radius. */
@@ -222,7 +245,7 @@ export function shockwaveParams(
   return {
     radius: outerRadius * SHOCKWAVE_RADIUS_FACTOR,
     durationMs: SHOCKWAVE_MS,
-    color: [2.4, 1.9, 1.4],
+    color: [SHOCKWAVE_COLOR[0], SHOCKWAVE_COLOR[1], SHOCKWAVE_COLOR[2]],
   };
 }
 
@@ -842,6 +865,257 @@ class ParticlePool {
 }
 
 // ---------------------------------------------------------------------------
+// Fallout smoke (lot 3, item 5)
+// ---------------------------------------------------------------------------
+
+/** Young / old fallout smoke (linear; the sprite's shading multiplies it). */
+const FALLOUT_SMOKE_YOUNG: Rgb = [0.18, 0.16, 0.14];
+const FALLOUT_SMOKE_OLD: Rgb = [0.52, 0.5, 0.48];
+/** Downwind direction of the fallout smoke (unit, world xz). */
+const FALLOUT_WIND: readonly [number, number] = [0.8, -0.6];
+/** A slot is re-aimed when its emitter leaves the view by this margin, tiles. */
+const FALLOUT_VIEW_MARGIN = 12;
+/** A slot that found no emitter retries after this long, ms. */
+const FALLOUT_RETRY_MS = 300;
+
+// Slot record layout (Float64).
+const S_X = 0;
+const S_Z = 1;
+const S_Y = 2;
+const S_PHASE = 3;
+const S_CYCLE = 4;
+const S_BIRTH = 5;
+const S_ACTIVE = 6;
+const S_RETRY = 7;
+const S_ROT = 8;
+const S_SIZE = 9;
+const S_STRIDE = 10;
+
+/** NDC points viewRect casts: the screen corners and centre (x, y pairs). */
+const VIEW_CORNERS: readonly number[] = [-1, -1, 1, -1, 1, 1, -1, 1, 0, 0];
+
+/**
+ * Fallout smoke: `slots` puffs, each looping forever over its emitter (a
+ * random fallout tile of a dense `FalloutField` cell in view): at time t a
+ * slot is at life fraction fract(t / life + phase), so the population is
+ * steady from the first frame and costs nothing to spawn. A slot gets a new
+ * emitter when its loop wraps (its puff is invisible then), and at once when
+ * it has none or its emitter left the view (with a short fade-in). One draw
+ * call with the FX smoke material while any puff shows.
+ */
+class FalloutSmoke {
+  readonly mesh: THREE.Mesh;
+  private readonly geometry: THREE.InstancedBufferGeometry;
+  private readonly offsets: THREE.InstancedBufferAttribute;
+  private readonly colors: THREE.InstancedBufferAttribute;
+  private readonly sizeRot: THREE.InstancedBufferAttribute;
+  private readonly slots: Float64Array;
+  private readonly rand = mulberry32(0x5eedf00d);
+  private readonly ray = new THREE.Vector3();
+  /** viewRect's result and the puff being written (reused every frame). */
+  private readonly rect = new Float64Array(4);
+  private readonly puff: FalloutPuff = { rise: 0, drift: 0, size: 0, alpha: 0 };
+  /** Visible puffs of the last update, and its JS time (perf counters). */
+  visible = 0;
+  lastMs = 0;
+
+  constructor(
+    private readonly count: number,
+    material: THREE.ShaderMaterial,
+    renderOrder: number,
+  ) {
+    this.slots = new Float64Array(count * S_STRIDE);
+    for (let i = 0; i < count; i++) {
+      const o = i * S_STRIDE;
+      this.slots[o + S_PHASE] = (i + 0.5) / count;
+      this.slots[o + S_CYCLE] = -1;
+      this.slots[o + S_ROT] = this.rand() * Math.PI * 2;
+      this.slots[o + S_SIZE] = 0.8 + 0.4 * this.rand();
+    }
+    const quad = new THREE.PlaneGeometry(1, 1);
+    const geo = new THREE.InstancedBufferGeometry();
+    geo.setIndex(quad.getIndex());
+    geo.setAttribute("position", quad.getAttribute("position"));
+    geo.setAttribute("uv", quad.getAttribute("uv"));
+    this.offsets = dynamicInstanced(count, 3);
+    this.colors = dynamicInstanced(count, 4);
+    this.sizeRot = dynamicInstanced(count, 2);
+    geo.setAttribute("iOffset", this.offsets);
+    geo.setAttribute("iColor", this.colors);
+    geo.setAttribute("iSizeRot", this.sizeRot);
+    geo.instanceCount = 0;
+    this.geometry = geo;
+    this.mesh = new THREE.Mesh(geo, material);
+    this.mesh.name = "fx-fallout-smoke";
+    this.mesh.frustumCulled = false;
+    this.mesh.renderOrder = renderOrder;
+    this.mesh.visible = false;
+  }
+
+  update(
+    frame: FrameInfo,
+    field: FalloutField | null,
+    surface: { surfaceAt(x: number, z: number): number },
+  ): void {
+    const t0 = performance.now();
+    const fade = falloutSmokeZoomFade(frame.cssPxPerTile);
+    if (field === null || field.denseCells === 0 || fade <= 0) {
+      this.hide();
+      this.lastMs = performance.now() - t0;
+      return;
+    }
+    const rect = this.viewRect(frame, field.width, field.height);
+    const now = frame.nowMs;
+    const d = this.slots;
+    const off = this.offsets.array as Float32Array;
+    const col = this.colors.array as Float32Array;
+    const sr = this.sizeRot.array as Float32Array;
+    const m = FALLOUT_VIEW_MARGIN;
+    let n = 0;
+    for (let i = 0; i < this.count; i++) {
+      const o = i * S_STRIDE;
+      const cyc = now / FALLOUT_SMOKE_LIFE_MS + d[o + S_PHASE];
+      const cycle = Math.floor(cyc);
+      const u = cyc - cycle;
+      const active = d[o + S_ACTIVE] === 1;
+      const x = d[o + S_X];
+      const z = d[o + S_Z];
+      const outside =
+        active &&
+        (x < rect[0] - m ||
+          x > rect[2] + m ||
+          z < rect[1] - m ||
+          z > rect[3] + m);
+      if (
+        cycle !== d[o + S_CYCLE] ||
+        (!active && now >= d[o + S_RETRY]) ||
+        outside
+      ) {
+        // At the loop's wrap the puff is invisible: no fade needed then.
+        const wrap = cycle !== d[o + S_CYCLE] && active;
+        d[o + S_CYCLE] = cycle;
+        const e = field.pickEmitter(
+          rect[0],
+          rect[1],
+          rect[2],
+          rect[3],
+          this.rand,
+        );
+        if (e === null) {
+          d[o + S_ACTIVE] = 0;
+          d[o + S_RETRY] = now + FALLOUT_RETRY_MS;
+          continue;
+        }
+        d[o + S_ACTIVE] = 1;
+        d[o + S_X] = e.x + 0.2 + 0.6 * this.rand();
+        d[o + S_Z] = e.y + 0.2 + 0.6 * this.rand();
+        d[o + S_Y] = surface.surfaceAt(d[o + S_X], d[o + S_Z]);
+        d[o + S_BIRTH] = wrap ? -Infinity : now;
+      } else if (!active) {
+        continue;
+      }
+      const p = falloutPuff(u, this.puff);
+      const birth = Math.min(
+        1,
+        (now - d[o + S_BIRTH]) / FALLOUT_SMOKE_BIRTH_MS,
+      );
+      const a = p.alpha * fade * birth;
+      if (a <= 0.002) continue;
+      const k3 = n * 3;
+      off[k3] = d[o + S_X] + FALLOUT_WIND[0] * p.drift;
+      off[k3 + 1] = d[o + S_Y] + p.rise;
+      off[k3 + 2] = d[o + S_Z] + FALLOUT_WIND[1] * p.drift;
+      const k4 = n * 4;
+      for (let c = 0; c < 3; c++) {
+        col[k4 + c] =
+          FALLOUT_SMOKE_YOUNG[c] +
+          (FALLOUT_SMOKE_OLD[c] - FALLOUT_SMOKE_YOUNG[c]) * u;
+      }
+      col[k4 + 3] = a;
+      sr[n * 2] = p.size * d[o + S_SIZE];
+      sr[n * 2 + 1] = d[o + S_ROT] + 0.25 * u;
+      n++;
+    }
+    this.geometry.instanceCount = n;
+    this.mesh.visible = n > 0;
+    this.visible = n;
+    if (n > 0) {
+      markRange(this.offsets, n);
+      markRange(this.colors, n);
+      markRange(this.sizeRot, n);
+    }
+    this.lastMs = performance.now() - t0;
+  }
+
+  /**
+   * Tile rectangle [x0, z0, x1, z1] seen by the camera: the screen corners
+   * and centre cast onto the sea plane (rays above the horizon capped at
+   * 3 camera heights), clamped to the map.
+   */
+  private viewRect(frame: FrameInfo, W: number, H: number): Float64Array {
+    const cam = frame.camera;
+    const r = this.rect;
+    r[0] = Infinity;
+    r[1] = Infinity;
+    r[2] = -Infinity;
+    r[3] = -Infinity;
+    const pos = cam.position;
+    const cap = 3 * Math.max(1, pos.y);
+    for (let c = 0; c < VIEW_CORNERS.length; c += 2) {
+      const dir = this.ray
+        .set(VIEW_CORNERS[c], VIEW_CORNERS[c + 1], 0.5)
+        .unproject(cam)
+        .sub(pos)
+        .normalize();
+      const t = dir.y < -1e-3 ? Math.min(-pos.y / dir.y, cap / -dir.y) : cap;
+      const x = pos.x + dir.x * t;
+      const z = pos.z + dir.z * t;
+      r[0] = Math.min(r[0], x);
+      r[1] = Math.min(r[1], z);
+      r[2] = Math.max(r[2], x);
+      r[3] = Math.max(r[3], z);
+    }
+    r[0] = Math.max(0, r[0]);
+    r[1] = Math.max(0, r[1]);
+    r[2] = Math.min(W, r[2]);
+    r[3] = Math.min(H, r[3]);
+    return r;
+  }
+
+  /** Screen area of the visible puffs, px² (perf tool's fill estimate). */
+  screenArea(v: FillView): number {
+    const off = this.offsets.array as Float32Array;
+    const sr = this.sizeRot.array as Float32Array;
+    let area = 0;
+    for (let i = 0; i < this.geometry.instanceCount; i++) {
+      area += quadScreenArea(
+        v.view,
+        v.focalPx,
+        v.widthPx,
+        v.heightPx,
+        off[i * 3],
+        off[i * 3 + 1],
+        off[i * 3 + 2],
+        sr[i * 2],
+      );
+    }
+    return area;
+  }
+
+  private hide(): void {
+    if (this.mesh.visible) {
+      this.mesh.visible = false;
+      this.geometry.instanceCount = 0;
+    }
+    this.visible = 0;
+  }
+
+  dispose(): void {
+    this.geometry.dispose();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fireballs (instanced spheres)
 // ---------------------------------------------------------------------------
 
@@ -1307,6 +1581,9 @@ interface PendingFx {
 export class FxLayer {
   private readonly glow: ParticlePool;
   private readonly smoke: ParticlePool;
+  /** Lot 3: smoke over fallout zones (TerrainLayer's field). */
+  private readonly falloutSmoke: FalloutSmoke;
+  private falloutField: FalloutField | null = null;
   private readonly fireballs: FireballPool;
   private readonly decals: DecalPool;
   private readonly lights: FlashLights;
@@ -1408,6 +1685,11 @@ export class FxLayer {
       RENDER_ORDER_SMOKE,
       "fx-smoke",
     );
+    this.falloutSmoke = new FalloutSmoke(
+      low ? FALLOUT_SMOKE_SLOTS / 2 : FALLOUT_SMOKE_SLOTS,
+      smokeMat,
+      RENDER_ORDER_SMOKE,
+    );
     this.fireballs = new FireballPool(FIREBALL_CAPACITY, fireMat);
     this.decals = new DecalPool(DECAL_CAPACITY, decalMat);
     this.lights = new FlashLights(low ? 0 : LIGHT_POOL);
@@ -1415,6 +1697,7 @@ export class FxLayer {
     this.root.name = "fx";
     this.root.add(
       this.decals.mesh,
+      this.falloutSmoke.mesh,
       this.smoke.mesh,
       this.fireballs.mesh,
       this.glow.mesh,
@@ -1456,6 +1739,11 @@ export class FxLayer {
     }
   }
 
+  /** The fallout cells the fallout smoke rises from (TerrainLayer's). */
+  setFallout(field: FalloutField | null): void {
+    this.falloutField = field;
+  }
+
   // ---- Per frame ----
 
   update(frame: FrameInfo): void {
@@ -1464,6 +1752,7 @@ export class FxLayer {
     if (this.pending.length > 0) this.spawnPending(now);
     this.glow.update(now);
     this.smoke.update(now);
+    this.falloutSmoke.update(frame, this.falloutField, this.ctx.heightField);
     this.fireballs.update(now);
     this.decals.update(now, this.ctx.heightField);
     this.lights.update(now);
@@ -1497,6 +1786,8 @@ export class FxLayer {
       liveEffects: this.liveEnds.length,
       fillScreens: Math.round(last * 100) / 100,
       fillScreensMax: Math.round(max * 100) / 100,
+      falloutPuffs: this.falloutSmoke.visible,
+      falloutSmokeMs: Math.round(this.falloutSmoke.lastMs * 1000) / 1000,
     };
   }
 
@@ -1513,6 +1804,7 @@ export class FxLayer {
     const area =
       this.glow.screenArea(v) +
       this.smoke.screenArea(v) +
+      this.falloutSmoke.screenArea(v) +
       this.fireballs.screenArea(v);
     return area / (v.widthPx * v.heightPx);
   }
@@ -1540,6 +1832,7 @@ export class FxLayer {
     this.ctx.scene.remove(this.root);
     this.glow.dispose();
     this.smoke.dispose();
+    this.falloutSmoke.dispose();
     this.fireballs.dispose();
     this.decals.dispose();
     this.lights.dispose();
@@ -1826,7 +2119,7 @@ export class FxLayer {
       lifeMs: ring.durationMs,
       startMs: t0,
       color: ring.color,
-      alpha: 0.85 * clamp(60 / ring.radius, 0.55, 1),
+      alpha: SHOCKWAVE_ALPHA * clamp(60 / ring.radius, 0.55, 1),
     });
     this.fireballs.spawn({
       x,

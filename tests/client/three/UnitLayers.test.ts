@@ -370,8 +370,23 @@ describe("UnitLayer", () => {
     );
     expect(ctx.scene.getObjectByName("units-atomBomb")).toBeUndefined();
     expect(instanced(ctx, "unit-shadows").count).toBe(1);
-    // The off-screen nuke still lays its trail.
+    // The off-screen nuke still lays its trail (it flies on: ~10 tiles a
+    // tick, and the trail starts behind its tail).
     const trail = ctx.scene.getObjectByName("unit-trails") as THREE.Mesh;
+    layer.updateUnits(
+      unitMap(
+        unit({ id: 1, pos: ref(5, 5) }),
+        unit({ id: 2, pos: ref(60, 60) }),
+        unit({
+          id: 3,
+          unitType: "Atom Bomb",
+          pos: ref(63, 58),
+          lastPos: ref(58, 58),
+          targetTile: ref(62, 62),
+        }),
+      ),
+      2,
+    );
     layer.update({ ...f, nowMs: 100 });
     expect(trail.visible).toBe(true);
     const stats = layer.perfStats();

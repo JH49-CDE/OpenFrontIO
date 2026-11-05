@@ -34,7 +34,11 @@
  *   when holes pile up). Unused slots hold zero matrices (degenerate, no
  *   pixels). Its colour and opacity follow the zoom: a light, half
  *   transparent line below ~2 px per tile (so railways do not read as
- *   borders), the ballast colour from ~5 px per tile.
+ *   borders), the ballast colour from ~5 px per tile. Lot 3: on top of
+ *   that, the default renderer's RailroadPass fade (`railroad.railMinZoom`
+ *   3, `railFadeRange` 2, in device px per tile; × RAIL_FADE_GAIN for the
+ *   thinner strip): fainter below ~2.3 device px per tile, not drawn at all
+ *   from 1 down (`railStripLook`).
  * - Detail (`rails-detail`): sleepers and rails (16 triangles) for the
  *   blocks that intersect the view frustum and are close enough: a tile at
  *   the block's nearest corner covers ≥ DETAIL_ON_PX CSS px (off again
@@ -181,6 +185,70 @@ const STRIP_FAR = new THREE.Color(0xd2c9b6);
 const STRIP_NEAR = new THREE.Color(0x8f877b);
 const STRIP_FAR_OPACITY = 0.55;
 const STRIP_FADE_ZOOM: readonly [number, number] = [2, 5];
+/**
+ * Visibility of the strips, as the default renderer's RailroadPass with the
+ * `railroad` render settings' defaults (`railMinZoom` 3, `railFadeRange`
+ * 2): full from RAIL_MIN_ZOOM device px per tile, fading linearly to none
+ * at RAIL_MIN_ZOOM - RAIL_FADE_RANGE (1 device px per tile) and below.
+ */
+export const RAIL_MIN_ZOOM = 3;
+export const RAIL_FADE_RANGE = 2;
+/**
+ * Opacity gain on that visibility: the 3D strip is half a tile wide where
+ * the default's line is a full tile, so its opacity follows 1.5 × the
+ * default's fade (capped at 1): the lot-1 look from ~2.3 device px per
+ * tile, 60% of it at the default zoom (1.8), none from 1 down.
+ */
+export const RAIL_FADE_GAIN = 1.5;
+
+/** The strip material's look at a zoom (see `railStripLook`). */
+export interface RailStripLook {
+  /** Default-renderer visibility (0..1); 0 = the strips are not drawn. */
+  visibility: number;
+  /** Far (0, light) → near (1, ballast) colour weight. */
+  colorT: number;
+  /**
+   * Material opacity: min(1, RAIL_FADE_GAIN × visibility) × the lot-1 far →
+   * near opacity.
+   */
+  opacity: number;
+}
+
+/**
+ * Look of the railway strips at `cssPxPerTile` on a `dpr` screen. The
+ * colour / opacity ramp of lot 1 (light, 55% → ballast, opaque between 2
+ * and 5 CSS px per tile) times the default renderer's fade by device px
+ * per tile (`RAIL_MIN_ZOOM`, `RAIL_FADE_RANGE`, with `RAIL_FADE_GAIN`): at
+ * the default zoom (1.8 CSS px per tile on a 1× screen) the network shows
+ * at 60% of the lot-1 strip (33% opacity), at full map (0.7) not at all,
+ * as in the default renderer, so long straight railways no longer read as
+ * borders while the network still shows.
+ */
+export function railStripLook(
+  cssPxPerTile: number,
+  dpr: number,
+): RailStripLook {
+  const devicePx = cssPxPerTile * (dpr > 0 ? dpr : 1);
+  const visibility = Math.min(
+    1,
+    Math.max(
+      0,
+      (devicePx - (RAIL_MIN_ZOOM - RAIL_FADE_RANGE)) / RAIL_FADE_RANGE,
+    ),
+  );
+  const colorT = smoothstep(
+    STRIP_FADE_ZOOM[0],
+    STRIP_FADE_ZOOM[1],
+    cssPxPerTile,
+  );
+  return {
+    visibility,
+    colorT,
+    opacity:
+      Math.min(1, RAIL_FADE_GAIN * visibility) *
+      (STRIP_FAR_OPACITY + (1 - STRIP_FAR_OPACITY) * colorT),
+  };
+}
 /** Floats per instance matrix. */
 const M = 16;
 
@@ -239,9 +307,12 @@ class RailMesh {
     this.marked += next.instanceMatrix.array.length;
   }
 
+  /** False hides the mesh whatever its count (the strips when faded out). */
+  shown = true;
+
   setCount(n: number): void {
     this.mesh.count = n;
-    this.mesh.visible = n > 0;
+    this.mesh.visible = n > 0 && this.shown;
   }
 
   /** Schedules instances [start, start + count) for upload. */
@@ -399,6 +470,7 @@ export class RailTracks {
   private readonly strip: RailMesh;
   private readonly detail: RailMesh;
   private stripZoom = Number.NaN;
+  private stripDpr = Number.NaN;
 
   // Stats.
   private readonly jsHistory = new Float32Array(JS_HISTORY);
@@ -480,9 +552,9 @@ export class RailTracks {
     this.diffStep(t0 + this.budgetMs * DIFF_BUDGET_SHARE);
     this.rebuildStep(deadline);
     this.compactIfNeeded();
+    this.updateStripLook(frame.cssPxPerTile, frame.dpr);
     this.strip.setCount(this.totalPieces > 0 ? this.highWater : 0);
     this.updateDetail(frame);
-    this.updateStripLook(frame.cssPxPerTile);
     this.lastUploadBytes =
       (this.strip.takeMarkedFloats() + this.detail.takeMarkedFloats()) * 4;
     const ms = this.clock() - t0;
@@ -853,13 +925,18 @@ export class RailTracks {
     }
   }
 
-  /** Light, see-through strips when far, ballast-coloured close up. */
-  private updateStripLook(zoom: number): void {
-    if (zoom === this.stripZoom) return;
+  /**
+   * Light, see-through strips when far, ballast-coloured close up, fainter
+   * below ~2.3 device px per tile and hidden from 1 down (`railStripLook`;
+   * hidden strips cost no draw call). Rebuilds keep running while hidden.
+   */
+  private updateStripLook(zoom: number, dpr: number): void {
+    if (zoom === this.stripZoom && dpr === this.stripDpr) return;
     this.stripZoom = zoom;
-    const t = smoothstep(STRIP_FADE_ZOOM[0], STRIP_FADE_ZOOM[1], zoom);
-    this.stripMaterial.color.lerpColors(STRIP_FAR, STRIP_NEAR, t);
-    this.stripMaterial.opacity =
-      STRIP_FAR_OPACITY + (1 - STRIP_FAR_OPACITY) * t;
+    this.stripDpr = dpr;
+    const look = railStripLook(zoom, dpr);
+    this.stripMaterial.color.lerpColors(STRIP_FAR, STRIP_NEAR, look.colorT);
+    this.stripMaterial.opacity = look.opacity;
+    this.strip.shown = look.visibility > 0;
   }
 }

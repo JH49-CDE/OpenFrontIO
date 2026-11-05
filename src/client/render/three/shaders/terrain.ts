@@ -19,6 +19,13 @@
  *   procedural micro detail (bump normals + albedo) per material.
  * The close-up code is kept lean although GPUs skip it when zoomed out:
  * SwiftShader (headless runs) executes both sides of every branch.
+ *
+ * Lot 3 (each in a delimited block below): the territory fill, borders and
+ * alt-view look strengthen as the camera zooms out (uniforms set from the
+ * zoom by TerrainLayer, curves in TerrainShading.territoryLook); on the
+ * flat apron TerrainLayer lays around the map, the land continues past the
+ * border as its mirror image and breaks up into the sea along a noisy
+ * virtual coast (no straight cut at the map edge).
  */
 
 import { EFFECT_TRAILS_GLSL } from "../EffectTrails";
@@ -85,6 +92,25 @@ uniform float uBorderPx;   // target border width, device px
 uniform float uMinBorder;  // narrowest border, tiles
 uniform float uBorderGlow; // border emission (bloom), fraction of its colour
 
+// ---- BEGIN lot 3: territory readability at distance (TerrainLayer sets
+// them from the zoom each frame, with uFillAlpha / uBorderPx / uAltFillAlpha;
+// TerrainShading.territoryLook holds the curves).
+uniform float uFarFlatten;     // share of the hillshade replaced by flat light on owned land
+uniform float uAltGroundOwned; // alt view: brightness of the ground under owned land
+uniform float uAltGroundFree;  // alt view: brightness of unowned land
+// ---- END lot 3: territory readability uniforms
+
+// ---- BEGIN lot 3: map-edge apron uniforms (TerrainLayer, TerrainShading
+// edgeReachTiles / mirrorIntoMap / virtualLandReach / apronWaterMagnitude).
+uniform float uEdgeReach;      // mean reach of the land past the map edge, tiles
+// ---- END lot 3: map-edge apron uniforms
+
+// ---- BEGIN lot 3: smooth relief close up (item 9; TerrainLayer's relief
+// texture, TerrainShading reliefGridCoord / cubicBsplineTaps).
+uniform highp sampler2D uRelief; // RGBA16F cols x rows: (dh/dx, dh/dz, height, 0) per grid vertex
+uniform vec3 uReliefGrid;        // (step, cols, rows)
+// ---- END lot 3: smooth relief uniforms
+
 // ---- BEGIN surface overlay uniforms + surfaceOverlay() (SurfaceOverlay.ts:
 // coordinate grid, small-player glow). Lot 2; keep this block self-contained.
 ${SURFACE_OVERLAY_GLSL}
@@ -129,10 +155,11 @@ int zoneClass(uint tb) {
   return (tb & MAG) < 10u ? 1 : 2;
 }
 
-// Owner smallID of a tile, 0 off the map.
+// Owner smallID of a tile. Off the map: the nearest edge tile's owner, so
+// no border runs along the map edge (lot 3: the land continues past it on
+// the apron; the default renderer draws one there).
 int ownerAt(ivec2 t) {
-  if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, uMapSize))) return 0;
-  return int(texelFetch(uTiles, t, 0).r & 0xfffu);
+  return int(texelFetch(uTiles, clamp(t, ivec2(0), uMapSize - 1), 0).r & 0xfffu);
 }
 
 // Pairwise relation: 0 neutral, 1 friendly, 2 embargo.
@@ -169,23 +196,6 @@ vec3 baseColor(uint tb) {
   return uColMountain * vec3(0.72, 0.70, 0.68);
 }
 
-// Value noise with its analytic gradient: (n, dn/dx, dn/dy).
-vec3 valueNoiseD(vec2 p) {
-  vec2 i = floor(p);
-  vec2 f = p - i;
-  vec2 u = f * f * (3.0 - 2.0 * f);
-  vec2 du = 6.0 * f * (1.0 - f);
-  ivec2 c = ivec2(i);
-  float a = hash12(c);
-  float b = hash12(c + ivec2(1, 0));
-  float d = hash12(c + ivec2(0, 1));
-  float e = hash12(c + ivec2(1, 1));
-  float k = a - b - d + e;
-  return vec3(
-    a + (b - a) * u.x + (d - a) * u.y + k * u.x * u.y,
-    du * (vec2(b - a, d - a) + k * u.yx));
-}
-
 // Fade of a noise octave of 'freq' cycles per tile: gone before its period
 // shrinks under ~3 pixels (no shimmer).
 float octaveFade(float freq, float tpp) {
@@ -218,6 +228,87 @@ float luma(vec3 c) {
   return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
+// ---- BEGIN lot 3: smooth relief close up (item 9). The mesh is a 2-tile
+// grid (World) with per-vertex normals, and the per-tile detail was a
+// bilinear blend whose slope jumps at every (domain-warped) tile edge:
+// close up, snow and rock showed angular cells. Both are replaced, close up
+// only (weight 'close'; the default-zoom look is unchanged), by C1 / C2
+// smooth versions; the geometry (silhouettes, picking) is untouched.
+//
+// Cubic B-spline of the relief texture at world xz, 4 bilinear taps (two
+// per axis, each pair of B-spline weights folded into one linear fetch):
+// slope and height of the mesh grid, C2-smooth.
+vec4 reliefSmooth(vec2 p) {
+  vec2 dims = uReliefGrid.yz;
+  vec2 cells = dims - 1.0;
+  // Grid coordinate; the last cell is narrower when the map size is not a
+  // multiple of the step (TerrainShading.reliefGridCoord).
+  vec2 lastStart = (cells - 1.0) * uReliefGrid.x;
+  vec2 g = mix(
+    p / uReliefGrid.x,
+    cells - 1.0 + (p - lastStart) / max(vec2(uMapSize) - lastStart, vec2(1e-3)),
+    step(lastStart, p));
+  g = clamp(g, vec2(0.0), cells);
+  vec2 i = floor(g);
+  vec2 f = g - i;
+  vec2 f2 = f * f;
+  vec2 f3 = f2 * f;
+  vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) * (1.0 / 6.0);
+  vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
+  vec2 w3 = f3 * (1.0 / 6.0);
+  vec2 g0 = w0 + w1;
+  vec2 g1 = 1.0 - g0;
+  vec2 t0 = (i - 0.5 + w1 / g0) / dims;
+  vec2 t1 = (i + 1.5 + w3 / max(g1, vec2(1e-6))) / dims;
+  return g0.y * (g0.x * texture(uRelief, t0) + g1.x * texture(uRelief, vec2(t1.x, t0.y)))
+    + g1.y * (g0.x * texture(uRelief, vec2(t0.x, t1.y)) + g1.x * texture(uRelief, t1));
+}
+
+// Quadratic B-spline over the 3 x 3 tiles around the sample point (the 2 x 2
+// of t4 at b plus 5 fetches): tile heights with a continuous slope.
+// Returns (dh/dx, dh/dz, height, mean upland magnitude), the last one
+// weighted over upland tiles only (-1 when there is none), for rock / snow
+// lines that follow smooth contours instead of the tile staircase.
+vec4 tileBspline(ivec2 b, vec2 w, uvec4 t4) {
+  ivec2 hi = ivec2(step(vec2(0.5), w));
+  ivec2 c = b + hi;      // centre tile: round(sample point)
+  vec2 f = w + 0.5 - vec2(hi);
+  ivec2 o = 1 - hi;      // t4 covers columns / rows o .. o + 1 of the 3 x 3
+  uint tt[9];
+  tt[o.y * 3 + o.x] = t4.x;
+  tt[o.y * 3 + o.x + 1] = t4.y;
+  tt[o.y * 3 + o.x + 3] = t4.z;
+  tt[o.y * 3 + o.x + 4] = t4.w;
+  int mc = 2 - 2 * o.x;  // the column t4 misses
+  int mr = 2 - 2 * o.y;  // the row t4 misses
+  for (int k = 0; k < 3; k++) {
+    tt[k * 3 + mc] = terrainAt(c + ivec2(mc - 1, k - 1));
+    if (k != mc) tt[mr * 3 + k] = terrainAt(c + ivec2(k - 1, mr - 1));
+  }
+  vec3 wx = vec3(0.5 * (1.0 - f.x) * (1.0 - f.x), 0.75 - (f.x - 0.5) * (f.x - 0.5), 0.5 * f.x * f.x);
+  vec3 wy = vec3(0.5 * (1.0 - f.y) * (1.0 - f.y), 0.75 - (f.y - 0.5) * (f.y - 0.5), 0.5 * f.y * f.y);
+  vec3 dx = vec3(f.x - 1.0, 1.0 - 2.0 * f.x, f.x);
+  vec3 dy = vec3(f.y - 1.0, 1.0 - 2.0 * f.y, f.y);
+  vec4 r = vec4(0.0);
+  float upW = 0.0;
+  for (int j = 0; j < 3; j++) {
+    for (int i = 0; i < 3; i++) {
+      uint tb = tt[j * 3 + i];
+      float m = float(tb & MAG);
+      bool landT = (tb & LAND) != 0u && m < 30.5;
+      float th = landT ? uHeightScale * (0.03 + 0.97 * pow(m / 30.0, 1.6)) : 0.0;
+      r.xyz += vec3(dx[i] * wy[j], wx[i] * dy[j], wx[i] * wy[j]) * th;
+      if (landT && (tb & SHORE) == 0u && m >= 10.0) {
+        r.w += wx[i] * wy[j] * m;
+        upW += wx[i] * wy[j];
+      }
+    }
+  }
+  r.w = upW > 1e-4 ? r.w / upW : -1.0;
+  return r;
+}
+// ---- END lot 3: smooth relief functions
+
 // Water tile: the seabed (under the water plane), or the water surface
 // itself where the relief is above sea level.
 vec3 shadeWaterTile(vec2 p, uvec4 t4, vec2 w, vec3 V, float tpp) {
@@ -225,8 +316,9 @@ vec3 shadeWaterTile(vec2 p, uvec4 t4, vec2 w, vec3 V, float tpp) {
     mix(shoreValue(t4.x), shoreValue(t4.y), w.x),
     mix(shoreValue(t4.z), shoreValue(t4.w), w.x),
     w.y);
-  // Flat-lit so it matches WaterLayer's own seabed composite exactly.
-  vec3 seabed = seabedAlbedo(mag) * diffuseLight(UP);
+  // Flat-lit so it matches WaterLayer's own seabed composite exactly; the
+  // shallow look narrows when zoomed out (lot 3, shoreViewScale).
+  vec3 seabed = seabedAlbedo(mag * shoreViewScale(tpp)) * diffuseLight(UP);
   vec3 c = seabed;
   if (vWorld.y > 0.0) {
     vec4 wtr = shadeWater(p, mag, V, tpp, uTime);
@@ -235,13 +327,17 @@ vec3 shadeWaterTile(vec2 p, uvec4 t4, vec2 w, vec3 V, float tpp) {
   return c * mix(1.0, 0.6, uAltView);
 }
 
-// p: world xz; tile / f: the tile under p and the position in it; t4 / w:
-// the 4 tile centres around the (close up: domain-warped) sample point and
-// its bilinear weights; nw: the warp noise; dp: (dFdx(p), dFdy(p)); close:
-// 0 at strategy zoom .. 1 once a tile spans ~7+ pixels.
+// p: world xz; tile / f: the tile under p and the position in it; t4 / b /
+// w: the 4 tile centres around the (close up: domain-warped) sample point,
+// the first one and its bilinear weights; nw: the warp noise; hRef: the
+// surface height the concavity shade compares the tiles with (the smooth
+// relief close up, lot 3); dp: (dFdx(p), dFdy(p)); close:
+// 0 at strategy zoom .. 1 once a tile spans ~7+ pixels; apron: 0 on the map,
+// > 0 on the map-edge apron (lot 3): the fill fades by it, no borders.
 vec3 shadeLandTile(
-  vec2 p, ivec2 tile, vec2 f, uint tb, uvec4 t4, vec2 w, vec3 nw,
-  vec3 nMesh, vec2 fw, vec4 dp, float tpp, float detail, float close
+  vec2 p, ivec2 tile, vec2 f, uint tb, uvec4 t4, ivec2 b, vec2 w, vec3 nw,
+  vec3 nMesh, float hRef, vec2 fw, vec4 dp, float tpp, float detail,
+  float close, float apron
 ) {
   vec3 albedo;
   vec3 n = nMesh;
@@ -276,6 +372,8 @@ vec3 shadeLandTile(
     // follow the blended elevation plus large-scale noise, so they form
     // whole slopes and caps instead of tile speckle.
     albedo = farCol;
+    // Lot 3 (item 9): smooth tile heights / slope / upland elevation close up.
+    vec4 bs = close > 0.0 ? tileBspline(b, w, t4) : vec4(0.0, 0.0, 0.0, -1.0);
     float sand = 0.0;
     float grass = 0.0;
     float high = 0.0;
@@ -299,6 +397,9 @@ vec3 shadeLandTile(
       up = tot > 1e-5 ? dot(sw, isUp) : float(z0 == 2);
       vec3 lowCol = tot > 1e-5 ? c4 * (sw * (1.0 - isUp)) : own * (1.0 - up);
       float elev = up > 1e-5 && tot > 1e-5 ? dot(sw * isUp, mags) / up : float(tb & MAG);
+      // Lot 3 (item 9): the rock / snow lines follow the smooth upland
+      // elevation (no angular tile-edge contours).
+      if (bs.w >= 0.0) elev = bs.w;
       lo = valueNoise(mat2(0.94, 0.34, -0.34, 0.94) * p * 0.23 + vec2(-31.0, 17.0));
       float e = elev + (lo - 0.5) * 5.0 + (nw.x - 0.5);
       float rockAmt = smoothstep(18.0, 21.0, e);
@@ -317,8 +418,16 @@ vec3 shadeLandTile(
     // tiles of height per tile, so the gradient is flattened (x DETAIL_RELIEF)
     // to a gentle texture instead of dark bands along every zone boundary.
     vec4 h4 = tileHeights(t4);
-    float gx = mix(h4.y - h4.x, h4.w - h4.z, w.y) * DETAIL_RELIEF;
-    float gz = mix(h4.z - h4.x, h4.w - h4.y, w.x) * DETAIL_RELIEF;
+    float gx = mix(h4.y - h4.x, h4.w - h4.z, w.y);
+    float gz = mix(h4.z - h4.x, h4.w - h4.y, w.x);
+    float hTile = dot(bw, h4);
+    // Lot 3 (item 9): close up, the B-spline's continuous slope instead
+    // (fully from ~5 px per tile: a residue of the bilinear slope draws a
+    // tile checker on flat, uniform ground such as fallout ash).
+    float smoothW = min(1.0, 1.25 * close);
+    gx = mix(gx, bs.x, smoothW) * DETAIL_RELIEF;
+    gz = mix(gz, bs.y, smoothW) * DETAIL_RELIEF;
+    hTile = mix(hTile, bs.z, smoothW);
     n = normalize(mix(nMesh, normalize(vec3(-gx, 1.0, -gz)), 0.6 * detail));
 
     // Bare rock on steep highland / mountain flanks (zoomed out: on
@@ -350,9 +459,12 @@ vec3 shadeLandTile(
       vec2 dRidge = (o1.x > 0.5 ? -2.0 : 2.0) * g1;
       float veg = grass + high;
       // Slopes (dh/dx, dh/dz) of the bump height field.
-      vec2 g = g1 * (f1 * (0.035 * veg + 0.02 * snow + 0.015 * sand))
+      // Lot 3 (item 9): snow gets wind-combed ripples (o1 stretched across
+      // the slowly turning direction) and grain, so the smooth relief
+      // close up does not read as plastic.
+      vec2 g = g1 * (f1 * (0.035 * veg + 0.05 * snow + 0.015 * sand))
         + dRidge * (f1 * 0.04 * rock)
-        + g2 * (f2 * (0.014 * veg + 0.02 * rock + 0.004 * snow + 0.008 * sand));
+        + g2 * (f2 * (0.014 * veg + 0.02 * rock + 0.012 * snow + 0.008 * sand));
       n = normalize(n - vec3(g.x, 0.0, g.y));
       // Albedo: meadows / dry grass patches, speckle, rock creases, snow.
       float meadow = smoothstep(0.25, 0.75, lo + (nw.x - 0.5) * 0.5) * close;
@@ -363,11 +475,13 @@ vec3 shadeLandTile(
       albedo = mix(albedo, albedo * vec3(0.94, 0.97, 1.03), snow * (1.0 - o1.x) * f1);
       // Concavity of the tiles vs the low-pass mesh: valleys darker, crests
       // a touch lighter (cheap ambient occlusion).
-      shade = mix(1.0, clamp(1.0 + 0.22 * (dot(bw, h4) - vWorld.y), 0.78, 1.08), close);
+      shade = mix(1.0, clamp(1.0 + 0.22 * (hTile - hRef), 0.78, 1.08), close);
     }
   }
   // Slope darkening (cheap ambient occlusion of steep ground).
   float ao = mix(0.75, 1.0, smoothstep(0.55, 0.95, n.y)) * shade;
+  // The ground's own colour (lot 3: the fallout burns it).
+  vec3 groundCol = albedo;
 
   // --- Territory fill (mixed in sRGB like the default renderer's blend).
   uint st = texelFetch(uTiles, tile, 0).r;
@@ -376,8 +490,12 @@ vec3 shadeLandTile(
   bool alt = uAltView > 0.5;
   bool hl = owner != 0 && owner == uHighlightOwner;
   if (alt) {
+    // ---- BEGIN lot 3: alt-view ground. Desaturated and dimmed, owned land
+    // less than unowned land, so neutral (grey) territory still reads.
     float l = dot(albedo, vec3(0.299, 0.587, 0.114));
-    albedo = mix(vec3(l), albedo, 0.35) * 0.6;
+    albedo = mix(vec3(l), albedo, 0.35)
+      * (owner != 0 ? uAltGroundOwned : uAltGroundFree);
+    // ---- END lot 3: alt-view ground
   }
   vec3 ground = albedo;
   if (owner != 0) {
@@ -400,25 +518,122 @@ vec3 shadeLandTile(
       if (hl) fill = clamp((fill - 0.5) * (1.0 + uHighlightFill) + 0.5, 0.0, 1.0);
       a = uFillAlpha;
     }
-    albedo = mix(albedo, fill, a);
+    // Lot 3: the fill fades out across the map-edge apron's virtual land.
+    albedo = mix(albedo, fill, a * (1.0 - apron));
   }
 
-  // --- Fallout: toxic ground with a slow glowing pulse.
+  // ---- BEGIN lot 3: fallout (item 5; TerrainShading.falloutLook /
+  // falloutHotspot / emberRadiusTiles mirror the curves). Burnt ground that
+  // keeps the relief and the lighting: the fallout replaces the colour (as
+  // in the default renderer, over any territory fill) but not the normals,
+  // the slope darkening or the hillshade. One hue family at every zoom:
+  // warm ash grey following the ground's own brightness (snow, rock,
+  // plains), darker than any territory.
+  // - Zoomed out: the ash, darker, with a touch of sickly tint, mottled at
+  //   a ~10-tile scale, and a sickly yellow-green rim (FALLOUT_RIM_PX wide,
+  //   on the zone's own tiles), so the zone reads at a glance as a hazard,
+  //   not as one more player or a forest.
+  // - Close up: soft charred patches, fine ash dust and wind-blown ash
+  //   streaks (rotated world-space noise: no tile checker), a faint
+  //   sickly stain, the rim faint; a few hotspots (at most one per
+  //   FALLOUT_HOT_CELL-tile cell of a rotated lattice, in FALLOUT_HOT_SHARE
+  //   of the cells, only well inside the zone: FALLOUT_HOT_CLEAR tiles from
+  //   its edge), a dim amber core in a sickly halo, breathing; a few
+  //   flickering embers (a disc inside its tile).
+  // Everything hangs on this tile's fallout bit: the zone stays exact to
+  // the tile (no glow or colour outside it).
   vec3 emissive = vec3(0.0);
   if (fallout) {
-    float nz = valueNoise(p * 0.45 + vec2(uTime * 0.05, uTime * 0.03));
-    float pulse = 0.75 + 0.25 * sin(uTime * 1.3 + nz * 6.2831853);
-    vec3 tox = uFalloutColor + (hash12(tile) - 0.5) * 0.08;
-    // Scorched, darkened ground tinted toward the fallout colour, so the
-    // relief still reads through it instead of a flat neon sheet.
-    albedo = mix(albedo * vec3(0.55, 0.6, 0.5), clamp(tox, 0.0, 1.0), 0.45);
-    // Only the noise peaks push the luminance past the bloom threshold:
-    // scattered glowing patches rather than a glowing area.
-    emissive = srgbToLinear(uFalloutColor) * (0.06 + 1.3 * nz * nz) * pulse;
+    float near = 1.0 - smoothstep(0.18, 0.5, tpp);
+    float gL = luma(groundCol);
+    vec3 sick = mix(uFalloutColor, vec3(0.75, 0.72, 0.2), 0.6);
+    vec3 ash = vec3(0.4, 0.375, 0.345) * (0.55 + 0.7 * gL);
+    // Far: the ash, darker, a touch of the sickly tint, mottled.
+    float mot = 0.5 + (valueNoise(mat2(0.8, -0.6, 0.6, 0.8) * p * 0.11 + vec2(9.0, 4.0)) - 0.5)
+      * octaveFade(0.11, tpp);
+    vec3 farA = mix(ash * 0.78, sick * 0.6, 0.1 + 0.12 * mot) * (0.85 + 0.3 * mot);
+    // Near: soft charred patches and fine ash dust over the ash.
+    vec3 burnt = ash;
+    float fc = octaveFade(0.83, tpp);
+    float c1 = valueNoise(mat2(0.8, 0.6, -0.6, 0.8) * p * 0.31 + vec2(17.0, 3.0));
+    float c2 = 0.5 + (valueNoise(mat2(0.6, -0.8, 0.8, 0.6) * p * 0.83 + vec2(5.0, 11.0)) - 0.5) * fc;
+    float charred = smoothstep(0.45, 0.8, 0.65 * c1 + 0.35 * c2);
+    burnt *= (1.0 - 0.16 * charred)
+      * (1.0 + 0.12 * (valueNoise(p * 2.3 + vec2(1.7, 6.1)) - 0.5) * octaveFade(2.3, tpp));
+    // Ash streaks, stretched across the wind (FALLOUT_WIND, FxLayer's smoke).
+    vec2 aq = vec2(dot(p, vec2(0.8, -0.6)), dot(p, vec2(0.6, 0.8)));
+    float ash2 = smoothstep(0.55, 0.85, valueNoise(aq * vec2(0.4, 0.62) + vec2(3.0, 8.0)) * (0.7 + 0.3 * c2));
+    burnt = mix(burnt, vec3(0.6, 0.58, 0.55) * (0.8 + 0.25 * gL),
+      0.3 * ash2 * (1.0 - charred) * octaveFade(1.2, tpp));
+    burnt = mix(burnt, burnt * vec3(1.0, 1.04, 0.85), 0.2);
+    // Hotspots: one per 16-tile cell at most (10% of the cells), radius
+    // 1.6-3.2 tiles, only well inside the zone (4 taps 6 tiles around the
+    // centre, fetched only inside the disc); faded zoomed out (they would
+    // shimmer) and on steep flanks (stretched there under tilt).
+    vec2 hq = mat2(0.8, 0.6, -0.6, 0.8) * p * (1.0 / 16.0);
+    ivec2 hc = ivec2(floor(hq));
+    float hh = hash12(hc + ivec2(311, 97));
+    float hot = 0.0;
+    float halo = 0.0;
+    if (hh < 0.1) {
+      float r = 0.1 + 0.1 * fract(hh * 37.0);
+      vec2 c = r + (1.0 - 2.0 * r) * vec2(hash12(hc + ivec2(5, 71)), fract(hh * 113.0));
+      float d2 = dot(hq - vec2(hc) - c, hq - vec2(hc) - c) / (r * r);
+      float k = max(0.0, 1.0 - d2);
+      if (k > 0.0) {
+        ivec2 ct = ivec2(floor(mat2(0.8, -0.6, 0.6, 0.8) * ((vec2(hc) + c) * 16.0)));
+        ivec2 hiT = uMapSize - 1;
+        uint m = texelFetch(uTiles, clamp(ct + ivec2(6, 0), ivec2(0), hiT), 0).r
+          & texelFetch(uTiles, clamp(ct - ivec2(6, 0), ivec2(0), hiT), 0).r
+          & texelFetch(uTiles, clamp(ct + ivec2(0, 6), ivec2(0), hiT), 0).r
+          & texelFetch(uTiles, clamp(ct - ivec2(0, 6), ivec2(0), hiT), 0).r;
+        float vis = (m & 0x2000u) != 0u
+          ? (1.0 - smoothstep(0.25, 0.5, tpp)) * smoothstep(0.55, 0.8, nMesh.y)
+          : 0.0;
+        hot = k * k * k * vis;
+        halo = k * vis;
+      }
+    }
+    burnt = mix(burnt, sick * 0.5, 0.3 * halo) * (1.0 - 0.25 * hot);
+    albedo = mix(farA, burnt, near);
+    // Zone rim: the fallout tiles within R tiles (~1.6 px, 1-4 tiles) of a
+    // clean tile (4 taps), sickly yellow-green, strong zoomed out, faint
+    // close up.
+    int R = int(clamp(floor(1.6 * tpp + 0.5), 1.0, 4.0));
+    ivec2 hiR = uMapSize - 1;
+    uint rm = texelFetch(uTiles, clamp(tile + ivec2(R, 0), ivec2(0), hiR), 0).r
+      & texelFetch(uTiles, clamp(tile - ivec2(R, 0), ivec2(0), hiR), 0).r
+      & texelFetch(uTiles, clamp(tile + ivec2(0, R), ivec2(0), hiR), 0).r
+      & texelFetch(uTiles, clamp(tile - ivec2(0, R), ivec2(0), hiR), 0).r;
+    float rim = (rm & 0x2000u) == 0u ? mix(0.85, 0.3, near) : 0.0;
+    albedo = mix(albedo, sick, rim);
+    float breath = 0.7 + 0.3 * sin(uTime * 0.8 + hh * 40.0);
+    emissive = srgbToLinear(sick) * (mix(0.025, 0.0, near) + 0.1 * rim + 0.12 * halo * halo * breath)
+      + vec3(1.0, 0.42, 0.1) * (0.9 * hot * hot * breath);
+    // Embers: on 2% of the tiles (more in hotspots), close up only, a disc
+    // of at least ~1.3 px whose centre lies EMBER_MARGIN inside the tile,
+    // flickering.
+    float emberW = 1.0 - smoothstep(0.12, 0.25, tpp);
+    float e0 = hash12(tile + ivec2(9173, 3511));
+    if (emberW > 0.0 && e0 < 0.02 + 0.2 * hot) {
+      vec2 c = 0.25 + 0.5 * vec2(hash12(tile + ivec2(71, 4093)), hash12(tile + ivec2(2287, 113)));
+      float r = clamp(1.3 * tpp, 0.06, 0.25);
+      float disc = 1.0 - smoothstep(0.3 * r, r, length(f - c));
+      float flick = sin(uTime * (1.1 + 1.8 * fract(e0 * 57.0)) + e0 * 211.0);
+      emissive += vec3(1.0, 0.32, 0.06) * (3.6 * disc * (0.25 + 0.75 * flick * flick) * emberW);
+    }
   }
+  // ---- END lot 3: fallout
 
   vec3 dl = diffuseLight(n);
-  vec3 lit = srgbToLinear(albedo) * dl * ao + emissive;
+  vec3 shading = dl * ao;
+  // ---- BEGIN lot 3: zoomed out, owned land is lit partly flat, so a
+  // territory reads as one colour while the relief still shows (0 close up).
+  if (owner != 0 && uFarFlatten > 0.0) {
+    shading = mix(shading, diffuseLight(UP), uFarFlatten);
+  }
+  // ---- END lot 3: far flatten
+  vec3 lit = srgbToLinear(albedo) * shading + emissive;
 
   // --- Borders: a band along every edge whose 4-neighbour has another
   // owner (plus concave corners), width = uBorderPx pixels clamped to
@@ -426,7 +641,7 @@ vec3 shadeLandTile(
   // little contrast with the ground on either side (e.g. a light grey band
   // on snow), it gets thin dark edge lines close up (its outermost pixel
   // and one pixel inside the territory) and, zoomed out, a darker shade.
-  if (owner != 0) {
+  if (owner != 0 && apron <= 0.0) {
     vec2 wb = clamp(uBorderPx * fw, vec2(uMinBorder), vec2(1.0));
     if (hl) wb = min(vec2(1.0), wb * 1.7);
     // Band plus the inner edge line.
@@ -467,7 +682,9 @@ vec3 shadeLandTile(
     if (covIn > 0.0) {
       vec3 bc;
       if (alt) {
-        bc = affiliation(owner);
+        // Lot 3: lifted towards white so the band reads on the dimmed
+        // ground (the neutral grey above all).
+        bc = min(affiliation(owner) * 1.15 + 0.12, vec3(1.0));
       } else {
         bc = texelFetch(uPalette, ivec2(owner, 1), 0).rgb;
         if (hl) bc = mix(bc, vec3(1.0), uHighlightBorder);
@@ -520,24 +737,60 @@ void main() {
     c *= 0.9 + 0.1 * sin(y * 9.0 + 2.0 * valueNoise(p * 0.5));
     col = c * diffuseLight(nMesh);
   } else {
-    ivec2 tile = clamp(ivec2(floor(p)), ivec2(0), uMapSize - 1);
-    vec2 f = clamp(p - vec2(tile), 0.0, 1.0);
+    // ---- BEGIN lot 3: map-edge apron lookups. Off the map (TerrainLayer's
+    // flat ring), tiles are looked up at pt, p mirrored at the map border,
+    // so the land and coasts continue past the edge (no stretched edge
+    // row); the point is warped first, more with the distance past the
+    // edge (TerrainShading.apronWarp), so farther out the land is not a
+    // recognisable mirror image. On the map pt = p.
+    vec2 offMap = max(max(-p, p - vec2(uMapSize)), vec2(0.0));
+    float dOut = max(offMap.x, offMap.y);
+    vec2 pt = p;
+    if (dOut > 0.0) {
+      vec2 wn = vec2(
+        valueNoise(p * 0.025 + vec2(1.3, 7.1)),
+        valueNoise(p * 0.025 + vec2(8.2, 2.6)));
+      vec2 pw = p + (wn - 0.5) * (0.9 * min(dOut, 20.0));
+      pt = vec2(uMapSize) - abs(vec2(uMapSize) - abs(pw));
+    }
+    // ---- END lot 3: map-edge apron lookups
+    ivec2 tile = clamp(ivec2(floor(pt)), ivec2(0), uMapSize - 1);
+    vec2 f = clamp(pt - vec2(tile), 0.0, 1.0);
     uint tb = terrainAt(tile);
     bool land = (tb & LAND) != 0u;
     // Per-tile detail fades out once a tile is under ~1-3 pixels; the
     // close-up look (organic zones, micro detail) needs ~3-7+ pixels.
     float detail = 1.0 - smoothstep(0.35, 1.2, tpp);
     float close = 1.0 - smoothstep(0.15, 0.4, tpp);
+    // ---- BEGIN lot 3: smooth relief close up (item 9): shading normal and
+    // reference height from the relief's B-spline instead of the mesh's
+    // per-vertex normals (creased along its triangles).
+    float hRef = vWorld.y;
+    if (land && close > 0.0 && dOut <= 0.0) {
+      vec4 rs = reliefSmooth(p);
+      float smoothW = min(1.0, 1.25 * close);
+      nMesh = normalize(mix(nMesh, normalize(vec3(-rs.x, 1.0, -rs.y)), smoothW));
+      hRef = mix(hRef, rs.z, smoothW);
+    }
+    // ---- END lot 3: smooth relief
+    // Lot 3 (item 6): the relief's shading fades to flat over the last
+    // EDGE_FLAT_TILES inside the map edge, so it meets the flat-lit apron
+    // without a seam under tilt.
+    if (dOut <= 0.0) {
+      vec2 inMap = min(p, vec2(uMapSize) - p);
+      float edgeFlat = 1.0 - smoothstep(0.0, 3.0, min(inMap.x, inMap.y));
+      if (edgeFlat > 0.0) nMesh = normalize(mix(nMesh, UP, edgeFlat));
+    }
     // The 4 tile centres around the sample point, for bilinear colour /
     // depth / normals. Close up, land samples them at a domain-warped point
     // (gradients of two noise octaves as the warp field: typically ~0.2, at
     // most ~0.6 tile), which turns zone edges organic. The tile's own land /
     // water class and owner are never warped.
     vec3 nw = vec3(0.5, 0.0, 0.0);
-    vec2 q = p - 0.5;
+    vec2 q = pt - 0.5;
     if (land && close > 0.0) {
-      nw = valueNoiseD(p * 0.9 + vec2(13.7, 41.3));
-      vec3 nw2 = valueNoiseD(mat2(0.8, 0.6, -0.6, 0.8) * p * 2.6);
+      nw = valueNoiseD(pt * 0.9 + vec2(13.7, 41.3));
+      vec3 nw2 = valueNoiseD(mat2(0.8, 0.6, -0.6, 0.8) * pt * 2.6);
       q += (nw.yz * 0.34 + nw2.yz * 0.12) * close;
     }
     ivec2 b = ivec2(floor(q));
@@ -547,10 +800,48 @@ void main() {
       terrainAt(b + ivec2(1, 0)),
       terrainAt(b + ivec2(0, 1)),
       terrainAt(b + ivec2(1, 1)));
+    // ---- BEGIN lot 3: map-edge apron. On TerrainLayer's flat ring around
+    // the map (at COAST_LIFT), the mirrored land continues past the border
+    // up to a noisy virtual coastline (reach = uEdgeReach x 0.15..2 by two
+    // low-frequency octaves, plus a ragged one; TerrainShading
+    // virtualLandReach): along the edge some land dies at once, some runs
+    // far. The territory fill stops at the edge (gone within 1.5 tiles /
+    // 6 px, apronFillFade: the playfield's limit stays readable, owners do
+    // not look bigger), and the land fades like a page margin, desaturated,
+    // dimmed and blended into the sea with the distance. The water is the mirrored water, or
+    // past the virtual coast its distance from it (a shelf like a real
+    // coast's, never a wide pale band), deepening to open sea
+    // (apronWaterMagnitude), shaded as WaterLayer's off-map plane, which
+    // takes over as open sea at the ring's rim (seamless).
+    if (dOut > 0.0) {
+      float nz = 0.6 * valueNoise(p * 0.03 + vec2(3.1, 9.7))
+        + 0.4 * valueNoise(p * 0.09 + vec2(7.3, 1.9));
+      float reach = max(0.0, uEdgeReach * (0.15 + 1.85 * smoothstep(0.25, 0.75, nz)
+        + 0.3 * (valueNoise(p * 0.37 + vec2(5.2, 4.4)) - 0.5)));
+      float magM = mix(
+        mix(shoreValue(t4.x), shoreValue(t4.y), w.x),
+        mix(shoreValue(t4.z), shoreValue(t4.w), w.x),
+        w.y);
+      float magA = min(max(max(magM, 0.0), dOut - reach), 16.0);
+      magA = mix(magA, 16.0, smoothstep(reach + 0.5 * uEdgeReach, reach + uEdgeReach + 8.0, dOut));
+      vec4 wtr = shadeWater(p, magA, V, tpp, uTime);
+      vec3 seabed = seabedAlbedo(magA * shoreViewScale(tpp)) * diffuseLight(UP);
+      col = mix(seabed, wtr.rgb, wtr.a) * mix(1.0, 0.6, uAltView);
+      // Virtual land: anti-aliased over a pixel around the virtual coast.
+      float cover = land ? clamp((reach - dOut) / max(tpp, 1e-3) + 0.5, 0.0, 1.0) : 0.0;
+      if (cover > 0.0) {
+        float fillFade = smoothstep(0.0, max(1.5, 6.0 * tpp), dOut);
+        vec3 lc = shadeLandTile(pt, tile, f, tb, t4, b, w, nw, UP, vWorld.y, fw, dp, tpp, detail, close, max(fillFade, 1e-3));
+        float margin = smoothstep(0.0, max(reach, 1.0), dOut);
+        lc = mix(lc, vec3(luma(lc)), 0.5 * margin) * ((1.0 - 0.2 * margin) * mix(1.0, 0.7, uAltView));
+        col = mix(col, mix(lc, col, 0.45 * margin + 0.3 * smoothstep(0.5 * reach, reach, dOut)), cover);
+      }
+    } else
+    // ---- END lot 3: map-edge apron
     if (!land) {
       col = shadeWaterTile(p, t4, w, V, tpp);
     } else {
-      col = shadeLandTile(p, tile, f, tb, t4, w, nw, nMesh, fw, dp, tpp, detail, close);
+      col = shadeLandTile(p, tile, f, tb, t4, b, w, nw, nMesh, hRef, fw, dp, tpp, detail, close, 0.0);
     }
     // ---- BEGIN effect trails composite (boat / nuke trails, EffectTrails.ts):
     // the trail colour lit flat, over the shaded ground at trailAlpha, where
@@ -558,8 +849,14 @@ void main() {
     // relief rises above sea level; WaterLayer paints the same elsewhere).
     // Under the surface overlays (the sea plane draws those over the water).
     // A uniform branch: free while no tile holds a trail.
-    if (uTrailsOn > 0.5 && (land || vWorld.y > 0.0)) {
+    if (uTrailsOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0)) {
       vec4 tr = effectTrail(tile, p, uAltView > 0.5);
+      // Lot 3 (item 5): over fallout a trail is faint and greyed, so the
+      // bombs' ground tracks do not read as green streaks on the ash.
+      if (tr.a > 0.0 && (texelFetch(uTiles, tile, 0).r & 0x2000u) != 0u) {
+        tr.rgb = mix(tr.rgb, vec3(dot(tr.rgb, vec3(0.299, 0.587, 0.114))), 0.75);
+        tr.a *= 0.35;
+      }
       col = mix(col, srgbToLinear(tr.rgb) * diffuseLight(UP), tr.a);
     }
     // ---- END effect trails composite
@@ -568,7 +865,7 @@ void main() {
     // where this mesh is the visible surface: land, and water tiles where the
     // relief rises above sea level (elsewhere the sea-level overlay plane
     // draws it above the water). A uniform branch: free while off.
-    if (uOverlayOn > 0.5 && (land || vWorld.y > 0.0)) {
+    if (uOverlayOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0)) {
       vec4 ov = surfaceOverlay(p, fw);
       col = col * (1.0 - ov.a) + ov.rgb;
     }

@@ -6,6 +6,7 @@
  */
 import * as THREE from "three";
 import { afterEach, describe, expect, it } from "vitest";
+import { createRenderSettings } from "../../../src/client/render/gl/RenderSettings";
 import { CameraRig } from "../../../src/client/render/three/CameraRig";
 import { HeightField } from "../../../src/client/render/three/HeightField";
 import {
@@ -15,9 +16,13 @@ import {
   RAIL_BUDGET_MS,
   RAIL_DIR_X,
   RAIL_DIR_Z,
+  RAIL_FADE_GAIN,
+  RAIL_FADE_RANGE,
+  RAIL_MIN_ZOOM,
   railDetailWanted,
   railHalfDirections,
   railSlotCapacity,
+  railStripLook,
   RailTracks,
   writeRailPieceMatrix,
 } from "../../../src/client/render/three/RailTracks";
@@ -266,7 +271,7 @@ describe("RailTracks incremental rebuilds", () => {
     const { scene, rails, hf } = setup(W, H);
     const st = network();
     rails.set(st);
-    rails.update(rigFrame(W, H, hf, W / 2, H / 2, 1));
+    rails.update(rigFrame(W, H, hf, W / 2, H / 2, 1.8));
     expect(rails.pieces).toBe(2 * railTiles(st));
     expect(pieceKeys(mesh(scene, "rails"))).toEqual(expectedKeys(st, W));
     const s = rails.stats();
@@ -283,7 +288,7 @@ describe("RailTracks incremental rebuilds", () => {
   it("rebuilds only the blocks whose tiles changed", () => {
     const { scene, rails, hf } = setup(W, H);
     const st = network();
-    const f = rigFrame(W, H, hf, W / 2, H / 2, 1);
+    const f = rigFrame(W, H, hf, W / 2, H / 2, 1.8);
     rails.set(st);
     rails.update(f);
     const strip = mesh(scene, "rails");
@@ -317,7 +322,7 @@ describe("RailTracks incremental rebuilds", () => {
       clock: () => t++,
     });
     const st = network();
-    const f = rigFrame(W, H, hf, W / 2, H / 2, 1);
+    const f = rigFrame(W, H, hf, W / 2, H / 2, 1.8);
     rails.set(st);
     rails.update(f);
     const first = rails.stats();
@@ -336,7 +341,7 @@ describe("RailTracks incremental rebuilds", () => {
   it("re-drapes only the blocks under a terrain patch", () => {
     const { scene, rails, hf } = setup(W, H);
     const st = network();
-    const f = rigFrame(W, H, hf, W / 2, H / 2, 1);
+    const f = rigFrame(W, H, hf, W / 2, H / 2, 1.8);
     rails.set(st);
     rails.update(f);
     // Flatten a 6×6 patch to sea level near (140, 10) (on the first line).
@@ -365,7 +370,7 @@ describe("RailTracks incremental rebuilds", () => {
   it("moves outgrown blocks and compacts the strip buffer", () => {
     const { scene, rails, hf } = setup(W, H, { blockSize: 16 });
     const st = new Uint8Array(W * H);
-    const f = rigFrame(W, H, hf, W / 2, H / 2, 1);
+    const f = rigFrame(W, H, hf, W / 2, H / 2, 1.8);
     // Grow 36 blocks one tile per row at a time: each outgrows its slot
     // again and again, leaving holes until the buffer is compacted.
     for (let step = 0; step < 40; step++) {
@@ -393,7 +398,7 @@ describe("RailTracks incremental rebuilds", () => {
     // blocks, so the upload ranges are not collapsed into one.
     const { scene, rails, hf } = setup(W, H);
     const st = new Uint8Array(W * H);
-    const f = rigFrame(W, H, hf, W / 2, H / 2, 1);
+    const f = rigFrame(W, H, hf, W / 2, H / 2, 1.8);
     const gpu = new GpuMirror();
     // A dense block built first (low slots), then a single tile in block 0
     // and a block that grows one row per step (moves, holes, compactions).
@@ -559,5 +564,80 @@ describe("RailTracks on a late-game World network (loose bounds)", () => {
     // Loose wall-clock bound (CI machines vary): far below the 21-47 ms
     // stalls of the full rebuild this replaces.
     expect(rails.stats().jsMsMax).toBeLessThan(15);
+  });
+});
+
+describe("RailTracks strip fade (default renderer semantics, lot 3)", () => {
+  it("uses the default renderer's railroad thresholds", () => {
+    // RailroadPass: invisible at railMinZoom - railFadeRange device px per
+    // tile and below, full from railMinZoom.
+    const rs = createRenderSettings().railroad;
+    expect(RAIL_MIN_ZOOM).toBe(rs.railMinZoom);
+    expect(RAIL_FADE_RANGE).toBe(rs.railFadeRange);
+  });
+
+  it("fades the strips out below 3 device px per tile, by device px", () => {
+    // Full map (0.7 CSS px per tile) on a 1x screen: hidden.
+    expect(railStripLook(0.7, 1)).toMatchObject({ visibility: 0, opacity: 0 });
+    expect(railStripLook(1, 1).visibility).toBe(0);
+    // Default zoom (1.8): visibility 40% as the default; the strip, half
+    // as wide as the default's line, at 1.5 x 40% of the lot-1 light strip
+    // (55%): 33%.
+    const def = railStripLook(1.8, 1);
+    expect(def.visibility).toBeCloseTo(0.4, 9);
+    expect(def.opacity).toBeCloseTo(RAIL_FADE_GAIN * 0.4 * 0.55, 9);
+    // The lot-1 look (55%) again from ~2.3 device px per tile.
+    expect(railStripLook(2.4, 1).opacity).toBeCloseTo(
+      0.55 + 0.45 * railStripLook(2.4, 1).colorT,
+      9,
+    );
+    expect(def.colorT).toBe(0);
+    // 3 device px and up: the lot-1 ramp unchanged (ballast, opaque at 5).
+    expect(railStripLook(3, 1).visibility).toBe(1);
+    expect(railStripLook(5, 1)).toMatchObject({
+      visibility: 1,
+      colorT: 1,
+      opacity: 1,
+    });
+    // A 2x screen reaches the same device px at half the CSS zoom.
+    expect(railStripLook(0.9, 2).visibility).toBeCloseTo(
+      railStripLook(1.8, 1).visibility,
+      9,
+    );
+    expect(railStripLook(1.5, 2).visibility).toBe(1);
+    // Monotonic in the zoom.
+    let prev = -1;
+    for (let z = 0.5; z <= 8; z += 0.1) {
+      const o = railStripLook(z, 1).opacity;
+      expect(o).toBeGreaterThanOrEqual(prev - 1e-12);
+      prev = o;
+    }
+  });
+
+  it("does not draw the strips while faded out, and keeps rebuilding", () => {
+    const W = 256;
+    const H = 256;
+    const { scene, rails, hf } = setup(W, H);
+    const st = new Uint8Array(W * H);
+    addRailroad(st, railPath(10, 20, 240, 20, W, false, true), W);
+    rails.set(st);
+    // Full map: no strip draw, no triangles, pieces still built.
+    rails.update(rigFrame(W, H, hf, W / 2, H / 2, 0.7));
+    const strip = mesh(scene, "rails");
+    expect(strip.visible).toBe(false);
+    expect(rails.stats().triangles).toBe(0);
+    expect(rails.pieces).toBe(2 * railTiles(st));
+    const material = strip.material as THREE.MeshStandardMaterial;
+    expect(material.opacity).toBe(0);
+    // An edit while hidden is applied, and shows once zoomed in.
+    addRailroad(st, railPath(10, 60, 240, 60, W, false, true), W);
+    rails.set(st);
+    rails.update(rigFrame(W, H, hf, W / 2, H / 2, 0.7));
+    expect(rails.pieces).toBe(2 * railTiles(st));
+    rails.update(rigFrame(W, H, hf, W / 2, H / 2, 1.8));
+    expect(mesh(scene, "rails").visible).toBe(true);
+    expect(material.opacity).toBeCloseTo(railStripLook(1.8, 1).opacity, 9);
+    expect(rails.stats().triangles).toBe(mesh(scene, "rails").count * 2);
+    expect(pieceKeys(mesh(scene, "rails"))).toEqual(expectedKeys(st, W));
   });
 });

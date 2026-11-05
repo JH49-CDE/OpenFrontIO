@@ -226,19 +226,21 @@ describe("UnitLayer nuke ribbons", () => {
     const units = (k: number) =>
       new Map(
         [
+          // Bombs fly ~10 tiles per tick (EngineConfig.nukeSpeed): their
+          // trail starts behind the model's tail.
           unit({
             id: 1,
-            pos: ref(10 + k, 20),
-            lastPos: ref(9 + k, 20),
-            targetTile: ref(50, 20),
+            pos: ref(12 + 8 * k, 20),
+            lastPos: ref(4 + 8 * k, 20),
+            targetTile: ref(60, 20),
           }),
           unit({
             id: 2,
             ownerID: OTHER,
             unitType: "Hydrogen Bomb",
-            pos: ref(10 + k, 40),
-            lastPos: ref(9 + k, 40),
-            targetTile: ref(50, 40),
+            pos: ref(12 + 8 * k, 40),
+            lastPos: ref(4 + 8 * k, 40),
+            targetTile: ref(60, 40),
           }),
           unit({
             id: 3,
