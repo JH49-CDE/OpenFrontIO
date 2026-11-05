@@ -199,12 +199,14 @@ describe("fallout look (lot 3, item 5)", () => {
     expect(src).not.toMatch(/\bn = /);
     expect(src).not.toMatch(/\bao\b/);
     expect(src).not.toMatch(/\bshading\b/);
-    expect(src).toContain("albedo = mix(farA, burnt, near);");
+    expect(src).toContain(
+      "albedo = near >= 1.0 ? burnt : mix(farA, burnt, near);",
+    );
     // No neon sheet: the even glow is faint zoomed out and gone close up.
     expect(src).toContain("mix(0.025, 0.0, near)");
     // One hue family: the far look is the ash, darker, lightly tinted.
-    expect(src).toContain("vec3 farA = mix(ash * 0.78, sick * 0.6,");
-    expect(src).toContain("vec3 burnt = ash;");
+    expect(src).toContain("farA = mix(ash * 0.78, sick * 0.6,");
+    expect(src).toContain("burnt = ash;");
     // Over fallout the bombs' ground tracks are faint and greyed.
     expect(TERRAIN_FRAG).toMatch(
       /if \(tr\.a > 0\.0 && \(texelFetch\(uTiles, tile, 0\)\.r & 0x2000u\) != 0u\) \{\s+tr\.rgb = mix\(tr\.rgb, vec3\(dot\(tr\.rgb, vec3\(0\.299, 0\.587, 0\.114\)\)\), 0\.75\);\s+tr\.a \*= 0\.35;/,
@@ -306,10 +308,10 @@ describe("smooth relief close up (lot 3, item 9)", () => {
     );
     // Close up, on the map, on land: the smooth shading normal.
     expect(TERRAIN_FRAG).toContain(
-      "if (land && close > 0.0 && dOut <= 0.0) {\n      vec4 rs = reliefSmooth(p);",
+      "if (land && close > 0.0 && dOut <= 0.0) {\n    vec4 rs = reliefSmooth(p);",
     );
     expect(TERRAIN_FRAG).toContain(
-      "vec4 bs = close > 0.0 ? tileBspline(b, w, t4) : vec4(0.0, 0.0, 0.0, -1.0);",
+      "vec4 bs = close > 0.0 ? tileBspline(b, w) : vec4(0.0, 0.0, 0.0, -1.0);",
     );
     // The rock / snow lines follow the smooth upland elevation.
     expect(TERRAIN_FRAG).toContain("if (bs.w >= 0.0) elev = bs.w;");

@@ -159,22 +159,29 @@ function triangleNormal(
 }
 
 describe("TerrainLayer geometry", () => {
-  it("is the HeightField grid plus outward-facing edge skirts and the apron", () => {
+  it("is the HeightField grid plus the apron, every triangle facing up", () => {
     const { ctx, heightField: hf } = makeCtx();
+    // The steepest relief there is: a mountain block next to deep sea.
+    for (let y = 4; y < 14; y++) {
+      for (let x = 4; x < 14; x++) hf.terrain[y * W + x] = LAND | 30;
+    }
+    hf.applyRects([{ x: 0, y: 0, w: W, h: H }], hf.terrain.slice());
     const terrain = new TerrainLayer(ctx);
     const geo = meshNamed(ctx, "terrain").geometry;
     const pos = geo.getAttribute("position").array;
+    const nrm = geo.getAttribute("normal").array;
     const index = geo.getIndex()!.array;
     const grid = hf.cols * hf.rows;
-    const skirtVerts = 2 * (2 * hf.cols + 2 * hf.rows);
-    // Grid, skirts, the apron's slope columns (as many as the skirts'),
-    // 4 slope-foot and 4 rim corners.
-    expect(pos.length / 3).toBe(grid + 2 * skirtVerts + 8);
+    const apronColumns = 2 * (2 * hf.cols + 2 * hf.rows);
+    // Grid, the apron's slope columns ([inner, foot] per edge vertex), 4
+    // slope-foot and 4 rim corners. No skirts: since lot 3 the apron hides
+    // the relief's underside, and the vertical walls drawn under it (always
+    // hidden) were removed in the perf triage.
+    expect(pos.length / 3).toBe(grid + apronColumns + 8);
     const gridTris = (hf.cols - 1) * (hf.rows - 1) * 2;
-    const skirtTris = 2 * (2 * (hf.cols - 1) + 2 * (hf.rows - 1));
-    expect(index.length).toBe((gridTris + 2 * skirtTris + 16) * 3);
-
-    for (let t = 0; t < gridTris; t++) {
+    const slopeTris = 2 * (2 * (hf.cols - 1) + 2 * (hf.rows - 1));
+    expect(index.length).toBe((gridTris + slopeTris + 16) * 3);
+    for (let t = 0; t < index.length / 3; t++) {
       const n = triangleNormal(
         pos,
         index[3 * t],
@@ -183,19 +190,13 @@ describe("TerrainLayer geometry", () => {
       );
       expect(n.y).toBeGreaterThan(0); // counter-clockwise from above
     }
-    for (let t = gridTris; t < gridTris + skirtTris; t++) {
-      const [a, b, c] = [index[3 * t], index[3 * t + 1], index[3 * t + 2]];
-      const n = triangleNormal(pos, a, b, c);
-      const cx = (pos[a * 3] + pos[b * 3] + pos[c * 3]) / 3 - W / 2;
-      const cz = (pos[a * 3 + 2] + pos[b * 3 + 2] + pos[c * 3 + 2]) / 3 - H / 2;
-      expect(Math.abs(n.y)).toBeLessThan(1e-9); // vertical wall
-      expect(n.x * cx + n.z * cz).toBeGreaterThan(0); // facing out
+    // No vertex normal comes near horizontal (the terrain shader has no
+    // wall branch any more).
+    let minNy = Infinity;
+    for (let k = 0; k < pos.length / 3; k++) {
+      minNy = Math.min(minNy, nrm[k * 3 + 1]);
     }
-    // Skirt bottoms sit below the deepest seabed.
-    let minY = Infinity;
-    for (let k = grid; k < grid + skirtVerts; k++)
-      minY = Math.min(minY, pos[k * 3 + 1]);
-    expect(minY).toBeLessThan(-ctx.settings.seabedDepth);
+    expect(minNy).toBeGreaterThan(0.1);
     terrain.dispose();
   });
 
@@ -211,9 +212,7 @@ describe("TerrainLayer geometry", () => {
     const index = geo.getIndex()!.array;
     const A = apronWidthTiles(W, H);
     expect(terrain.apronWidth).toBe(A);
-    const grid = hf.cols * hf.rows;
-    const skirtVerts = 2 * (2 * hf.cols + 2 * hf.rows);
-    const first = grid + skirtVerts;
+    const first = hf.cols * hf.rows; // the apron follows the grid
     let maxY = 0;
     for (let k = first; k < pos.length / 3; k++) {
       // Never under the water plane; flat-lit (normal up).
@@ -235,9 +234,8 @@ describe("TerrainLayer geometry", () => {
     // Every apron triangle faces up; their footprint is the ring between
     // the map and the map grown by A on every side, covered once.
     const gridTris = (hf.cols - 1) * (hf.rows - 1) * 2;
-    const skirtTris = 2 * (2 * (hf.cols - 1) + 2 * (hf.rows - 1));
     let area = 0;
-    for (let t = gridTris + skirtTris; t < index.length / 3; t++) {
+    for (let t = gridTris; t < index.length / 3; t++) {
       const [a, b, c] = [index[3 * t], index[3 * t + 1], index[3 * t + 2]];
       for (const v of [a, b, c]) expect(v).toBeGreaterThanOrEqual(first);
       const n = triangleNormal(pos, a, b, c);

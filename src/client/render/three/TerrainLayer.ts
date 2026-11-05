@@ -2,12 +2,13 @@
  * TerrainLayer — the relief mesh, with terrain colours, lighting, territory
  * fill, borders, fallout and coastal water, in ONE draw call.
  *
- * Geometry: the HeightField grid (bounded vertex count) plus vertical
- * "skirts" down the four map edges, so a tilted view never looks under the
- * relief, plus an apron around the map (lot 3, `apronWidthTiles` wide): a
- * strip per edge sloping from the edge vertices down to `COAST_LIFT` over
- * `APRON_SLOPE_TILES` (so land at the edge meets it without a cliff), then
- * flat. On it the shader continues the land past the border as its mirror
+ * Geometry: the HeightField grid (bounded vertex count) plus an apron
+ * around the map (lot 3, `apronWidthTiles` wide): a strip per edge sloping
+ * from the edge vertices down to `COAST_LIFT` over `APRON_SLOPE_TILES` (so
+ * land at the edge meets it without a cliff), then flat; it also keeps a
+ * tilted view from looking under the relief (the vertical edge "skirts"
+ * that did so before lot 3 were left under it, always hidden, and are
+ * gone since the perf triage). On it the shader continues the land past the border as its mirror
  * image, breaking up into the sea along a noisy virtual coast, so the map
  * no longer ends in a straight cut (the water beyond matches WaterLayer's
  * plane). Cells that hold any land tile are kept at or above
@@ -143,8 +144,6 @@ const MIN_BORDER_TILES = 0.2;
  * shading, and highlighted ones (3x) pass the bloom threshold and glow.
  */
 const BORDER_GLOW = 0.25;
-/** Skirt bottom, below the deepest seabed. */
-const SKIRT_EXTRA_DEPTH = 1;
 
 /**
  * Tile-state uploads per frame outside the spawn phase: at most 8
@@ -225,11 +224,15 @@ function createTerrainUniforms() {
 }
 type TerrainUniforms = ReturnType<typeof createTerrainUniforms> & WaterUniforms;
 
-/** One map edge's skirt: which grid vertices it hangs from, and its facing. */
-interface SkirtEdge {
-  /** Grid vertex index of each skirt column, in edge order. */
+/**
+ * One map edge's apron slope: the grid vertices along the edge, its first
+ * vertex (columns are [inner, foot] pairs, one per edge vertex) and its
+ * outward direction.
+ */
+interface ApronEdge {
+  /** Grid vertex index of each column, in edge order. */
   grid: Int32Array;
-  /** First skirt vertex (columns are [top, bottom] pairs). */
+  /** First apron vertex of the edge. */
   base: number;
   nx: number;
   nz: number;
@@ -275,20 +278,19 @@ export class TerrainLayer implements ReliefSurface {
   /** Boat / nuke trails and the effect palette (shared, see the header). */
   readonly trails: EffectTrails;
 
-  // Relief geometry (grid vertices first, then skirt [top, bottom] pairs).
+  // Relief geometry (grid vertices first, then the apron).
   private readonly positions: Float32Array;
   private readonly normals: Float32Array;
   private readonly gridCount: number;
-  private readonly skirts: SkirtEdge[] = [];
-  private readonly skirtVertexCount: number;
-  private readonly skirtBottomY: number;
-  /** First apron vertex (after the skirts) and the apron width, tiles. */
+  /** Vertices of the apron's slope columns (2 per edge vertex). */
+  private readonly apronColumnVertexCount: number;
+  /** First apron vertex (after the grid) and the apron width, tiles. */
   private readonly apronBase: number;
   readonly apronWidth: number;
   /** Mean reach (tiles) of the land past the map edge (`edgeReachTiles`). */
   private readonly edgeReach: number;
-  /** Apron slope columns ([inner, foot] pairs) per edge, like `skirts`. */
-  private readonly apronEdges: SkirtEdge[] = [];
+  /** Apron slope columns ([inner, foot] pairs) per edge. */
+  private readonly apronEdges: ApronEdge[] = [];
   /** Zoom (CSS px per tile) and pixel ratio of the last frame. */
   private zoom = 1.8;
   private dpr = 1;
@@ -344,12 +346,11 @@ export class TerrainLayer implements ReliefSurface {
     this.cellsY = hf.rows - 1;
     this.cellLand = new Uint8Array(this.cellsX * this.cellsY);
     this.gridCount = hf.cols * hf.rows;
-    this.skirtVertexCount = 2 * (2 * hf.cols + 2 * hf.rows);
-    this.skirtBottomY = -(hf.seabedDepth + SKIRT_EXTRA_DEPTH);
-    this.apronBase = this.gridCount + this.skirtVertexCount;
+    this.apronColumnVertexCount = 2 * (2 * hf.cols + 2 * hf.rows);
+    this.apronBase = this.gridCount;
     this.apronWidth = apronWidthTiles(this.W, this.H);
-    // Slope columns (2 per skirt column), 4 slope-foot corners, 4 rim corners.
-    const vertexCount = this.apronBase + this.skirtVertexCount + 8;
+    // Slope columns (2 per edge vertex), 4 slope-foot corners, 4 rim corners.
+    const vertexCount = this.apronBase + this.apronColumnVertexCount + 8;
     this.positions = new Float32Array(vertexCount * 3);
     this.normals = new Float32Array(vertexCount * 3);
     this.reliefData = new Uint16Array(this.gridCount * 4);
@@ -813,7 +814,7 @@ export class TerrainLayer implements ReliefSurface {
 
   // ---- Geometry ----
 
-  /** X/Z of all vertices, skirt normals and the index buffer (once). */
+  /** X/Z of all vertices, the apron's normals and the index buffer (once). */
   private buildStaticGeometry(): void {
     const hf = this.hf;
     const cols = hf.cols;
@@ -828,7 +829,7 @@ export class TerrainLayer implements ReliefSurface {
       }
     }
 
-    // Skirts: north (z = 0), south (z = H), west (x = 0), east (x = W),
+    // Map edges: north (z = 0), south (z = H), west (x = 0), east (x = W),
     // each running along +X or +Z.
     const edgeDefs: {
       n: number;
@@ -841,28 +842,11 @@ export class TerrainLayer implements ReliefSurface {
       { n: rows, at: (s) => s * cols, nx: -1, nz: 0 },
       { n: rows, at: (s) => s * cols + cols - 1, nx: 1, nz: 0 },
     ];
-    let base = this.gridCount;
-    for (const e of edgeDefs) {
-      const grid = new Int32Array(e.n);
-      for (let s = 0; s < e.n; s++) {
-        grid[s] = e.at(s);
-        for (const v of [base + 2 * s, base + 2 * s + 1]) {
-          pos[v * 3] = pos[grid[s] * 3];
-          pos[v * 3 + 2] = pos[grid[s] * 3 + 2];
-          this.normals[v * 3] = e.nx;
-          this.normals[v * 3 + 1] = 0;
-          this.normals[v * 3 + 2] = e.nz;
-        }
-        pos[(base + 2 * s + 1) * 3 + 1] = this.skirtBottomY;
-      }
-      this.skirts.push({ grid, base, nx: e.nx, nz: e.nz });
-      base += 2 * e.n;
-    }
 
-    // Apron (lot 3): per edge, [inner, foot] columns under the skirt
-    // columns: inner on the edge vertex (height set by refreshRelief, at
-    // least COAST_LIFT), foot APRON_SLOPE_TILES further out at COAST_LIFT;
-    // then the slope-foot corners and the rim corners, flat at COAST_LIFT.
+    // Apron (lot 3): per edge, an [inner, foot] column per edge vertex:
+    // inner on the edge vertex (height set by refreshRelief, at least
+    // COAST_LIFT), foot APRON_SLOPE_TILES further out at COAST_LIFT; then
+    // the slope-foot corners and the rim corners, flat at COAST_LIFT.
     // Normals point up (the shader lights the apron flat).
     const A = this.apronWidth;
     const S = APRON_SLOPE_TILES;
@@ -875,12 +859,14 @@ export class TerrainLayer implements ReliefSurface {
       this.normals[v * 3 + 1] = 1;
       this.normals[v * 3 + 2] = 0;
     };
-    for (const sk of this.skirts) {
-      this.apronEdges.push({ grid: sk.grid, base: av, nx: sk.nx, nz: sk.nz });
-      for (let q = 0; q < sk.grid.length; q++) {
-        const g = sk.grid[q] * 3;
+    for (const e of edgeDefs) {
+      const grid = new Int32Array(e.n);
+      for (let s = 0; s < e.n; s++) grid[s] = e.at(s);
+      this.apronEdges.push({ grid, base: av, nx: e.nx, nz: e.nz });
+      for (let q = 0; q < grid.length; q++) {
+        const g = grid[q] * 3;
         setApron(av++, pos[g], COAST_LIFT, pos[g + 2]);
-        setApron(av++, pos[g] + sk.nx * S, COAST_LIFT, pos[g + 2] + sk.nz * S);
+        setApron(av++, pos[g] + e.nx * S, COAST_LIFT, pos[g + 2] + e.nz * S);
       }
     }
     const footCorner = av;
@@ -908,14 +894,14 @@ export class TerrainLayer implements ReliefSurface {
       );
     }
 
-    // Index: grid cells, counter-clockwise seen from above (+Y), then skirt
-    // quads facing outwards, then the apron (slope quads, corner patches and
-    // the flat ring's 4 trapezoids, all facing up).
+    // Index: grid cells, counter-clockwise seen from above (+Y), then the
+    // apron (slope quads, corner patches and the flat ring's 4 trapezoids,
+    // all facing up).
     const cells = (cols - 1) * (rows - 1);
-    let skirtQuads = 0;
-    for (const s of this.skirts) skirtQuads += s.grid.length - 1;
+    let slopeQuads = 0;
+    for (const e of this.apronEdges) slopeQuads += e.grid.length - 1;
     const index = new Uint32Array(
-      (cells + 2 * skirtQuads) * 6 + APRON_EXTRA_TRIANGLES * 3,
+      (cells + slopeQuads) * 6 + APRON_EXTRA_TRIANGLES * 3,
     );
     let o = 0;
     for (let j = 0; j < rows - 1; j++) {
@@ -930,35 +916,6 @@ export class TerrainLayer implements ReliefSurface {
         index[o++] = b;
         index[o++] = c;
         index[o++] = d;
-      }
-    }
-    for (const s of this.skirts) {
-      // The edge runs along e = +X or +Z; triangle (top_a, top_b, bot_a)
-      // has normal e × (0, -1, 0) = (e.z, 0, -e.x). Flip the winding when
-      // that points into the map instead of along the outward normal.
-      const ex = s.nz !== 0 ? 1 : 0;
-      const ez = s.nx !== 0 ? 1 : 0;
-      const flip = ez * s.nx - ex * s.nz < 0;
-      for (let q = 0; q < s.grid.length - 1; q++) {
-        const ta = s.base + 2 * q;
-        const ba = ta + 1;
-        const tb = ta + 2;
-        const bb = ta + 3;
-        if (!flip) {
-          index[o++] = ta;
-          index[o++] = tb;
-          index[o++] = ba;
-          index[o++] = tb;
-          index[o++] = bb;
-          index[o++] = ba;
-        } else {
-          index[o++] = ta;
-          index[o++] = ba;
-          index[o++] = tb;
-          index[o++] = tb;
-          index[o++] = ba;
-          index[o++] = bb;
-        }
       }
     }
     // Apron triangles, wound counter-clockwise seen from above (normal +Y):
@@ -984,8 +941,8 @@ export class TerrainLayer implements ReliefSurface {
     // to it and the slope-foot corner. Edges: north, south (along +X), west,
     // east (along +Z).
     const [north, south, west, east] = this.apronEdges;
-    const first = (e: SkirtEdge) => e.base;
-    const last = (e: SkirtEdge) => e.base + 2 * (e.grid.length - 1);
+    const first = (e: ApronEdge) => e.base;
+    const last = (e: ApronEdge) => e.base + 2 * (e.grid.length - 1);
     const patches: [number, number, number][] = [
       [first(north), first(west), footCorner],
       [last(north), first(east), footCorner + 1],
@@ -1006,9 +963,9 @@ export class TerrainLayer implements ReliefSurface {
   }
 
   /**
-   * Recompute vertex heights (with the coast lift), normals and skirt tops
-   * for the HeightField vertex range `r` (null = everything), and queue the
-   * matching buffer uploads.
+   * Recompute vertex heights (with the coast lift), normals and the apron's
+   * inner row for the HeightField vertex range `r` (null = everything), and
+   * queue the matching buffer uploads.
    */
   private refreshRelief(r: GridRange | null): void {
     const hf = this.hf;
@@ -1057,13 +1014,8 @@ export class TerrainLayer implements ReliefSurface {
       }
     }
     this.computeNormals(nRange);
-    // Skirt tops follow the edge vertices (a few thousand: just redo all),
-    // and so does the apron's inner row (never below COAST_LIFT).
-    for (const s of this.skirts) {
-      for (let q = 0; q < s.grid.length; q++) {
-        pos[(s.base + 2 * q) * 3 + 1] = pos[s.grid[q] * 3 + 1];
-      }
-    }
+    // The apron's inner row follows the edge vertices, never below
+    // COAST_LIFT (a few thousand: just redo all).
     for (const e of this.apronEdges) {
       for (let q = 0; q < e.grid.length; q++) {
         pos[(e.base + 2 * q) * 3 + 1] = Math.max(
@@ -1099,8 +1051,11 @@ export class TerrainLayer implements ReliefSurface {
           nRange.j0 * cols * 3,
           (nRange.j1 - nRange.j0 + 1) * cols * 3,
         );
-        // Skirts and the apron's slope columns right after them.
-        attr.addUpdateRange(this.gridCount * 3, 2 * this.skirtVertexCount * 3);
+        // The apron's slope columns, right after the grid.
+        attr.addUpdateRange(
+          this.apronBase * 3,
+          this.apronColumnVertexCount * 3,
+        );
       }
       attr.needsUpdate = true;
     }

@@ -701,7 +701,10 @@ the GLSL is in delimited `lot 3` blocks of `shaders/terrain.ts` and
   over `APRON_SLOPE_TILES` (8), so land at the edge meets it without a
   cliff, then flat to `apronWidthTiles` (World: (2 + 0.15 + 1) × 18 + 8 =
   65 tiles). Picking is unchanged (rays off the map return NaN, as
-  before; the apron is not in the height field). The skirts stay under it.
+  before; the apron is not in the height field). It also keeps tilted
+  views from looking under the relief: the vertical skirts that hung from
+  the map edges before were left under it, always hidden but still drawn
+  (and shaded) first, and the perf triage removed them.
   - **Lookups**: the shader looks tiles up at the point mirrored at the map
     border (`mirrorIntoMap`), so the land and coasts continue past the edge
     (no stretched edge row), after warping the point more with the
@@ -756,19 +759,23 @@ the GLSL is in delimited `lot 3` blocks of `shaders/terrain.ts` and
   territory, halo and apron changes (the apron is in the terrain draw);
   railways −1 draw call at and below 1 device px per tile. Triangles: the
   apron adds 2 × (2 (cols − 1) + 2 (rows − 1)) + 16 = 6,016 (World, high
-  quality; 3,016 with `three_quality=low`); the hidden strips save their
-  ~2.5 triangles per piece (slack included). Texture memory:
-  none added. JS: `territoryLook` and three uniform writes per frame, the
-  apron's inner row refreshed with the skirt tops on terrain patches.
+  quality; 3,016 with `three_quality=low`), and since the perf triage the
+  skirts it hides are gone (−6,000 / −3,000): +16 triangles over lot 2;
+  the hidden strips save their ~2.5 triangles per piece (slack included).
+  Texture memory: none added. JS: `territoryLook` and three uniform writes per frame, the
+  apron's inner row refreshed with the edge vertices on terrain patches.
   Per fragment, by static count: owned land, zoomed out: one more
   `diffuseLight` (ALU, a uniform branch, skipped from 5 px per tile);
   water: one smoothstep; apron fragments run the terrain shader instead
   of the water plane's (which the apron hides): 5 value noises (20
-  hashes: 2 for the warp, 3 for the reach), the 4 terrain fetches the
-  terrain shader always does, the water shading, plus the land shading
-  where the virtual land is; no border fetches there. Map fragments: a
-  min and a smoothstep for the edge flattening (a normalize within 3
-  tiles of the edge). The edge tiles no longer test bounds in `ownerAt`.
+  hashes: 2 for the warp, 3 for the reach), the 5 terrain fetches the
+  terrain shader always does (the tile, the 4 bilinear neighbours), the
+  water shading, plus the land shading where the virtual land is; no
+  border fetches there. Map fragments: a min and a smoothstep for the edge
+  flattening (a normalize within 3 tiles of the edge). The edge tiles no
+  longer test bounds in `ownerAt`. The apron shares the map's one call of
+  `shadeLandTile` and of `shadeWater` (perf triage: its own calls had
+  inlined a second copy of both, see "Performance notes").
 
 - **Measured** (headless, SwiftShader, 1920 × 1032, high quality; the
   same recorded game state pushed through the facade before and after:
@@ -782,7 +789,8 @@ the GLSL is in delimited `lot 3` blocks of `shaders/terrain.ts` and
   | 1.8 / 3 / 6, 35k pieces     | unchanged                      | +6.0k (apron)                    | unchanged               |
   | Every view, 44-player state | −1 at full map, else unchanged | +6.0k (apron), −4.1k at full map | 4.1k → 0 at full map    |
 
-  Terrain triangles 1,006,000 → 1,012,016 at every zoom. GPU time needs a
+  Terrain triangles 1,006,000 → 1,012,016 at every zoom (1,006,016 since
+  the perf triage removed the hidden skirts). GPU time needs a
   real GPU (`three_perf=1`): the apron's fragments replace the sea plane's
   around the map (similar cost), the rest is a few ALU per fragment.
 
@@ -1057,12 +1065,20 @@ the tile: no colour or glow outside it, and its edge is the tile edge.
   35% and 75% desaturated on fallout tiles, so they no longer read as
   green fallout streaks on the ash (the default renderer's neon sheet hid
   them).
-- Costs: per fallout fragment 5 value-noise lookups (20 hashes), 2
-  hotspot hashes, 4 tile-texture fetches for the rim, and 4 more only
-  inside a hotspot disc (~1% of the zone); 3 ember hashes on the ~2-5% of
-  tiles holding an ember; one tile fetch where a ground track is drawn
-  (to dim it over fallout). Off fallout the block is skipped (a branch on the tile
-  bit; SwiftShader runs both sides). Smoke: +1 draw call and ≤ 36 quads
+- Costs, per fallout fragment (each part behind a branch on its weight
+  since the perf triage, so a GPU skips what is mixed away): 4 tile-texture
+  fetches for the rim at every zoom; the far look's 1 value noise while
+  `near` < 1 (from ~5.5 px per tile on it is skipped); the near look's 4
+  value noises (16 hashes) while `near` > 0, i.e. from ~2 px per tile, not
+  at full map or the default zoom (they were computed and mixed away there
+  before); the hotspot test (1-2 hashes) only while hotspots can show
+  (from 2 px per tile, on flat enough ground), and its 4 fetches only
+  inside a disc (~1% of the zone); the ember hash only from 4 px per tile,
+  2 more on the ~2-5% of tiles holding an ember. The territory fill is no
+  longer computed under fallout (it was replaced anyway). One tile fetch
+  where a ground track is drawn (to dim it over fallout). Off fallout the
+  block is skipped (a branch on the tile bit; SwiftShader runs every block
+  of the program anyway). Smoke: +1 draw call and ≤ 36 quads
   (72 triangles) while any puff shows, ≤ 0.2 ms JS per frame measured
   headless (36 emitter picks: ~0.03 ms). Field: 2 MB of tile bytes plus 3
   arrays of 31k cells (~0.3 MB) on World.
@@ -1090,8 +1106,10 @@ contours, a few dozen px wide. Now:
   and default-zoom water is unchanged; close up, the waves, fresnel and
   foam are those of lot 2.
 - Cost (water plane and coastal terrain fragments while glints show): 2
-  value-noise lookups with gradient (8 hashes), a few trig ops for the
-  warp; no texture fetch.
+  value-noise lookups with gradient (8 hashes) and their trig, and the
+  glints' share of each live wave octave (a divide and a smoothstep, only
+  computed while glints show since the perf triage); at every zoom the
+  phase warp (2 sin) on all water fragments; no texture fetch.
 
 ### Smooth relief close up (`TerrainLayer.ts`, `shaders/terrain.ts`)
 
@@ -1110,15 +1128,21 @@ silhouettes, the projector and picking, is unchanged.
   bilinear fetches (`reliefSmooth`; `cubicBsplineTaps`, `reliefGridCoord`)
   for the shading normal and the reference height of the concavity shade.
 - **Tile heights**: a quadratic B-spline over the 3 × 3 tiles around the
-  sample point (`tileBspline`; the bilinear 2 × 2 already fetched plus 5
-  tiles; `quadBsplineAt`) gives the detail slope (no jump at tile edges),
-  and the mean upland magnitude the rock and snow lines follow (smooth
-  contours instead of the tile staircase).
+  sample point (`tileBspline`, 9 fetches at constant offsets, 4 of them
+  the bilinear 2 × 2's texels; `quadBsplineAt`) gives the detail slope
+  (no jump at tile edges), and the mean upland magnitude the rock and snow
+  lines follow (smooth contours instead of the tile staircase).
 - **Surface detail**: snow gets wind-combed ripples and a fine grain in its
   bump normals, so the smooth relief does not read as plastic.
-- Cost (land fragments close up): +4 texture fetches (relief) + 5 tile
-  texel fetches, a 3 × 3 weight loop; zoomed out nothing (the branch is on
-  `close`).
+- Cost (land fragments close up): 4 more bilinear fetches (the relief,
+  at an explicit level 0: no implicit derivatives inside the non-uniform
+  branch) and 9 tile texel fetches at constant offsets (4 of them t4's
+  texels, in cache; no local array, which GPUs spill to scratch memory
+  when it is indexed per fragment), a 3 × 3 weight loop; the bilinear tile
+  heights it replaces (4 pow) are skipped once it is fully in (from ~4.5
+  device px per tile). Zoomed out a GPU skips it all (the branch is on
+  `close`); SwiftShader still pays for the code (see "Performance
+  notes").
 
 ### Testing
 
@@ -1480,6 +1504,143 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   samples (the head-glow split vertices included), draw calls unchanged
   (23 at full map, 37 at 4, 31 at 11).
 
+- **Lot 3 perf triage** (shader cost; every change keeps the pixels). In
+  the lot-3 verification a whole-map frame took 24-32 s headless against
+  ~1-7 s before. That is SwiftShader, a CPU renderer: its times are only a
+  proxy and say nothing about FPS. On an idle machine the gap was 10.1 s
+  (lot 2) → 16.5-17.1 s (lot 3), all of it in the terrain draw, and it was
+  program size, not pixel work: SwiftShader runs every block of every
+  branch for every fragment (16 value noises behind a branch never taken
+  cost as much as the same noises taken), and every call site is inlined.
+  Lot 3 had given `shadeLandTile` and `shadeWater`, the two largest
+  functions, a second call site (the apron's), so the terrain program
+  carried two copies of each, and its zoom-weighted blocks (smooth relief,
+  fallout, glitter) are in the program at every zoom. A GPU skips a branch
+  that goes the same way for a whole group of pixels, so what it executes
+  grew much less (below).
+  - **Fixes** (`shaders/terrain.ts`, `shaders/water.ts`, `TerrainLayer.ts`;
+    `ShaderPerfTriage.test.ts`):
+    - one call site each for `shadeLandTile` and `shadeWater` in the
+      terrain shader: the map and the apron select their inputs and share
+      them (`shadeWaterTile` is gone);
+    - work whose weight is 0 behind a branch instead of computed and mixed
+      away: the fallout's near look (4 value noises) while `near` = 0 (full
+      map, default zoom) and its far look (1) while `near` = 1, the hotspot
+      hashes and clearance fetches while hotspots are faded out, the ember
+      hash while embers are; the micro-detail noises (2 value noises with
+      gradient, a cos and a sin) and the whole detail normal (4 pow, 2
+      normalize) while `detail` = 0 (full map on a 1× screen); the bilinear
+      tile heights once the B-spline has replaced them (`smoothW` = 1); the
+      territory fill under fallout (replaced) and past the apron's fade
+      (weight 0); the glints' share of each wave octave while glints are
+      off; the sun disc's `pow(s, 1200)` in the reflected sky (weight 0);
+    - the relief's 4 bilinear taps at an explicit level 0 (`textureLod`;
+      the same result: no mips, linear min and mag filters), so no
+      implicit derivatives sit in a non-uniform branch (undefined in GLSL
+      ES; ANGLE's D3D back end may hoist or flatten such a branch);
+    - `tileBspline` fetches its 3 × 3 tiles at constant offsets instead of
+      filling a `uint[9]` indexed per fragment (scratch memory on most
+      GPUs);
+    - no skirts (−6,000 triangles on World): always under the apron but
+      drawn first in the same draw call, so shaded for nothing in edge
+      views, and their depth won over the apron on a few pixels of the
+      seam (28 isolated pixels, ~20/255 darker than their neighbours, in a
+      tilted view of the south edge; now the apron's colour). The shader's
+      wall branch went with them.
+  - **Headless render time** (SwiftShader, so a proxy for program size and
+    never a GPU time: median of 3 synced renders, 1 × 1 readPixels then
+    `composer.render(0)` then 1 × 1 readPixels; 1920 × 1032, DPR 1, high
+    quality, World; the recorded late state above and the hydrogen-bomb
+    fallout state; game paused, fixed animation clock). "Before" and
+    "after" are two sessions; "lot 2" and "default" are the same states and
+    cameras measured during the triage (`00199ee`, and the default renderer
+    through `GPURenderer.draw`). Spread: ±4% run to run, ±5-10% between
+    two builds of a program:
+
+    | View (CSS px per tile)  | Default | Lot 2  | Lot 3 before | Lot 3 after   | After / lot 2 |
+    | ----------------------- | ------- | ------ | ------------ | ------------- | ------------- |
+    | Late, full map (0.7)    | 1,212   | 10,058 | 16,539       | 11,029 (−33%) | 1.10          |
+    | Late, 1.8               | 1,726   | 5,481  | 8,512        | 6,200 (−27%)  | 1.13          |
+    | Late, 5 (tilted 9°)     | 1,734   | 3,150  | 5,312        | 4,357 (−18%)  | 1.38          |
+    | Late, 11 (tilted 48°)   | 1,714   | 3,288  | 4,954        | 3,704 (−25%)  | 1.13          |
+    | Late, 20 (tilted 50°)   | 1,681   | 2,906  | 4,380        | 3,337 (−24%)  | 1.15          |
+    | Fallout, full map (0.7) | –       | –      | 17,711       | 10,351 (−42%) | –             |
+    | Fallout, 1.8            | 1,656   | 4,622  | 8,152        | 5,034 (−38%)  | 1.09          |
+    | Fallout, 5              | 1,608   | 2,761  | 4,636        | 3,235 (−30%)  | 1.17          |
+    | Fallout, 11             | 1,576   | 2,368  | 4,400        | 3,151 (−28%)  | 1.33          |
+
+    In the "after" session, the lot-3 shaders swapped back in at runtime
+    (same scene, same geometry) took 1.24-1.69× as long in every view and
+    drew the same pixels (0 differing pixels in 24 views: the table's,
+    map edges, a coast, the alt view, fallout at 3 and 20 and at its edge,
+    open water at 4.5, 8 and 20). Canvas dumps of the two sessions match
+    exactly in 22 of the 24 views; the other two differ by the skirt seam
+    (above) and by one fallout smoke puff (its random emitter follows the
+    order the views were taken in; hiding the smoke removes the same
+    pixels). Draw calls are unchanged; triangles −6,000 at every view (the
+    skirts).
+
+  - **What a GPU executes per fragment, lot 3 over lot 2, after the
+    triage.** Full map and default zoom: owned land one more
+    `diffuseLight` (far flatten), every map fragment the edge flattening (a
+    min and a smoothstep); the apron ring (~10% of the screen at full map,
+    only at the map edge otherwise) runs the terrain shader instead of the
+    water plane (5 value noises, 5 tile fetches, the water shading);
+    fallout 4 rim fetches and the far look's noise; water 2 sin (phase
+    warp). From ~2.5 device px per tile, land 4 bilinear relief taps, 9
+    tile fetches (4 in cache) and the 3 × 3 loop (9 pow); from ~2 px per
+    tile, fallout the near look (4 noises) and the hotspot test, from ~4 px
+    its embers; from ~4 px per tile, water the glitter (2 value noises with
+    gradient and their trig). Lot 3 also skips the glint lobes below ~4 px
+    per tile, which lot 2 computed and multiplied by 0.
+  - **Not done**: compile-time variants (`defines`) of the terrain program
+    without the close-up, fallout or apron code (they would bring the
+    headless frame near lot 2's, but switching programs at zoom thresholds
+    risks compile hitches unless every variant is precompiled, and a GPU
+    already skips those blocks); an early-out for the outer apron ring
+    close up (only edge views would gain, and it adds code every fragment
+    pays headless); skipping bloom while nothing crosses its threshold (not
+    lot 3, and proving "nothing" without a visible change is not cheap).
+  - **Pricing lot 3 on a real GPU** (the numbers that matter):
+    `?renderer=three&three_perf=1` in a late game, `__threePerf().gpuMs.avg`
+    (a 120-frame window: wait a few seconds after each change) at full map
+    (0.7 CSS px per tile), 1.8, 5, 11 and 20, over a fallout zone at 1.8,
+    5 and 11, and at a map edge at 1.8; then the same with one feature off
+    at a time from the console (each patch recompiles the terrain program
+    once):
+
+    ```js
+    const t = __webglView.terrain;
+    const w = __webglView.water;
+    const src = new Map(
+      [t.material, w.material].map((m) => [m, m.fragmentShader]),
+    );
+    // Patch (or with no pairs, restore) one material's shader.
+    const off = (m, ...pairs) => {
+      let s = src.get(m);
+      for (const [a, b] of pairs) s = s.split(a).join(b);
+      m.fragmentShader = s;
+      m.needsUpdate = true;
+    };
+    // Smooth relief (normal and tile B-spline):
+    off(
+      t.material,
+      ["if (land && close > 0.0 && dOut <= 0.0) {", "if (false) {"],
+      ["close > 0.0 ? tileBspline(b, w)", "false ? tileBspline(b, w)"],
+    );
+    // Fallout look: off(t.material, ["if (fallout) {", "if (false) {"]);
+    // Far flatten: off(t.material, ["if (owner != 0 && uFarFlatten > 0.0) {", "if (false) {"]);
+    // Glitter: the same pair ["* glitterSlope(p, t, tpp);", "* vec2(0.0);"]
+    // for t.material and w.material.
+    off(t.material);
+    off(w.material); // back
+    // The apron ring: draw the grid only (the water plane shades the ring).
+    t.geometry.setDrawRange(0, (t.grid.cols - 1) * (t.grid.rows - 1) * 6);
+    t.geometry.setDrawRange(0, Infinity); // back
+    ```
+
+    Bloom: `three_bloom=0`.
+
 - Names, troop counts and level badges are pooled DOM elements. The frame
   loop never reads layout, and troop text changes at most every 500 ms per
   label.
@@ -1488,9 +1649,11 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   laptop RTX of the real-GPU test), and the backing store is capped at
   pixel ratio 2. On weak GPUs try `three_quality=low` (canvas MSAA, no
   post-processing chain).
-- The headless harness runs on SwiftShader at about 1.5-4 s per frame, which
-  says nothing about real hardware. Measure with `three_perf=1` on a real
-  GPU.
+- The headless harness runs on SwiftShader at about 2.4-11 s per render
+  late in a game (World, 1920 × 1032, high quality; 1.5-4 s early on),
+  which says nothing about real hardware: its time follows the size of the
+  shader programs (it runs every branch), not the work a GPU executes (see
+  "Lot 3 perf triage"). Measure with `three_perf=1` on a real GPU.
 - `dispose()` releases the WebGL context (`forceContextLoss`), so starting
   game after game in one tab does not pile up contexts (see "When
   `dispose()` runs").
@@ -1551,7 +1714,11 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   ring just over the bloom threshold). Fallout, water glints and smooth
   relief (lot 3): `TerrainSurfaces.test.ts`, `FalloutField.test.ts` and
   additions to `TerrainLayers.test.ts` / `FxLayer.test.ts` (see "Lot 3:
-  fallout, water glints, smooth relief").
+  fallout, water glints, smooth relief"). Perf triage:
+  `ShaderPerfTriage.test.ts` (one call site per shading function, work
+  whose weight is 0 behind branches, relief fetches at level 0, no local
+  array in the tile B-spline, the water's glint share and sun disc only
+  when used) and the skirt-free geometry in `TerrainLayers.test.ts`.
 - Headless checks in `.claude/skills/run-openfront/`:
   - `three-shots.mjs`: screenshots at four zoom levels plus a click test
     while tilted.

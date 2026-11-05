@@ -43,12 +43,16 @@ vec3 diffuseLight(vec3 n) {
 }
 
 // Sky radiance along a unit direction: horizon haze -> zenith blue, with a
-// soft glow and (sunDisc = 1) a small disc around the sun.
+// soft glow and (sunDisc = 1) a small disc around the sun. Callers pass a
+// constant, so the branch folds away: with 0 the disc's pow is not
+// evaluated at all (SwiftShader would, as 0 * pow(s, 1200)).
 vec3 skyRadiance(vec3 dir, float sunDisc) {
   float e = clamp(dir.y, 0.0, 1.0);
   vec3 c = mix(uSkyHorizon, uSkyZenith, pow(e, 0.55));
   float s = max(dot(dir, uSunDir), 0.0);
-  c += uSunTint * (0.25 * pow(s, 24.0) + sunDisc * 4.0 * pow(s, 1200.0));
+  float glow = 0.25 * pow(s, 24.0);
+  if (sunDisc > 0.0) glow += sunDisc * 4.0 * pow(s, 1200.0);
+  c += uSunTint * glow;
   return c;
 }
 
@@ -133,7 +137,7 @@ float waterDepth01(float mag) {
 // 3 once a tile is under ~0.7 px, so the coastal halo is a thin band at full
 // map instead of ~7 tiles of yellow-green glow. Foam, waves and the seabed
 // geometry keep the true magnitude. Callers: shadeWater (body + opacity),
-// the seabed colour in terrain.ts (shadeWaterTile) and WATER_FRAG.
+// the seabed colour in terrain.ts (main, the water path) and WATER_FRAG.
 float shoreViewScale(float tpp) {
   return 1.0 + 2.0 * smoothstep(0.3, 1.4, tpp);
 }
@@ -150,29 +154,33 @@ vec3 seabedAlbedo(float mag) {
 // zw (lot 3, item 8): the same slope for the glints, kept only while the
 // wavelength is under ~16-40 px on screen (glintWaveWeight): the long
 // octaves' highlight contours were the big repeating "vermicelli".
-vec4 waveSlope1(vec2 p, float t, vec2 dir, float lambda, float steep, float speed, float tpp) {
+// The glint share is only computed while the glints show (glints; zw is
+// read under the same condition), not at full map or the default zoom.
+vec4 waveSlope1(vec2 p, float t, vec2 dir, float lambda, float steep, float speed, float tpp, bool glints) {
   float fade = 1.0 - smoothstep(0.12, 0.33, tpp / lambda);
   if (fade <= 0.0) return vec4(0.0);
   float k = 6.2831853 / lambda;
   float phase = k * (dot(dir, p) - speed * t);
   vec2 s = dir * (6.2831853 * steep * fade * cos(phase));
-  return vec4(s, s * (1.0 - smoothstep(16.0, 40.0, lambda / tpp)));
+  vec4 r = vec4(s, 0.0, 0.0);
+  if (glints) r.zw = s * (1.0 - smoothstep(16.0, 40.0, lambda / tpp));
+  return r;
 }
 
 // xy: slope of the surface (reflection, fresnel); zw: its share for the
-// glints (lot 3, item 8). The phase is bent by a slow warp (cheap trig), so
-// the crests of the 5 octaves do not repeat as a lattice.
-vec4 waveSlope(vec2 p, float t, float tpp) {
+// glints (lot 3, item 8; 0 unless glints). The phase is bent by a slow warp
+// (cheap trig), so the crests of the 5 octaves do not repeat as a lattice.
+vec4 waveSlope(vec2 p, float t, float tpp, bool glints) {
   // Slow large-scale modulation so the wave pattern does not look tiled.
   float swell = 0.65 + 0.7 * valueNoise(p * 0.035 + vec2(t * 0.013, -t * 0.009));
   vec2 pw = p + 2.2 * vec2(
     sin(dot(p, vec2(0.071, 0.046)) + t * 0.05),
     sin(dot(p, vec2(-0.052, 0.083)) - t * 0.04));
-  vec4 g = waveSlope1(pw, t, vec2(0.832, 0.555), 13.0, 0.010, 1.10, tpp);
-  g += waveSlope1(pw, t, vec2(-0.447, 0.894), 7.3, 0.012, 0.85, tpp);
-  g += waveSlope1(pw, t, vec2(0.970, -0.243), 4.1, 0.014, 0.65, tpp);
-  g += waveSlope1(pw, t, vec2(-0.781, -0.625), 2.3, 0.013, 0.50, tpp);
-  g += waveSlope1(pw, t, vec2(0.196, 0.981), 1.3, 0.011, 0.38, tpp);
+  vec4 g = waveSlope1(pw, t, vec2(0.832, 0.555), 13.0, 0.010, 1.10, tpp, glints);
+  g += waveSlope1(pw, t, vec2(-0.447, 0.894), 7.3, 0.012, 0.85, tpp, glints);
+  g += waveSlope1(pw, t, vec2(0.970, -0.243), 4.1, 0.014, 0.65, tpp, glints);
+  g += waveSlope1(pw, t, vec2(-0.781, -0.625), 2.3, 0.013, 0.50, tpp, glints);
+  g += waveSlope1(pw, t, vec2(0.196, 0.981), 1.3, 0.011, 0.38, tpp, glints);
   return g * (swell * uWaveStrength);
 }
 
@@ -234,7 +242,10 @@ vec4 shadeWater(vec2 p, float mag, vec3 V, float tpp, float t) {
   // Calmer near the coast and when zoomed out.
   float calm = mix(0.4, 1.0, smoothstep(0.0, 3.0, mag))
     * mix(1.0, 0.45, smoothstep(0.3, 1.5, tpp));
-  vec4 slopes = waveSlope(p, t, tpp) * calm;
+  // Sun glints only at close zoom (faded out from ~30 down to ~4 px per
+  // tile; see below).
+  float glintOn = 1.0 - smoothstep(0.03, 0.25, tpp);
+  vec4 slopes = waveSlope(p, t, tpp, glintOn > 0.0) * calm;
   vec2 slope = slopes.xy;
   vec3 n = normalize(vec3(-slope.x, 1.0, -slope.y));
 
@@ -254,7 +265,6 @@ vec4 shadeWater(vec2 p, float mag, vec3 V, float tpp, float t) {
   // of sparkles of a few px at any zoom instead of long repeating contours;
   // with them that small, the tight lobe can be brighter (0.22, was 0.05).
   vec3 h = normalize(V + uSunDir);
-  float glintOn = 1.0 - smoothstep(0.03, 0.25, tpp);
   float glint = 0.0;
   if (glintOn > 0.0) {
     vec2 gs = 0.35 * slopes.zw + 0.28 * calm * uWaveStrength * glitterSlope(p, t, tpp);

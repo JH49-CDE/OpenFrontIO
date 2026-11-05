@@ -260,31 +260,24 @@ vec4 reliefSmooth(vec2 p) {
   vec2 g1 = 1.0 - g0;
   vec2 t0 = (i - 0.5 + w1 / g0) / dims;
   vec2 t1 = (i + 1.5 + w3 / max(g1, vec2(1e-6))) / dims;
-  return g0.y * (g0.x * texture(uRelief, t0) + g1.x * texture(uRelief, vec2(t1.x, t0.y)))
-    + g1.y * (g0.x * texture(uRelief, vec2(t0.x, t1.y)) + g1.x * texture(uRelief, t1));
+  // Explicit level 0 (the texture has no mips; min = mag = linear, so the
+  // result is the same): no implicit derivatives inside the caller's
+  // non-uniform branch, which compilers may otherwise hoist out of it.
+  return g0.y * (g0.x * textureLod(uRelief, t0, 0.0) + g1.x * textureLod(uRelief, vec2(t1.x, t0.y), 0.0))
+    + g1.y * (g0.x * textureLod(uRelief, vec2(t0.x, t1.y), 0.0) + g1.x * textureLod(uRelief, t1, 0.0));
 }
 
-// Quadratic B-spline over the 3 x 3 tiles around the sample point (the 2 x 2
-// of t4 at b plus 5 fetches): tile heights with a continuous slope.
+// Quadratic B-spline over the 3 x 3 tiles around the sample point (9 fetches
+// at constant offsets; 4 of them are t4's texels, in cache): tile heights
+// with a continuous slope. No local array: one indexed by the sample point
+// would be spilled to scratch memory on most GPUs.
 // Returns (dh/dx, dh/dz, height, mean upland magnitude), the last one
 // weighted over upland tiles only (-1 when there is none), for rock / snow
 // lines that follow smooth contours instead of the tile staircase.
-vec4 tileBspline(ivec2 b, vec2 w, uvec4 t4) {
+vec4 tileBspline(ivec2 b, vec2 w) {
   ivec2 hi = ivec2(step(vec2(0.5), w));
   ivec2 c = b + hi;      // centre tile: round(sample point)
   vec2 f = w + 0.5 - vec2(hi);
-  ivec2 o = 1 - hi;      // t4 covers columns / rows o .. o + 1 of the 3 x 3
-  uint tt[9];
-  tt[o.y * 3 + o.x] = t4.x;
-  tt[o.y * 3 + o.x + 1] = t4.y;
-  tt[o.y * 3 + o.x + 3] = t4.z;
-  tt[o.y * 3 + o.x + 4] = t4.w;
-  int mc = 2 - 2 * o.x;  // the column t4 misses
-  int mr = 2 - 2 * o.y;  // the row t4 misses
-  for (int k = 0; k < 3; k++) {
-    tt[k * 3 + mc] = terrainAt(c + ivec2(mc - 1, k - 1));
-    if (k != mc) tt[mr * 3 + k] = terrainAt(c + ivec2(k - 1, mr - 1));
-  }
   vec3 wx = vec3(0.5 * (1.0 - f.x) * (1.0 - f.x), 0.75 - (f.x - 0.5) * (f.x - 0.5), 0.5 * f.x * f.x);
   vec3 wy = vec3(0.5 * (1.0 - f.y) * (1.0 - f.y), 0.75 - (f.y - 0.5) * (f.y - 0.5), 0.5 * f.y * f.y);
   vec3 dx = vec3(f.x - 1.0, 1.0 - 2.0 * f.x, f.x);
@@ -293,7 +286,7 @@ vec4 tileBspline(ivec2 b, vec2 w, uvec4 t4) {
   float upW = 0.0;
   for (int j = 0; j < 3; j++) {
     for (int i = 0; i < 3; i++) {
-      uint tb = tt[j * 3 + i];
+      uint tb = terrainAt(c + ivec2(i - 1, j - 1));
       float m = float(tb & MAG);
       bool landT = (tb & LAND) != 0u && m < 30.5;
       float th = landT ? uHeightScale * (0.03 + 0.97 * pow(m / 30.0, 1.6)) : 0.0;
@@ -308,24 +301,6 @@ vec4 tileBspline(ivec2 b, vec2 w, uvec4 t4) {
   return r;
 }
 // ---- END lot 3: smooth relief functions
-
-// Water tile: the seabed (under the water plane), or the water surface
-// itself where the relief is above sea level.
-vec3 shadeWaterTile(vec2 p, uvec4 t4, vec2 w, vec3 V, float tpp) {
-  float mag = mix(
-    mix(shoreValue(t4.x), shoreValue(t4.y), w.x),
-    mix(shoreValue(t4.z), shoreValue(t4.w), w.x),
-    w.y);
-  // Flat-lit so it matches WaterLayer's own seabed composite exactly; the
-  // shallow look narrows when zoomed out (lot 3, shoreViewScale).
-  vec3 seabed = seabedAlbedo(mag * shoreViewScale(tpp)) * diffuseLight(UP);
-  vec3 c = seabed;
-  if (vWorld.y > 0.0) {
-    vec4 wtr = shadeWater(p, mag, V, tpp, uTime);
-    c = mix(seabed, wtr.rgb, wtr.a);
-  }
-  return c * mix(1.0, 0.6, uAltView);
-}
 
 // p: world xz; tile / f: the tile under p and the position in it; t4 / b /
 // w: the 4 tile centres around the (close up: domain-warped) sample point,
@@ -343,7 +318,10 @@ vec3 shadeLandTile(
   vec3 n = nMesh;
   float shade = 1.0;
   if (tileClass(tb) == 2) {
-    albedo = uColVoid * (0.8 + 0.35 * detail * valueNoise(p * 0.9));
+    // The noise only where its weight is not 0 (detail: not at full map).
+    float v = 0.8;
+    if (detail > 0.0) v = 0.8 + 0.35 * detail * valueNoise(p * 0.9);
+    albedo = uColVoid * v;
   } else {
     vec3 rockCol = uColMountain * vec3(0.72, 0.70, 0.68);
     vec3 snowCol = min(uColMountain * 1.04 + 0.02, vec3(1.0));
@@ -373,7 +351,7 @@ vec3 shadeLandTile(
     // whole slopes and caps instead of tile speckle.
     albedo = farCol;
     // Lot 3 (item 9): smooth tile heights / slope / upland elevation close up.
-    vec4 bs = close > 0.0 ? tileBspline(b, w, t4) : vec4(0.0, 0.0, 0.0, -1.0);
+    vec4 bs = close > 0.0 ? tileBspline(b, w) : vec4(0.0, 0.0, 0.0, -1.0);
     float sand = 0.0;
     float grass = 0.0;
     float high = 0.0;
@@ -417,18 +395,30 @@ vec3 shadeLandTile(
     // Magnitude steps between neighbouring tiles are terraces of up to ~1.5
     // tiles of height per tile, so the gradient is flattened (x DETAIL_RELIEF)
     // to a gentle texture instead of dark bands along every zone boundary.
-    vec4 h4 = tileHeights(t4);
-    float gx = mix(h4.y - h4.x, h4.w - h4.z, w.y);
-    float gz = mix(h4.z - h4.x, h4.w - h4.y, w.x);
-    float hTile = dot(bw, h4);
     // Lot 3 (item 9): close up, the B-spline's continuous slope instead
     // (fully from ~5 px per tile: a residue of the bilinear slope draws a
     // tile checker on flat, uniform ground such as fallout ash).
+    // Perf triage (same pixels): each part only where its weight is not 0,
+    // the whole normal from detail > 0 (not at full map on a 1x screen),
+    // the bilinear slope while smoothW < 1. hTile is read close up only.
     float smoothW = min(1.0, 1.25 * close);
-    gx = mix(gx, bs.x, smoothW) * DETAIL_RELIEF;
-    gz = mix(gz, bs.y, smoothW) * DETAIL_RELIEF;
-    hTile = mix(hTile, bs.z, smoothW);
-    n = normalize(mix(nMesh, normalize(vec3(-gx, 1.0, -gz)), 0.6 * detail));
+    float hTile = 0.0;
+    if (detail > 0.0) {
+      float gx = 0.0;
+      float gz = 0.0;
+      if (smoothW < 1.0) {
+        vec4 h4 = tileHeights(t4);
+        gx = mix(h4.y - h4.x, h4.w - h4.z, w.y);
+        gz = mix(h4.z - h4.x, h4.w - h4.y, w.x);
+        hTile = dot(bw, h4);
+      }
+      gx = mix(gx, bs.x, smoothW) * DETAIL_RELIEF;
+      gz = mix(gz, bs.y, smoothW) * DETAIL_RELIEF;
+      hTile = mix(hTile, bs.z, smoothW);
+      n = normalize(mix(nMesh, normalize(vec3(-gx, 1.0, -gz)), 0.6 * detail));
+    } else {
+      n = normalize(nMesh);
+    }
 
     // Bare rock on steep highland / mountain flanks (zoomed out: on
     // highland / mountain tiles; close up: on the upland zone, sparing snow).
@@ -442,15 +432,22 @@ vec3 shadeLandTile(
     // grass); o2 (4.6 / tile) is fine grain. Zoomed out they only speckle
     // the albedo a little; close up they become per-material bump normals
     // and albedo variation, each faded once its period is under ~3 px.
-    float ang = 0.6 + lo * 4.0 * close;
-    vec2 u = vec2(cos(ang), sin(ang));
-    vec2 v = vec2(-u.y, u.x);
+    // Only where their weight is not 0 (detail > 0; close > 0 implies it).
     vec2 s1 = vec2(1.7, 1.7 + 2.0 * close);
-    vec3 o1 = valueNoiseD(vec2(dot(p, u), dot(p, v)) * s1 + vec2(3.1, 7.7));
-    vec2 g1 = u * (s1.x * o1.y) + v * (s1.y * o1.z); // d o1 / dp
-    vec3 o2 = valueNoiseD(mat2(0.6, -0.8, 0.8, 0.6) * p * 4.6);
-    vec2 g2 = mat2(0.6, 0.8, -0.8, 0.6) * o2.yz * 4.6;
-    albedo *= 1.0 + (0.6 * o1.x + 0.4 * o2.x - 0.5) * 0.1 * detail * (1.0 - close);
+    vec3 o1 = vec3(0.5, 0.0, 0.0);
+    vec3 o2 = o1;
+    vec2 g1 = vec2(0.0);
+    vec2 g2 = vec2(0.0);
+    if (detail > 0.0) {
+      float ang = 0.6 + lo * 4.0 * close;
+      vec2 u = vec2(cos(ang), sin(ang));
+      vec2 v = vec2(-u.y, u.x);
+      o1 = valueNoiseD(vec2(dot(p, u), dot(p, v)) * s1 + vec2(3.1, 7.7));
+      g1 = u * (s1.x * o1.y) + v * (s1.y * o1.z); // d o1 / dp
+      o2 = valueNoiseD(mat2(0.6, -0.8, 0.8, 0.6) * p * 4.6);
+      g2 = mat2(0.6, 0.8, -0.8, 0.6) * o2.yz * 4.6;
+      albedo *= 1.0 + (0.6 * o1.x + 0.4 * o2.x - 0.5) * 0.1 * detail * (1.0 - close);
+    }
     if (close > 0.0) {
       float f1 = octaveFade(s1.y, tpp) * close;
       float f2 = octaveFade(4.6, tpp) * close;
@@ -498,7 +495,9 @@ vec3 shadeLandTile(
     // ---- END lot 3: alt-view ground
   }
   vec3 ground = albedo;
-  if (owner != 0) {
+  // Not where it would be thrown away: the fallout below replaces the
+  // colour, and past the apron's fade its weight is 0 (perf triage).
+  if (owner != 0 && !fallout && apron < 1.0) {
     vec3 fill;
     float a;
     if (alt) {
@@ -548,54 +547,66 @@ vec3 shadeLandTile(
     float gL = luma(groundCol);
     vec3 sick = mix(uFalloutColor, vec3(0.75, 0.72, 0.2), 0.6);
     vec3 ash = vec3(0.4, 0.375, 0.345) * (0.55 + 0.7 * gL);
+    // Each look is computed only where its weight is not 0 (perf triage,
+    // same pixels): the far one while near < 1, the near one while near > 0
+    // (it was mixed away at full map and at the default zoom).
     // Far: the ash, darker, a touch of the sickly tint, mottled.
-    float mot = 0.5 + (valueNoise(mat2(0.8, -0.6, 0.6, 0.8) * p * 0.11 + vec2(9.0, 4.0)) - 0.5)
-      * octaveFade(0.11, tpp);
-    vec3 farA = mix(ash * 0.78, sick * 0.6, 0.1 + 0.12 * mot) * (0.85 + 0.3 * mot);
+    vec3 farA = vec3(0.0);
+    if (near < 1.0) {
+      float mot = 0.5 + (valueNoise(mat2(0.8, -0.6, 0.6, 0.8) * p * 0.11 + vec2(9.0, 4.0)) - 0.5)
+        * octaveFade(0.11, tpp);
+      farA = mix(ash * 0.78, sick * 0.6, 0.1 + 0.12 * mot) * (0.85 + 0.3 * mot);
+    }
     // Near: soft charred patches and fine ash dust over the ash.
-    vec3 burnt = ash;
-    float fc = octaveFade(0.83, tpp);
-    float c1 = valueNoise(mat2(0.8, 0.6, -0.6, 0.8) * p * 0.31 + vec2(17.0, 3.0));
-    float c2 = 0.5 + (valueNoise(mat2(0.6, -0.8, 0.8, 0.6) * p * 0.83 + vec2(5.0, 11.0)) - 0.5) * fc;
-    float charred = smoothstep(0.45, 0.8, 0.65 * c1 + 0.35 * c2);
-    burnt *= (1.0 - 0.16 * charred)
-      * (1.0 + 0.12 * (valueNoise(p * 2.3 + vec2(1.7, 6.1)) - 0.5) * octaveFade(2.3, tpp));
-    // Ash streaks, stretched across the wind (FALLOUT_WIND, FxLayer's smoke).
-    vec2 aq = vec2(dot(p, vec2(0.8, -0.6)), dot(p, vec2(0.6, 0.8)));
-    float ash2 = smoothstep(0.55, 0.85, valueNoise(aq * vec2(0.4, 0.62) + vec2(3.0, 8.0)) * (0.7 + 0.3 * c2));
-    burnt = mix(burnt, vec3(0.6, 0.58, 0.55) * (0.8 + 0.25 * gL),
-      0.3 * ash2 * (1.0 - charred) * octaveFade(1.2, tpp));
-    burnt = mix(burnt, burnt * vec3(1.0, 1.04, 0.85), 0.2);
+    vec3 burnt = vec3(0.0);
+    if (near > 0.0) {
+      burnt = ash;
+      float fc = octaveFade(0.83, tpp);
+      float c1 = valueNoise(mat2(0.8, 0.6, -0.6, 0.8) * p * 0.31 + vec2(17.0, 3.0));
+      float c2 = 0.5 + (valueNoise(mat2(0.6, -0.8, 0.8, 0.6) * p * 0.83 + vec2(5.0, 11.0)) - 0.5) * fc;
+      float charred = smoothstep(0.45, 0.8, 0.65 * c1 + 0.35 * c2);
+      burnt *= (1.0 - 0.16 * charred)
+        * (1.0 + 0.12 * (valueNoise(p * 2.3 + vec2(1.7, 6.1)) - 0.5) * octaveFade(2.3, tpp));
+      // Ash streaks, stretched across the wind (FALLOUT_WIND, FxLayer's smoke).
+      vec2 aq = vec2(dot(p, vec2(0.8, -0.6)), dot(p, vec2(0.6, 0.8)));
+      float ash2 = smoothstep(0.55, 0.85, valueNoise(aq * vec2(0.4, 0.62) + vec2(3.0, 8.0)) * (0.7 + 0.3 * c2));
+      burnt = mix(burnt, vec3(0.6, 0.58, 0.55) * (0.8 + 0.25 * gL),
+        0.3 * ash2 * (1.0 - charred) * octaveFade(1.2, tpp));
+      burnt = mix(burnt, burnt * vec3(1.0, 1.04, 0.85), 0.2);
+    }
     // Hotspots: one per 16-tile cell at most (10% of the cells), radius
     // 1.6-3.2 tiles, only well inside the zone (4 taps 6 tiles around the
     // centre, fetched only inside the disc); faded zoomed out (they would
-    // shimmer) and on steep flanks (stretched there under tilt).
-    vec2 hq = mat2(0.8, 0.6, -0.6, 0.8) * p * (1.0 / 16.0);
-    ivec2 hc = ivec2(floor(hq));
-    float hh = hash12(hc + ivec2(311, 97));
+    // shimmer) and on steep flanks (stretched there under tilt). Nothing is
+    // hashed or fetched while that fade is 0 (from 0.5 tile per px).
+    float hotVis = (1.0 - smoothstep(0.25, 0.5, tpp)) * smoothstep(0.55, 0.8, nMesh.y);
+    float hh = 0.0;
     float hot = 0.0;
     float halo = 0.0;
-    if (hh < 0.1) {
-      float r = 0.1 + 0.1 * fract(hh * 37.0);
-      vec2 c = r + (1.0 - 2.0 * r) * vec2(hash12(hc + ivec2(5, 71)), fract(hh * 113.0));
-      float d2 = dot(hq - vec2(hc) - c, hq - vec2(hc) - c) / (r * r);
-      float k = max(0.0, 1.0 - d2);
-      if (k > 0.0) {
-        ivec2 ct = ivec2(floor(mat2(0.8, -0.6, 0.6, 0.8) * ((vec2(hc) + c) * 16.0)));
-        ivec2 hiT = uMapSize - 1;
-        uint m = texelFetch(uTiles, clamp(ct + ivec2(6, 0), ivec2(0), hiT), 0).r
-          & texelFetch(uTiles, clamp(ct - ivec2(6, 0), ivec2(0), hiT), 0).r
-          & texelFetch(uTiles, clamp(ct + ivec2(0, 6), ivec2(0), hiT), 0).r
-          & texelFetch(uTiles, clamp(ct - ivec2(0, 6), ivec2(0), hiT), 0).r;
-        float vis = (m & 0x2000u) != 0u
-          ? (1.0 - smoothstep(0.25, 0.5, tpp)) * smoothstep(0.55, 0.8, nMesh.y)
-          : 0.0;
-        hot = k * k * k * vis;
-        halo = k * vis;
+    if (hotVis > 0.0) {
+      vec2 hq = mat2(0.8, 0.6, -0.6, 0.8) * p * (1.0 / 16.0);
+      ivec2 hc = ivec2(floor(hq));
+      hh = hash12(hc + ivec2(311, 97));
+      if (hh < 0.1) {
+        float r = 0.1 + 0.1 * fract(hh * 37.0);
+        vec2 c = r + (1.0 - 2.0 * r) * vec2(hash12(hc + ivec2(5, 71)), fract(hh * 113.0));
+        float d2 = dot(hq - vec2(hc) - c, hq - vec2(hc) - c) / (r * r);
+        float k = max(0.0, 1.0 - d2);
+        if (k > 0.0) {
+          ivec2 ct = ivec2(floor(mat2(0.8, -0.6, 0.6, 0.8) * ((vec2(hc) + c) * 16.0)));
+          ivec2 hiT = uMapSize - 1;
+          uint m = texelFetch(uTiles, clamp(ct + ivec2(6, 0), ivec2(0), hiT), 0).r
+            & texelFetch(uTiles, clamp(ct - ivec2(6, 0), ivec2(0), hiT), 0).r
+            & texelFetch(uTiles, clamp(ct + ivec2(0, 6), ivec2(0), hiT), 0).r
+            & texelFetch(uTiles, clamp(ct - ivec2(0, 6), ivec2(0), hiT), 0).r;
+          float vis = (m & 0x2000u) != 0u ? hotVis : 0.0;
+          hot = k * k * k * vis;
+          halo = k * vis;
+        }
       }
     }
     burnt = mix(burnt, sick * 0.5, 0.3 * halo) * (1.0 - 0.25 * hot);
-    albedo = mix(farA, burnt, near);
+    albedo = near >= 1.0 ? burnt : mix(farA, burnt, near);
     // Zone rim: the fallout tiles within R tiles (~1.6 px, 1-4 tiles) of a
     // clean tile (4 taps), sickly yellow-green, strong zoomed out, faint
     // close up.
@@ -614,13 +625,15 @@ vec3 shadeLandTile(
     // of at least ~1.3 px whose centre lies EMBER_MARGIN inside the tile,
     // flickering.
     float emberW = 1.0 - smoothstep(0.12, 0.25, tpp);
-    float e0 = hash12(tile + ivec2(9173, 3511));
-    if (emberW > 0.0 && e0 < 0.02 + 0.2 * hot) {
-      vec2 c = 0.25 + 0.5 * vec2(hash12(tile + ivec2(71, 4093)), hash12(tile + ivec2(2287, 113)));
-      float r = clamp(1.3 * tpp, 0.06, 0.25);
-      float disc = 1.0 - smoothstep(0.3 * r, r, length(f - c));
-      float flick = sin(uTime * (1.1 + 1.8 * fract(e0 * 57.0)) + e0 * 211.0);
-      emissive += vec3(1.0, 0.32, 0.06) * (3.6 * disc * (0.25 + 0.75 * flick * flick) * emberW);
+    if (emberW > 0.0) {
+      float e0 = hash12(tile + ivec2(9173, 3511));
+      if (e0 < 0.02 + 0.2 * hot) {
+        vec2 c = 0.25 + 0.5 * vec2(hash12(tile + ivec2(71, 4093)), hash12(tile + ivec2(2287, 113)));
+        float r = clamp(1.3 * tpp, 0.06, 0.25);
+        float disc = 1.0 - smoothstep(0.3 * r, r, length(f - c));
+        float flick = sin(uTime * (1.1 + 1.8 * fract(e0 * 57.0)) + e0 * 211.0);
+        emissive += vec3(1.0, 0.32, 0.06) * (3.6 * disc * (0.25 + 0.75 * flick * flick) * emberW);
+      }
     }
   }
   // ---- END lot 3: fallout
@@ -728,149 +741,169 @@ void main() {
   vec3 nMesh = normalize(vNormal);
   vec3 col;
 
-  if (nMesh.y < 0.02) {
-    // Map-edge skirt (vertical wall): an earthy cross-section.
-    float y = vWorld.y;
-    vec3 soil = vec3(0.23, 0.16, 0.10);
-    vec3 rock = vec3(0.11, 0.10, 0.10);
-    vec3 c = mix(rock, soil, smoothstep(-2.0, 0.5, y));
-    c *= 0.9 + 0.1 * sin(y * 9.0 + 2.0 * valueNoise(p * 0.5));
-    col = c * diffuseLight(nMesh);
-  } else {
-    // ---- BEGIN lot 3: map-edge apron lookups. Off the map (TerrainLayer's
-    // flat ring), tiles are looked up at pt, p mirrored at the map border,
-    // so the land and coasts continue past the edge (no stretched edge
-    // row); the point is warped first, more with the distance past the
-    // edge (TerrainShading.apronWarp), so farther out the land is not a
-    // recognisable mirror image. On the map pt = p.
-    vec2 offMap = max(max(-p, p - vec2(uMapSize)), vec2(0.0));
-    float dOut = max(offMap.x, offMap.y);
-    vec2 pt = p;
-    if (dOut > 0.0) {
-      vec2 wn = vec2(
-        valueNoise(p * 0.025 + vec2(1.3, 7.1)),
-        valueNoise(p * 0.025 + vec2(8.2, 2.6)));
-      vec2 pw = p + (wn - 0.5) * (0.9 * min(dOut, 20.0));
-      pt = vec2(uMapSize) - abs(vec2(uMapSize) - abs(pw));
-    }
-    // ---- END lot 3: map-edge apron lookups
-    ivec2 tile = clamp(ivec2(floor(pt)), ivec2(0), uMapSize - 1);
-    vec2 f = clamp(pt - vec2(tile), 0.0, 1.0);
-    uint tb = terrainAt(tile);
-    bool land = (tb & LAND) != 0u;
-    // Per-tile detail fades out once a tile is under ~1-3 pixels; the
-    // close-up look (organic zones, micro detail) needs ~3-7+ pixels.
-    float detail = 1.0 - smoothstep(0.35, 1.2, tpp);
-    float close = 1.0 - smoothstep(0.15, 0.4, tpp);
-    // ---- BEGIN lot 3: smooth relief close up (item 9): shading normal and
-    // reference height from the relief's B-spline instead of the mesh's
-    // per-vertex normals (creased along its triangles).
-    float hRef = vWorld.y;
-    if (land && close > 0.0 && dOut <= 0.0) {
-      vec4 rs = reliefSmooth(p);
-      float smoothW = min(1.0, 1.25 * close);
-      nMesh = normalize(mix(nMesh, normalize(vec3(-rs.x, 1.0, -rs.y)), smoothW));
-      hRef = mix(hRef, rs.z, smoothW);
-    }
-    // ---- END lot 3: smooth relief
-    // Lot 3 (item 6): the relief's shading fades to flat over the last
-    // EDGE_FLAT_TILES inside the map edge, so it meets the flat-lit apron
-    // without a seam under tilt.
-    if (dOut <= 0.0) {
-      vec2 inMap = min(p, vec2(uMapSize) - p);
-      float edgeFlat = 1.0 - smoothstep(0.0, 3.0, min(inMap.x, inMap.y));
-      if (edgeFlat > 0.0) nMesh = normalize(mix(nMesh, UP, edgeFlat));
-    }
-    // The 4 tile centres around the sample point, for bilinear colour /
-    // depth / normals. Close up, land samples them at a domain-warped point
-    // (gradients of two noise octaves as the warp field: typically ~0.2, at
-    // most ~0.6 tile), which turns zone edges organic. The tile's own land /
-    // water class and owner are never warped.
-    vec3 nw = vec3(0.5, 0.0, 0.0);
-    vec2 q = pt - 0.5;
-    if (land && close > 0.0) {
-      nw = valueNoiseD(pt * 0.9 + vec2(13.7, 41.3));
-      vec3 nw2 = valueNoiseD(mat2(0.8, 0.6, -0.6, 0.8) * pt * 2.6);
-      q += (nw.yz * 0.34 + nw2.yz * 0.12) * close;
-    }
-    ivec2 b = ivec2(floor(q));
-    vec2 w = q - vec2(b);
-    uvec4 t4 = uvec4(
-      terrainAt(b),
-      terrainAt(b + ivec2(1, 0)),
-      terrainAt(b + ivec2(0, 1)),
-      terrainAt(b + ivec2(1, 1)));
-    // ---- BEGIN lot 3: map-edge apron. On TerrainLayer's flat ring around
-    // the map (at COAST_LIFT), the mirrored land continues past the border
-    // up to a noisy virtual coastline (reach = uEdgeReach x 0.15..2 by two
-    // low-frequency octaves, plus a ragged one; TerrainShading
-    // virtualLandReach): along the edge some land dies at once, some runs
-    // far. The territory fill stops at the edge (gone within 1.5 tiles /
-    // 6 px, apronFillFade: the playfield's limit stays readable, owners do
-    // not look bigger), and the land fades like a page margin, desaturated,
-    // dimmed and blended into the sea with the distance. The water is the mirrored water, or
-    // past the virtual coast its distance from it (a shelf like a real
-    // coast's, never a wide pale band), deepening to open sea
-    // (apronWaterMagnitude), shaded as WaterLayer's off-map plane, which
-    // takes over as open sea at the ring's rim (seamless).
-    if (dOut > 0.0) {
-      float nz = 0.6 * valueNoise(p * 0.03 + vec2(3.1, 9.7))
-        + 0.4 * valueNoise(p * 0.09 + vec2(7.3, 1.9));
-      float reach = max(0.0, uEdgeReach * (0.15 + 1.85 * smoothstep(0.25, 0.75, nz)
-        + 0.3 * (valueNoise(p * 0.37 + vec2(5.2, 4.4)) - 0.5)));
-      float magM = mix(
-        mix(shoreValue(t4.x), shoreValue(t4.y), w.x),
-        mix(shoreValue(t4.z), shoreValue(t4.w), w.x),
-        w.y);
-      float magA = min(max(max(magM, 0.0), dOut - reach), 16.0);
-      magA = mix(magA, 16.0, smoothstep(reach + 0.5 * uEdgeReach, reach + uEdgeReach + 8.0, dOut));
-      vec4 wtr = shadeWater(p, magA, V, tpp, uTime);
-      vec3 seabed = seabedAlbedo(magA * shoreViewScale(tpp)) * diffuseLight(UP);
-      col = mix(seabed, wtr.rgb, wtr.a) * mix(1.0, 0.6, uAltView);
-      // Virtual land: anti-aliased over a pixel around the virtual coast.
-      float cover = land ? clamp((reach - dOut) / max(tpp, 1e-3) + 0.5, 0.0, 1.0) : 0.0;
-      if (cover > 0.0) {
-        float fillFade = smoothstep(0.0, max(1.5, 6.0 * tpp), dOut);
-        vec3 lc = shadeLandTile(pt, tile, f, tb, t4, b, w, nw, UP, vWorld.y, fw, dp, tpp, detail, close, max(fillFade, 1e-3));
-        float margin = smoothstep(0.0, max(reach, 1.0), dOut);
-        lc = mix(lc, vec3(luma(lc)), 0.5 * margin) * ((1.0 - 0.2 * margin) * mix(1.0, 0.7, uAltView));
-        col = mix(col, mix(lc, col, 0.45 * margin + 0.3 * smoothstep(0.5 * reach, reach, dOut)), cover);
-      }
-    } else
-    // ---- END lot 3: map-edge apron
-    if (!land) {
-      col = shadeWaterTile(p, t4, w, V, tpp);
-    } else {
-      col = shadeLandTile(p, tile, f, tb, t4, b, w, nw, nMesh, hRef, fw, dp, tpp, detail, close, 0.0);
-    }
-    // ---- BEGIN effect trails composite (boat / nuke trails, EffectTrails.ts):
-    // the trail colour lit flat, over the shaded ground at trailAlpha, where
-    // this mesh is the visible surface (land, and water tiles where the
-    // relief rises above sea level; WaterLayer paints the same elsewhere).
-    // Under the surface overlays (the sea plane draws those over the water).
-    // A uniform branch: free while no tile holds a trail.
-    if (uTrailsOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0)) {
-      vec4 tr = effectTrail(tile, p, uAltView > 0.5);
-      // Lot 3 (item 5): over fallout a trail is faint and greyed, so the
-      // bombs' ground tracks do not read as green streaks on the ash.
-      if (tr.a > 0.0 && (texelFetch(uTiles, tile, 0).r & 0x2000u) != 0u) {
-        tr.rgb = mix(tr.rgb, vec3(dot(tr.rgb, vec3(0.299, 0.587, 0.114))), 0.75);
-        tr.a *= 0.35;
-      }
-      col = mix(col, srgbToLinear(tr.rgb) * diffuseLight(UP), tr.a);
-    }
-    // ---- END effect trails composite
-    // ---- BEGIN surface overlay composite (grid / small-player glow, see
-    // SurfaceOverlay.ts). Unlit, over the shaded ground, before fog. Only
-    // where this mesh is the visible surface: land, and water tiles where the
-    // relief rises above sea level (elsewhere the sea-level overlay plane
-    // draws it above the water). A uniform branch: free while off.
-    if (uOverlayOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0)) {
-      vec4 ov = surfaceOverlay(p, fw);
-      col = col * (1.0 - ov.a) + ov.rgb;
-    }
-    // ---- END surface overlay composite
+  // ---- BEGIN lot 3: map-edge apron lookups. Off the map (TerrainLayer's
+  // flat ring), tiles are looked up at pt, p mirrored at the map border,
+  // so the land and coasts continue past the edge (no stretched edge
+  // row); the point is warped first, more with the distance past the
+  // edge (TerrainShading.apronWarp), so farther out the land is not a
+  // recognisable mirror image. On the map pt = p.
+  vec2 offMap = max(max(-p, p - vec2(uMapSize)), vec2(0.0));
+  float dOut = max(offMap.x, offMap.y);
+  vec2 pt = p;
+  if (dOut > 0.0) {
+    vec2 wn = vec2(
+      valueNoise(p * 0.025 + vec2(1.3, 7.1)),
+      valueNoise(p * 0.025 + vec2(8.2, 2.6)));
+    vec2 pw = p + (wn - 0.5) * (0.9 * min(dOut, 20.0));
+    pt = vec2(uMapSize) - abs(vec2(uMapSize) - abs(pw));
   }
+  // ---- END lot 3: map-edge apron lookups
+  ivec2 tile = clamp(ivec2(floor(pt)), ivec2(0), uMapSize - 1);
+  vec2 f = clamp(pt - vec2(tile), 0.0, 1.0);
+  uint tb = terrainAt(tile);
+  bool land = (tb & LAND) != 0u;
+  // Per-tile detail fades out once a tile is under ~1-3 pixels; the
+  // close-up look (organic zones, micro detail) needs ~3-7+ pixels.
+  float detail = 1.0 - smoothstep(0.35, 1.2, tpp);
+  float close = 1.0 - smoothstep(0.15, 0.4, tpp);
+  // ---- BEGIN lot 3: smooth relief close up (item 9): shading normal and
+  // reference height from the relief's B-spline instead of the mesh's
+  // per-vertex normals (creased along its triangles).
+  float hRef = vWorld.y;
+  if (land && close > 0.0 && dOut <= 0.0) {
+    vec4 rs = reliefSmooth(p);
+    float smoothW = min(1.0, 1.25 * close);
+    nMesh = normalize(mix(nMesh, normalize(vec3(-rs.x, 1.0, -rs.y)), smoothW));
+    hRef = mix(hRef, rs.z, smoothW);
+  }
+  // ---- END lot 3: smooth relief
+  // Lot 3 (item 6): the relief's shading fades to flat over the last
+  // EDGE_FLAT_TILES inside the map edge, so it meets the flat-lit apron
+  // without a seam under tilt.
+  if (dOut <= 0.0) {
+    vec2 inMap = min(p, vec2(uMapSize) - p);
+    float edgeFlat = 1.0 - smoothstep(0.0, 3.0, min(inMap.x, inMap.y));
+    if (edgeFlat > 0.0) nMesh = normalize(mix(nMesh, UP, edgeFlat));
+  }
+  // The 4 tile centres around the sample point, for bilinear colour /
+  // depth / normals. Close up, land samples them at a domain-warped point
+  // (gradients of two noise octaves as the warp field: typically ~0.2, at
+  // most ~0.6 tile), which turns zone edges organic. The tile's own land /
+  // water class and owner are never warped.
+  vec3 nw = vec3(0.5, 0.0, 0.0);
+  vec2 q = pt - 0.5;
+  if (land && close > 0.0) {
+    nw = valueNoiseD(pt * 0.9 + vec2(13.7, 41.3));
+    vec3 nw2 = valueNoiseD(mat2(0.8, 0.6, -0.6, 0.8) * pt * 2.6);
+    q += (nw.yz * 0.34 + nw2.yz * 0.12) * close;
+  }
+  ivec2 b = ivec2(floor(q));
+  vec2 w = q - vec2(b);
+  uvec4 t4 = uvec4(
+    terrainAt(b),
+    terrainAt(b + ivec2(1, 0)),
+    terrainAt(b + ivec2(0, 1)),
+    terrainAt(b + ivec2(1, 1)));
+  // ---- BEGIN lot 3: map-edge apron. On TerrainLayer's flat ring around
+  // the map (at COAST_LIFT), the mirrored land continues past the border
+  // up to a noisy virtual coastline (reach = uEdgeReach x 0.15..2 by two
+  // low-frequency octaves, plus a ragged one; TerrainShading
+  // virtualLandReach): along the edge some land dies at once, some runs
+  // far. The territory fill stops at the edge (gone within 1.5 tiles /
+  // 6 px, apronFillFade: the playfield's limit stays readable, owners do
+  // not look bigger), and the land fades like a page margin, desaturated,
+  // dimmed and blended into the sea with the distance. The water is the mirrored water, or
+  // past the virtual coast its distance from it (a shelf like a real
+  // coast's, never a wide pale band), deepening to open sea
+  // (apronWaterMagnitude), shaded as WaterLayer's off-map plane, which
+  // takes over as open sea at the ring's rim (seamless).
+  // The map and the apron share ONE call site of shadeLandTile and one of
+  // shadeWater, with their inputs selected per path (perf triage, same
+  // pixels): a second inlined copy of each doubled the program, which
+  // SwiftShader pays on every fragment and which weighs on the GPU's
+  // register allocation for all of them (README, "Performance notes").
+  bool onApron = dOut > 0.0;
+  float reach = 0.0;
+  if (onApron) {
+    float nz = 0.6 * valueNoise(p * 0.03 + vec2(3.1, 9.7))
+      + 0.4 * valueNoise(p * 0.09 + vec2(7.3, 1.9));
+    reach = max(0.0, uEdgeReach * (0.15 + 1.85 * smoothstep(0.25, 0.75, nz)
+      + 0.3 * (valueNoise(p * 0.37 + vec2(5.2, 4.4)) - 0.5)));
+  }
+  // Land cover: 1 on the map's land tiles; on the apron the virtual land,
+  // anti-aliased over a pixel around the virtual coast.
+  float cover = !land ? 0.0
+    : (onApron ? clamp((reach - dOut) / max(tpp, 1e-3) + 0.5, 0.0, 1.0) : 1.0);
+  vec3 landCol = vec3(0.0);
+  if (cover > 0.0) {
+    // On the apron: lit flat, the fill faded out (apronFillFade); there
+    // pt is the mirrored point and hRef = vWorld.y. On the map pt = p.
+    float fillFade = smoothstep(0.0, max(1.5, 6.0 * tpp), dOut);
+    landCol = shadeLandTile(pt, tile, f, tb, t4, b, w, nw, onApron ? UP : nMesh, hRef, fw, dp, tpp,
+      detail, close, onApron ? max(fillFade, 1e-3) : 0.0);
+  }
+  // Water: the map's water tiles (the seabed under the water plane, or
+  // the surface itself where the relief rises above sea level), and the
+  // whole apron (under its virtual land too: the land blends into it).
+  vec3 waterCol = vec3(0.0);
+  if (onApron || !land) {
+    float magM = mix(
+      mix(shoreValue(t4.x), shoreValue(t4.y), w.x),
+      mix(shoreValue(t4.z), shoreValue(t4.w), w.x),
+      w.y);
+    float mag = magM;
+    if (onApron) {
+      float magA = min(max(max(magM, 0.0), dOut - reach), 16.0);
+      mag = mix(magA, 16.0, smoothstep(reach + 0.5 * uEdgeReach, reach + uEdgeReach + 8.0, dOut));
+    }
+    // Flat-lit so it matches WaterLayer's own seabed composite exactly;
+    // the shallow look narrows when zoomed out (lot 3, shoreViewScale).
+    vec3 seabed = seabedAlbedo(mag * shoreViewScale(tpp)) * diffuseLight(UP);
+    waterCol = seabed;
+    if (onApron || vWorld.y > 0.0) {
+      vec4 wtr = shadeWater(p, mag, V, tpp, uTime);
+      waterCol = mix(seabed, wtr.rgb, wtr.a);
+    }
+    waterCol *= mix(1.0, 0.6, uAltView);
+  }
+  if (onApron) {
+    col = waterCol;
+    if (cover > 0.0) {
+      float margin = smoothstep(0.0, max(reach, 1.0), dOut);
+      vec3 lc = mix(landCol, vec3(luma(landCol)), 0.5 * margin) * ((1.0 - 0.2 * margin) * mix(1.0, 0.7, uAltView));
+      col = mix(col, mix(lc, col, 0.45 * margin + 0.3 * smoothstep(0.5 * reach, reach, dOut)), cover);
+    }
+  } else {
+    col = land ? landCol : waterCol;
+  }
+  // ---- END lot 3: map-edge apron
+  // ---- BEGIN effect trails composite (boat / nuke trails, EffectTrails.ts):
+  // the trail colour lit flat, over the shaded ground at trailAlpha, where
+  // this mesh is the visible surface (land, and water tiles where the
+  // relief rises above sea level; WaterLayer paints the same elsewhere).
+  // Under the surface overlays (the sea plane draws those over the water).
+  // A uniform branch: free while no tile holds a trail.
+  if (uTrailsOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0)) {
+    vec4 tr = effectTrail(tile, p, uAltView > 0.5);
+    // Lot 3 (item 5): over fallout a trail is faint and greyed, so the
+    // bombs' ground tracks do not read as green streaks on the ash.
+    if (tr.a > 0.0 && (texelFetch(uTiles, tile, 0).r & 0x2000u) != 0u) {
+      tr.rgb = mix(tr.rgb, vec3(dot(tr.rgb, vec3(0.299, 0.587, 0.114))), 0.75);
+      tr.a *= 0.35;
+    }
+    col = mix(col, srgbToLinear(tr.rgb) * diffuseLight(UP), tr.a);
+  }
+  // ---- END effect trails composite
+  // ---- BEGIN surface overlay composite (grid / small-player glow, see
+  // SurfaceOverlay.ts). Unlit, over the shaded ground, before fog. Only
+  // where this mesh is the visible surface: land, and water tiles where the
+  // relief rises above sea level (elsewhere the sea-level overlay plane
+  // draws it above the water). A uniform branch: free while off.
+  if (uOverlayOn > 0.5 && dOut <= 0.0 && (land || vWorld.y > 0.0)) {
+    vec4 ov = surfaceOverlay(p, fw);
+    col = col * (1.0 - ov.a) + ov.rgb;
+  }
+  // ---- END surface overlay composite
 
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>
