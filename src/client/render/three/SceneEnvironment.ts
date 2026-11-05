@@ -26,14 +26,33 @@ import type { FrameInfo, ThreeLayerContext } from "./types";
 /** Direction *towards* the sun (from the north-west, high). */
 export const SUN_DIRECTION = new THREE.Vector3(-0.5, 0.8, -0.35).normalize();
 
-const SUN_COLOR = 0xfff1dc;
-const SUN_INTENSITY = 2.4;
-const HEMI_SKY = 0xcfe3ff;
+export const SUN_COLOR = 0xfff1dc;
+export const SUN_INTENSITY = 2.4;
+export const HEMI_SKY = 0xcfe3ff;
 const HEMI_GROUND = 0x4d4a3c;
-const HEMI_INTENSITY = 1.1;
+export const HEMI_INTENSITY = 1.1;
 const SKY_ZENITH = 0x4f86c6;
 /** Horizon haze; also the fog colour, so distant ground melts into the sky. */
 const SKY_HORIZON = 0xbcd3e3;
+
+/**
+ * Lot 4 prototype, night (`?three_night=1`, NightLights.ts): the moonlit
+ * environment `setNightDepth(1)` reaches. A cool, dim moon in the sun's
+ * place (its disc and glow in the sky), a dark blue sky fill, a near-black
+ * sky and horizon (the fog colour too).
+ */
+export const NIGHT_ENVIRONMENT = {
+  moonColor: 0xb8c8f0,
+  moonIntensity: 0.4,
+  hemiSky: 0x3a4a66,
+  hemiGround: 0x101318,
+  hemiIntensity: 0.22,
+  zenith: 0x040a18,
+  horizon: 0x18233a,
+  moonTint: 0x6f7fa0,
+} as const;
+/** Depth past which the night only dims (up to 1.25: ambient 0.2). */
+const NIGHT_DIM_PER_DEPTH = 2;
 
 /**
  * Uniform objects of the environment, shared BY REFERENCE: spread them into
@@ -93,6 +112,8 @@ export class SceneEnvironment {
 
   private readonly sky: THREE.Mesh;
   private readonly skyMaterial: THREE.ShaderMaterial;
+  /** Night depth last applied (`setNightDepth`; 0 = the day look). */
+  private nightDepth = 0;
   private readonly previousBackground: THREE.Scene["background"];
   private readonly maxTiltRad: number;
 
@@ -161,6 +182,45 @@ export class SceneEnvironment {
     // Keep the dome around the camera and inside the far plane.
     this.sky.position.copy(cam.position);
     this.sky.scale.setScalar(cam.far * 0.9);
+  }
+
+  /**
+   * Lot 4 prototype, night (only called with `?three_night=1`, by
+   * NightLighting when the depth changes): blends the
+   * lights, sky and fog from the day look (0) to the moonlit one (1,
+   * `NIGHT_ENVIRONMENT`); past 1 it only dims (×0.5 at 1.25). Colours are
+   * blended in linear space; the shader uniforms are shared by reference,
+   * so every material follows.
+   */
+  setNightDepth(depth: number): void {
+    const d = Math.max(0, Math.min(1.25, Number.isFinite(depth) ? depth : 0));
+    if (d === this.nightDepth) return;
+    this.nightDepth = d;
+    const t = Math.min(1, d);
+    const dim = 1 - NIGHT_DIM_PER_DEPTH * Math.max(0, d - 1);
+    const N = NIGHT_ENVIRONMENT;
+    const mixHex = (out: THREE.Color, day: number, night: number) =>
+      out.lerpColors(new THREE.Color(day), new THREE.Color(night), t);
+    const u = this.uniforms;
+    mixHex(this.sun.color, SUN_COLOR, N.moonColor);
+    this.sun.intensity =
+      (SUN_INTENSITY + (N.moonIntensity - SUN_INTENSITY) * t) * dim;
+    u.uSunIrradiance.value
+      .copy(this.sun.color)
+      .multiplyScalar(this.sun.intensity);
+    const hemiI =
+      (HEMI_INTENSITY + (N.hemiIntensity - HEMI_INTENSITY) * t) * dim;
+    mixHex(this.hemisphere.color, HEMI_SKY, N.hemiSky);
+    mixHex(this.hemisphere.groundColor, HEMI_GROUND, N.hemiGround);
+    this.hemisphere.intensity = hemiI;
+    u.uHemiSky.value.copy(this.hemisphere.color).multiplyScalar(hemiI);
+    u.uHemiGround.value.copy(this.hemisphere.groundColor).multiplyScalar(hemiI);
+    mixHex(u.uSkyZenith.value, SKY_ZENITH, N.zenith);
+    mixHex(u.uSkyHorizon.value, SKY_HORIZON, N.horizon);
+    mixHex(u.uSunTint.value, SUN_COLOR, N.moonTint);
+    this.fog.color.copy(u.uSkyHorizon.value);
+    const bg = this.ctx.scene.background;
+    if (bg instanceof THREE.Color) bg.copy(u.uSkyHorizon.value);
   }
 
   dispose(): void {

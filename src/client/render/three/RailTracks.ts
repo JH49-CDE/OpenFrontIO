@@ -52,6 +52,7 @@
 import * as THREE from "three";
 import { smoothstep } from "./CameraRig";
 import type { HeightField } from "./HeightField";
+import { nightModeOf } from "./NightLights";
 import {
   createRailDetailGeometry,
   createRailStripGeometry,
@@ -184,6 +185,8 @@ const JS_HISTORY = 120;
 const STRIP_FAR = new THREE.Color(0xd2c9b6);
 const STRIP_NEAR = new THREE.Color(0x8f877b);
 const STRIP_FAR_OPACITY = 0.55;
+/** Lot 4 (night): strip emission, × its colour (the kept fill's level). */
+export const RAIL_NIGHT_GLOW = 0.45;
 const STRIP_FADE_ZOOM: readonly [number, number] = [2, 5];
 /**
  * Visibility of the strips, as the default renderer's RailroadPass with the
@@ -470,6 +473,8 @@ export class RailTracks {
   private readonly strip: RailMesh;
   private readonly detail: RailMesh;
   private stripZoom = Number.NaN;
+  /** Lot 4: strip self-light at night (0 by day). */
+  private nightGlow = 0;
   private stripDpr = Number.NaN;
 
   // Stats.
@@ -490,9 +495,17 @@ export class RailTracks {
     private readonly hf: HeightField,
     private readonly mapW: number,
     private readonly mapH: number,
-    private readonly settings: Pick<ThreeRenderSettings, "quality">,
+    private readonly settings: Pick<ThreeRenderSettings, "quality"> &
+      Partial<Pick<ThreeRenderSettings, "prototypes">>,
     opts: RailTracksOptions = {},
   ) {
+    // Lot 4, night (`?three_night=1` only): the strips glow faintly in their
+    // own colour (as bright as the kept territory fill), so rails never turn
+    // into black lines that read as borders; the close-up rails a little.
+    if (nightModeOf(settings) !== null) {
+      this.nightGlow = RAIL_NIGHT_GLOW;
+      this.detailMaterial.emissive.setRGB(0.05, 0.045, 0.04);
+    }
     this.blockSize = Math.max(8, Math.floor(opts.blockSize ?? RAIL_BLOCK_SIZE));
     this.budgetMs = opts.budgetMs ?? RAIL_BUDGET_MS;
     this.clock = opts.clock ?? (() => performance.now());
@@ -937,6 +950,11 @@ export class RailTracks {
     const look = railStripLook(zoom, dpr);
     this.stripMaterial.color.lerpColors(STRIP_FAR, STRIP_NEAR, look.colorT);
     this.stripMaterial.opacity = look.opacity;
+    if (this.nightGlow > 0) {
+      this.stripMaterial.emissive
+        .copy(this.stripMaterial.color)
+        .multiplyScalar(this.nightGlow);
+    }
     this.strip.shown = look.visibility > 0;
   }
 }

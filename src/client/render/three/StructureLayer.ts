@@ -85,6 +85,12 @@
  * - `setRelations` (the facade's `updateRelations`) feeds the alt-view
  *   affiliation colours (ally vs enemy); without it, every other player
  *   reads as an enemy, like the default renderer before relations arrive.
+ *
+ * Lot 4 prototype, night (`nightModeOf`: `?three_night=1`): the part
+ * material gets lit windows (`NIGHT_WINDOWS`, emission from the scene's
+ * `NightLighting`) and every model template the
+ * window mask (`addWindowMask`, `windowShare` by type and level). Off,
+ * neither exists. Icons, badges and bars are unlit and stay as they are.
  */
 
 import { UnitType } from "@openfront/engine-api/game/GameTypes";
@@ -101,7 +107,9 @@ import {
 } from "../types";
 import type { HeightField } from "./HeightField";
 import { ensureOverpassFont, LABEL_FONT_FAMILY } from "./NameLayer";
+import { NightLighting, nightModeOf, windowShare } from "./NightLights";
 import {
+  addWindowMask,
   BlobShadows,
   createPartMaterial,
   createStructureGeometry,
@@ -790,6 +798,8 @@ export class StructureLayer {
   private readonly group = new THREE.Group();
   private readonly glow = { value: 1 };
   private readonly material: THREE.MeshStandardMaterial;
+  /** Lot 4: night and lights (null unless the night is on). */
+  private readonly night: NightLighting | null;
   private readonly templates = new Map<string, THREE.BufferGeometry>();
   private readonly tops = new Map<string, number>();
   private readonly batches = new Map<string, InstancedBatch>();
@@ -895,11 +905,16 @@ export class StructureLayer {
   constructor(private readonly ctx: ThreeLayerContext) {
     this.group.name = "structures";
     ctx.scene.add(this.group);
+    const nightMode = nightModeOf(ctx.settings);
+    this.night =
+      nightMode !== null ? NightLighting.acquire(ctx, nightMode) : null;
     this.material = createPartMaterial({
       glow: this.glow,
       roughness: 0.75,
       metalness: 0.04,
       conform: true,
+      // Lot 4: lit windows at night (only when on).
+      ...(this.night !== null ? { night: this.night.windowUniform } : {}),
     });
     this.shadows = new BlobShadows(this.group, "structure-shadows");
     this.icons = new StructureIcons(this.group, ctx.renderSettings);
@@ -1128,6 +1143,7 @@ export class StructureLayer {
     this.ghostIcons.dispose();
     this.bars.dispose();
     this.material.dispose();
+    this.night?.release();
     this.insts.clear();
     this.animated = [];
     this.barred = [];
@@ -1903,6 +1919,8 @@ export class StructureLayer {
         ? createStructureLodGeometry(type, variant)
         : createStructureGeometry(type, variant);
       if (g === null) return null;
+      // Lot 4: the walls that get lit windows at night.
+      if (this.night !== null) addWindowMask(g, windowShare(type, variant));
       template = g;
       this.templates.set(tkey, template);
       if (!lod) {

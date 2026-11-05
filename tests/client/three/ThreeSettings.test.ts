@@ -32,6 +32,23 @@ describe("readThreeSettingsFromUrl", () => {
     expect(s.antialias).toBe("msaa");
   });
 
+  it("lot-4 prototypes are off by default and enabled one by one", () => {
+    expect(readThreeSettingsFromUrl("").prototypes).toEqual({
+      wakes: false,
+      front: false,
+      night: false,
+    });
+    expect(
+      readThreeSettingsFromUrl("?three_wakes=1&three_night=true").prototypes,
+    ).toEqual({ wakes: true, front: false, night: true });
+    expect(readThreeSettingsFromUrl("?three_front=1").prototypes.front).toBe(
+      true,
+    );
+    expect(readThreeSettingsFromUrl("?three_front=0").prototypes.front).toBe(
+      false,
+    );
+  });
+
   it("parses three_aa", () => {
     const aa = (v: string) =>
       readThreeSettingsFromUrl(`?three_aa=${v}`).antialias;

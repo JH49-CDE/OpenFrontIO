@@ -41,6 +41,9 @@
  *   and shells shorter on screen than UNIT_LOD_PX (UNIT_LOD_PX_LOW with
  *   `quality: "low"`) use a low-poly model (`createUnitLodGeometry`, batch
  *   `units-<kind>-lod`).
+ * - Lot 4 prototype (`?three_wakes=1`, `WakeLayer.ts`): foam wakes behind
+ *   moving ships, one instanced draw. Without the flag nothing is built
+ *   (no mesh, no shader program) and a frame only checks a null field.
  * - `perfStats()` reports unit and railway counters for the perf tool.
  *
  * Contract notes:
@@ -77,6 +80,7 @@ import {
   hasEffect,
   NUKE_TRAIL_BLOCK,
 } from "./EffectTrails";
+import { NightLighting, nightModeOf } from "./NightLights";
 import {
   BlobShadows,
   createPartMaterial,
@@ -97,6 +101,7 @@ import { FRAG_OUTPUT } from "./shaders/water";
 import { barSize, StatusBars } from "./StatusBars";
 import { type Rgb, srgbToLinearRgb } from "./TerrainShading";
 import type { FrameInfo, ThreeLayerContext } from "./types";
+import { WakeRenderer, type WakeTrack } from "./WakeLayer";
 
 export { railHalfDirections } from "./RailTracks";
 
@@ -632,6 +637,8 @@ interface UnitTrack {
   targetX: number;
   targetY: number;
   trail: Trail | null;
+  /** Lot 4 wake state (ships, `?three_wakes=1` only; created lazily). */
+  wake: WakeTrack | null;
 }
 
 /** Deterministic 0..2π phase from a unit id. */
@@ -1291,6 +1298,8 @@ export class UnitLayer {
   /** Shared emissive strength of all unit parts (flickers a little). */
   private readonly glow = { value: 1 };
   private readonly material: THREE.MeshStandardMaterial;
+  /** Lot 4: night and lights (null unless the night is on). */
+  private readonly night: NightLighting | null;
   /** Model geometry per batch key (`kind` or `kind-lod`); null = no LOD. */
   private readonly templates = new Map<string, THREE.BufferGeometry | null>();
   private readonly batches = new Map<string, InstancedBatch>();
@@ -1309,6 +1318,8 @@ export class UnitLayer {
   private readonly bars: StatusBars;
   private readonly healthRules: WarshipHealthRules;
   private readonly rails: RailTracks;
+  /** Lot 4 ship wakes; null (nothing built) without `?three_wakes=1`. */
+  private readonly wakes: WakeRenderer | null;
 
   private lastTick = Number.NaN;
   private stamp = 0;
@@ -1338,7 +1349,15 @@ export class UnitLayer {
   constructor(private readonly ctx: ThreeLayerContext) {
     this.group.name = "units";
     ctx.scene.add(this.group);
-    this.material = createPartMaterial({ glow: this.glow });
+    const nightMode = nightModeOf(ctx.settings);
+    this.night =
+      nightMode !== null ? NightLighting.acquire(ctx, nightMode) : null;
+    this.material = createPartMaterial({
+      glow: this.glow,
+      // Lot 4: night self-light (deck lights, stronger zoomed out), only
+      // when the night is on.
+      ...(this.night !== null ? { night: this.night.unitUniform } : {}),
+    });
     this.effectTrails = EffectTrails.acquire(ctx);
     this.trails = new TrailRenderer(this.group, this.effectTrails);
     this.shadows = new BlobShadows(this.group, "unit-shadows");
@@ -1355,6 +1374,10 @@ export class UnitLayer {
       ctx.mapHeight,
       ctx.settings,
     );
+    this.wakes =
+      ctx.settings.prototypes?.wakes === true
+        ? new WakeRenderer(this.group, ctx, minScreenScale)
+        : null;
 
     // Selection ring: a flat annulus facing up, drawn over everything.
     this.ringTemplate = new THREE.RingGeometry(0.82, 1, 48).rotateX(
@@ -1713,6 +1736,9 @@ export class UnitLayer {
     this.rings.end();
     this.shadows.end();
     this.bars.end();
+    if (this.wakes !== null) {
+      this.wakes.update(frame, this.tracks.values(), this.frustum);
+    }
     this.trails.update(now, frame.altView, glowScale);
     this.drawnUnits = drawn;
     this.lodUnits = lods;
@@ -1753,6 +1779,8 @@ export class UnitLayer {
       trailRibbons: this.trails.ribbons,
       trailSamples: this.trails.samples,
       warheadTrails: this.trails.liveWarheads,
+      // Lot 4 wakes (`?three_wakes=1` only).
+      ...this.wakes?.stats(),
     };
   }
 
@@ -1793,9 +1821,11 @@ export class UnitLayer {
     this.shadows.dispose();
     this.bars.dispose();
     this.rails.dispose();
+    this.wakes?.dispose();
     this.trails.dispose();
     this.effectTrails.release();
     this.material.dispose();
+    this.night?.release();
     this.tracks.clear();
     this.ctx.scene.remove(this.group);
   }
@@ -1854,6 +1884,7 @@ export class UnitLayer {
       targetX: Number.NaN,
       targetY: Number.NaN,
       trail: null,
+      wake: null,
     };
   }
 

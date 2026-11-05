@@ -81,13 +81,34 @@
  * - Fallout field (item 5, `FalloutField`): fallout tiles per 8×8-tile
  *   cell, updated from the same changed tiles as the uploads (FxLayer's
  *   fallout smoke reads it).
+ *
+ * Lot 4 prototype, living front (`?three_front=1`; nothing of it exists
+ * otherwise: no field, no texture, no uniform, and the shader's FRONT_WAVE
+ * block is compiled out): `front` (`FrontField`) is fed from the same
+ * changed tiles; its capture stamps are an R16UI texture sent with the tile
+ * state's own rectangles (the same dirty cells, one more `texSubImage2D`
+ * each), so the capture wave and the new owner reach the GPU in the same
+ * frame. FxLayer (smoke, sparks) and OverlayLayer (arrows) read the field.
+ *
+ * Lot 4 prototype, night (`?three_night=1`, `nightModeOf`; nothing of it exists otherwise and the shader's NIGHT code
+ * is compiled out): `night` (`NightLighting`, shared with WaterLayer,
+ * StructureLayer and FxLayer) is driven from here once per frame: the
+ * moonlit environment, the city lightmap's rebuilds and uploads (within its
+ * own budget), the flash uniforms.
  */
 
 import * as THREE from "three";
 import type { TerrainRect, UnitState } from "../types";
 import { EffectTrails } from "./EffectTrails";
 import { FalloutField } from "./FalloutField";
+import {
+  FRONT_SWEEP_BUDGET,
+  FrontField,
+  frontNowUnits,
+  frontWaveLook,
+} from "./FrontField";
 import type { GridRange, HeightField } from "./HeightField";
+import { NightLighting, nightModeOf } from "./NightLights";
 import { environmentUniforms } from "./SceneEnvironment";
 import { TERRAIN_FRAG, TERRAIN_VERT } from "./shaders/terrain";
 import { SurfaceOverlay } from "./SurfaceOverlay";
@@ -174,6 +195,21 @@ const f1 = (value: number): { value: number } => ({ value });
 
 function srgb255(c: readonly [number, number, number]): Rgb {
   return [c[0] / 255, c[1] / 255, c[2] / 255];
+}
+
+/**
+ * `defines` of the terrain material for the lot-4 prototypes that are on
+ * (none when every flag is off: the program is the plain one).
+ */
+export function terrainDefines(
+  front: boolean,
+  night: boolean,
+): { defines?: Record<string, string> } {
+  if (!front && !night) return {};
+  const defines: Record<string, string> = {};
+  if (front) defines.FRONT_WAVE = "";
+  if (night) defines.NIGHT = "";
+  return { defines };
 }
 
 /** Uniforms of the terrain material (besides environment / water / fog). */
@@ -312,6 +348,39 @@ export class TerrainLayer implements ReliefSurface {
   private readonly recentFalloutMs: Float32Array | null;
   private falloutMsPending = 0;
 
+  // ---- Lot 4: living front (`?three_front=1`; all null when off) ----
+  /** Capture stamps, border events, front segments (FxLayer, OverlayLayer). */
+  readonly front: FrontField | null;
+  /** The stamps as an R16UI texture (the shader's `uFront`). */
+  private readonly frontTex: THREE.DataTexture | null;
+  private readonly frontUploader: TextureRectUploader | null;
+  private readonly frontUniforms: {
+    uFront: { value: THREE.Texture };
+    uFrontNow: { value: number };
+    uFrontLook: { value: THREE.Vector4 };
+  } | null;
+  /** Front texture uploads: this frame (pending), last frame, totals. */
+  private frontCallsPending = 0;
+  private frontTexelsPending = 0;
+  private frontCallsLastFrame = 0;
+  private frontTexelsLastFrame = 0;
+  private frontCallsTotal = 0;
+  private frontTexelsTotal = 0;
+  /** JS ms of the front field (ticks + sweep) since the last frame / last frame. */
+  private frontMsPending = 0;
+  private frontMsLastFrame = 0;
+  private frontMsMax = 0;
+  private readonly frontLook = {
+    gain: 0,
+    heat: 0,
+    neutral: 0,
+    interior: 0,
+  };
+  /** Frame time of the last update: captures are stamped with it. */
+  private lastNowMs = 0;
+  /** Lot 4: night and lights (null unless the night is on). */
+  readonly night: NightLighting | null;
+
   constructor(private readonly ctx: ThreeLayerContext) {
     const hf = ctx.heightField;
     this.hf = hf;
@@ -323,6 +392,27 @@ export class TerrainLayer implements ReliefSurface {
     this.recentTexels = perf ? new Int32Array(PERF_WINDOW) : null;
     this.recentFalloutMs = perf ? new Float32Array(PERF_WINDOW) : null;
     this.fallout = new FalloutField(this.W, this.H);
+    // Lot 4: living front, only with its URL flag (fixed for the page).
+    const frontOn = ctx.settings.prototypes?.front === true;
+    this.front = frontOn ? new FrontField(this.W, this.H) : null;
+    this.frontTex =
+      this.front !== null
+        ? createIntegerTexture(this.front.stamps, this.W, this.H, "R16UI")
+        : null;
+    this.frontUploader =
+      this.frontTex !== null ? new TextureRectUploader(this.frontTex) : null;
+    this.frontUniforms =
+      this.frontTex !== null
+        ? {
+            uFront: { value: this.frontTex },
+            uFrontNow: { value: 1 },
+            uFrontLook: { value: new THREE.Vector4() },
+          }
+        : null;
+    // Lot 4: night and lights, only with its URL flag.
+    const nightMode = nightModeOf(ctx.settings);
+    this.night =
+      nightMode !== null ? NightLighting.acquire(ctx, nightMode) : null;
 
     // ---- Textures ----
     this.terrainBytes = TerrainByteTexture.acquire(ctx);
@@ -420,7 +510,13 @@ export class TerrainLayer implements ReliefSurface {
         ...this.cosmetics.uniforms,
         // Shared by reference with WaterLayer (and the nukes' ribbons).
         ...this.trails.uniforms,
+        // Lot 4: living front (only with ?three_front=1).
+        ...this.frontUniforms,
+        // Lot 4: night and lights (shared with WaterLayer).
+        ...this.night?.uniforms,
       },
+      // Lot 4 prototypes compile their shader code in only when on.
+      ...terrainDefines(this.frontUniforms !== null, this.night !== null),
       fog: true,
     });
 
@@ -562,6 +658,8 @@ export class TerrainLayer implements ReliefSurface {
       textureData(tex) !== tileState
     ) {
       setTextureData(tex, tileState);
+      // Lot 4: no capture wave for a state that did not arrive as captures.
+      this.front?.reset(tileState);
       this.uploadAllTiles();
       // The fallout field re-reads the buffer over the next frames.
       this.fallout.reset(tileState);
@@ -573,6 +671,13 @@ export class TerrainLayer implements ReliefSurface {
     this.fallout.applyChanges(tileState, changedTiles);
     if (this.recentFalloutMs !== null) {
       this.falloutMsPending += performance.now() - t0;
+    }
+    // Lot 4: capture stamps (sent with the same rectangles), border events
+    // and front segments.
+    if (this.front !== null) {
+      const f0 = performance.now();
+      this.front.applyChanges(tileState, changedTiles, this.lastNowMs);
+      this.frontMsPending += performance.now() - f0;
     }
   }
 
@@ -611,6 +716,40 @@ export class TerrainLayer implements ReliefSurface {
       falloutRebuilding: this.fallout.rebuilding ? 1 : 0,
       falloutMsMax: maxF(this.recentFalloutMs),
       reliefTextureMB: this.reliefData.byteLength / (1 << 20),
+      // Lot 4: living front (only with ?three_front=1).
+      ...this.frontPerfStats(),
+      // Lot 4: night and lights (only when the night is on).
+      ...this.night?.perfStats(),
+    };
+  }
+
+  /**
+   * Living-front counters (`?three_front=1` only, else none): the stamp
+   * texture's uploads of the last frame (`frontUploadCalls`,
+   * `frontTexelsLastFrame`) and in total, its size, the field's JS time
+   * (`frontJsMs`: ticks and sweep since the previous frame, and the max over
+   * the session), captures of the last tick, live segments, active attacks
+   * and swept cells.
+   */
+  private frontPerfStats(): Record<string, number> {
+    const f = this.front;
+    if (f === null) return {};
+    const r3 = (v: number) => Math.round(v * 1000) / 1000;
+    return {
+      frontUploadCalls: this.frontCallsLastFrame,
+      frontTexelsLastFrame: this.frontTexelsLastFrame,
+      frontUploadCallsTotal: this.frontCallsTotal,
+      frontTexelsTotal: this.frontTexelsTotal,
+      frontTextureMB: f.stamps.byteLength / (1 << 20),
+      frontFieldMB: f.memoryMB,
+      frontJsMs: r3(this.frontMsLastFrame),
+      frontJsMsMax: r3(this.frontMsMax),
+      frontCaptures: f.capturesLastTick,
+      frontPvpCaptures: f.pvpLastTick,
+      frontSegments: f.segments.size,
+      frontAttacks: f.activeAttacks,
+      frontStampedCells: f.stampedCells,
+      frontSweptCells: f.sweptCells,
     };
   }
 
@@ -683,6 +822,47 @@ export class TerrainLayer implements ReliefSurface {
     this.refreshOverlaySettings();
     const key = waterColorKey(this.ctx.renderSettings.terrain);
     if (key !== this.waterKey) this.refreshColors();
+    if (this.front !== null) this.updateFront(frame);
+    this.night?.update(frame);
+  }
+
+  /**
+   * Lot 4 (living front): the sweep of stale stamps (its uploads within
+   * FRONT_SWEEP_BUDGET), the wave's clock and look; closes the frame's
+   * front counters.
+   */
+  private updateFront(frame: FrameInfo): void {
+    const f = this.front;
+    const u = this.frontUniforms;
+    if (f === null || u === null || this.frontUploader === null) return;
+    const t0 = performance.now();
+    this.lastNowMs = frame.nowMs;
+    f.sweep(frame.nowMs);
+    const q = f.sweepQueue;
+    if (!q.empty) {
+      for (const r of q.take(FRONT_SWEEP_BUDGET)) {
+        this.frontUploader.upload(this.ctx.renderer, r.x, r.y, r.w, r.h);
+        this.countFrontUpload(1, r.w * r.h);
+      }
+    }
+    u.uFrontNow.value = frontNowUnits(frame.nowMs);
+    const look = frontWaveLook(frame.cssPxPerTile, this.frontLook);
+    u.uFrontLook.value.set(look.gain, look.heat, look.neutral, look.interior);
+    this.frontMsPending += performance.now() - t0;
+    this.frontMsLastFrame = this.frontMsPending;
+    this.frontMsMax = Math.max(this.frontMsMax, this.frontMsPending);
+    this.frontMsPending = 0;
+    this.frontCallsLastFrame = this.frontCallsPending;
+    this.frontTexelsLastFrame = this.frontTexelsPending;
+    this.frontCallsPending = 0;
+    this.frontTexelsPending = 0;
+  }
+
+  private countFrontUpload(calls: number, texels: number): void {
+    this.frontCallsPending += calls;
+    this.frontTexelsPending += texels;
+    this.frontCallsTotal += calls;
+    this.frontTexelsTotal += texels;
   }
 
   dispose(): void {
@@ -696,6 +876,8 @@ export class TerrainLayer implements ReliefSurface {
     this.tileTex.dispose();
     this.relTex.dispose();
     this.reliefTex.dispose();
+    this.frontTex?.dispose();
+    this.night?.release();
     this.terrainBytes.release();
   }
 
@@ -708,6 +890,12 @@ export class TerrainLayer implements ReliefSurface {
     this.tilesUploaded = true;
     this.fullUploads++;
     this.countUpload(1, this.W * this.H);
+    // Lot 4: the capture stamps follow the tile state (same cells).
+    if (this.frontTex !== null) {
+      uploadNow(this.ctx.renderer, this.frontTex);
+      this.countFrontUpload(1, this.W * this.H);
+      this.front?.clearDirty();
+    }
   }
 
   /**
@@ -723,10 +911,22 @@ export class TerrainLayer implements ReliefSurface {
       } else {
         const rects = q.take(this.spawnPhase ? null : TILE_UPLOAD_BUDGET);
         const renderer = this.ctx.renderer;
+        const front = this.frontUploader;
+        const field = this.front;
         for (let i = 0; i < rects.length; i++) {
           const r = rects[i];
           this.tileUploader.upload(renderer, r.x, r.y, r.w, r.h);
           this.countUpload(1, r.w * r.h);
+          // Lot 4: the capture stamps of the same cells, in the same frame,
+          // only where a stamp changed (not for tiles lost to nobody).
+          if (
+            front !== null &&
+            field !== null &&
+            field.takeDirty(r.x, r.y, r.w, r.h)
+          ) {
+            front.upload(renderer, r.x, r.y, r.w, r.h);
+            this.countFrontUpload(1, r.w * r.h);
+          }
         }
       }
     }

@@ -67,6 +67,22 @@ export interface ThreeRenderSettings {
    * may read it to skip their own instrumentation when off.
    */
   perf: boolean;
+  /**
+   * Lot-4 visual prototypes, off by default and compiled out of the shaders
+   * when off (each is fixed for the page's lifetime):
+   * - `wakes`: foam wakes behind moving ships (`?three_wakes=1`)
+   * - `front`: living front - capture wave, border smoke/sparks, attack
+   *   arrows (`?three_front=1`)
+   * - `night`: night and lights - lit cities by level, nuke flash lighting
+   *   the ground (`?three_night=1`, see `nightModeOf` in NightLights.ts)
+   */
+  prototypes: ThreePrototypes;
+}
+
+export interface ThreePrototypes {
+  wakes: boolean;
+  front: boolean;
+  night: boolean;
 }
 
 export function defaultThreeSettings(): ThreeRenderSettings {
@@ -90,7 +106,13 @@ export function defaultThreeSettings(): ThreeRenderSettings {
     unitMinScreenPx: 10,
     structureMinScreenPx: 14,
     perf: false,
+    prototypes: { wakes: false, front: false, night: false },
   };
+}
+
+function flagParam(params: URLSearchParams, key: string): boolean {
+  const v = params.get(key)?.trim().toLowerCase();
+  return v === "1" || v === "true";
 }
 
 function finiteParam(params: URLSearchParams, key: string): number | null {
@@ -125,6 +147,7 @@ function antialiasParam(value: string | null): ThreeAntialias | null {
  * - `three_bloom=0|1`  → force bloom off/on
  * - `three_aa=msaa|fxaa|off` (`1` = msaa, `0` = off) → anti-aliasing
  * - `three_perf=1`     → performance panel and `window.__threePerf()`
+ * - `three_wakes=1`, `three_front=1`, `three_night=1` → lot-4 prototypes
  */
 export function readThreeSettingsFromUrl(
   search: string = threeSettingsSearch(),
@@ -148,8 +171,12 @@ export function readThreeSettingsFromUrl(
   if (bloom === "0" || bloom === "1") s.bloom = bloom === "1";
   const aa = antialiasParam(params.get("three_aa"));
   if (aa !== null) s.antialias = aa;
-  const perf = params.get("three_perf");
-  s.perf = perf === "1" || perf?.toLowerCase() === "true";
+  s.perf = flagParam(params, "three_perf");
+  s.prototypes = {
+    wakes: flagParam(params, "three_wakes"),
+    front: flagParam(params, "three_front"),
+    night: flagParam(params, "three_night"),
+  };
   return s;
 }
 

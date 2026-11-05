@@ -314,6 +314,9 @@ export class ThreeMapRenderer implements MapRendererLike {
       this.fx = track("fx", () => new FxLayer(this.ctx));
       // Lot 3: the fallout smoke rises from the terrain's fallout cells.
       this.fx.setFallout(this.terrain.fallout);
+      // Lot 4: the living front (null unless ?three_front=1).
+      this.fx.setFront(this.terrain.front);
+      this.overlay.setFront(this.terrain.front);
       this.names = track("names", () => new NameLayer(this.ctx));
       this.frameLayers = [
         this.environment,
@@ -497,6 +500,8 @@ export class ThreeMapRenderer implements MapRendererLike {
   updateRelations(data: Uint8Array, size: number): void {
     this.terrain.setRelations(data, size);
     this.structures.setRelations(data, size);
+    // Lot 4: the front arrows' alt-view colours (only with ?three_front=1).
+    if (this.terrain.front !== null) this.overlay.setFrontRelations(data, size);
   }
 
   // ---- Players / palette ----
@@ -577,6 +582,8 @@ export class ThreeMapRenderer implements MapRendererLike {
     const t0 = this.perfNow();
     this.names.updateNames(names, players, snap, statusData);
     this.syncSamAllies(players);
+    // Lot 4: the attacks the living front's arrows follow (flag only).
+    this.terrain.front?.setAttacks(players);
     this.perf?.call("updateNames", performance.now() - t0);
   }
 
@@ -606,6 +613,8 @@ export class ThreeMapRenderer implements MapRendererLike {
   updateStructures(units: Map<number, UnitState>): void {
     const t0 = this.perfNow();
     this.structures.updateStructures(units);
+    // Lot 4: the night's city lights (null unless the night is on).
+    this.terrain.night?.setStructures(units);
     this.overlay.setSamStructures(units);
     this.terrain.setDefenseCoverage(units);
     this.perf?.call("updateStructures", performance.now() - t0);

@@ -28,6 +28,11 @@
  *   nukes (`nukeAltitude`, NukeFlight.Arc) drawn with fat lines (white, dashed
  *   in the untargetable stretch, red after the first SAM intercept) over a
  *   dark halo, plus a faint dashed ground track.
+ *
+ * Lot 4 prototype, living front (`?three_front=1` only; nothing of it is
+ * created otherwise): animated attack arrows from attacker into defender
+ * along active fronts (`FrontArrows`, LivingFront.ts), fed by TerrainLayer's
+ * `FrontField` (`setFront`), one instanced draw call.
  */
 
 import * as THREE from "three";
@@ -46,7 +51,9 @@ import {
   type NukeTrajectoryData,
   type UnitState,
 } from "../types";
+import type { FrontField } from "./FrontField";
 import type { HeightField } from "./HeightField";
+import { FrontArrows } from "./LivingFront";
 import {
   createStructureGeometry,
   nextCapacity,
@@ -846,6 +853,9 @@ export class OverlayLayer {
   private moveIndicators: TimedMarker[] = [];
   private blockedFlashes: TimedMarker[] = [];
   private readonly scratch = new THREE.Color();
+  // Lot 4: living front arrows (`?three_front=1`; null when off).
+  private frontArrows: FrontArrows | null = null;
+  private frontField: FrontField | null = null;
 
   constructor(
     private readonly ctx: ThreeLayerContext,
@@ -1086,6 +1096,26 @@ export class OverlayLayer {
     this.samRings.setAllianceClusters(clusters);
   }
 
+  /**
+   * Lot 4: the living front's segments (TerrainLayer's field); the arrows
+   * exist only with `?three_front=1` and a field.
+   */
+  setFront(field: FrontField | null): void {
+    this.frontField = field;
+    if (
+      field !== null &&
+      this.frontArrows === null &&
+      this.ctx.settings.prototypes?.front === true
+    ) {
+      this.frontArrows = new FrontArrows(this.group, this.ctx);
+    }
+  }
+
+  /** Lot 4: relations for the front arrows' alt-view colours (flag only). */
+  setFrontRelations(data: Uint8Array, size: number): void {
+    this.frontArrows?.setRelations(data, size);
+  }
+
   /** Build-bar highlight (null = none): SAM / bomb buttons show the rings. */
   setHighlightStructureTypes(types: readonly string[] | null): void {
     this.samRings.setHighlightTypes(types);
@@ -1110,6 +1140,14 @@ export class OverlayLayer {
       samRebuilds: sam.rebuilds,
       samBuildMs: sam.buildMs,
       samBuildMsMax: sam.buildMsMax,
+      // Lot 4: living front arrows (only with ?three_front=1).
+      ...(this.frontArrows !== null
+        ? {
+            frontArrows: this.frontArrows.drawn,
+            frontArrowCandidates: this.frontArrows.candidates,
+            frontJsMs: Math.round(this.frontArrows.lastMs * 1000) / 1000,
+          }
+        : {}),
     };
   }
 
@@ -1120,6 +1158,8 @@ export class OverlayLayer {
     this.samRings.update(frame);
     this.telegraphs.update(frame);
     this.rangeRing.update(frame);
+    // Lot 4: living front arrows (only with ?three_front=1).
+    this.frontArrows?.update(frame, this.frontField, this.hf);
     // Dash lengths in CSS px: line distances are in tiles.
     this.arcDashed.material.dashScale = zoom;
     this.groundTrack.material.dashScale = zoom;
@@ -1194,6 +1234,7 @@ export class OverlayLayer {
     this.telegraphs.dispose();
     this.rangeRing.dispose();
     this.markers.dispose();
+    this.frontArrows?.dispose();
     for (const fl of [
       this.arcHalo,
       this.arcSolid,

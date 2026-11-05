@@ -22,6 +22,10 @@
  * same water shading; the plane shows beyond it. The shallow-water look
  * narrows when zoomed out (`shoreViewScale` in shaders/water.ts).
  *
+ * Lot 4 prototype, night (`nightModeOf`): the scene's `NightLighting`
+ * uniforms and the NIGHT define (city lights on the harbours, flashes on
+ * the sea); off, neither exists.
+ *
  * Draw order: transparent queue with `renderOrder` -10 (before other
  * transparent objects, which should keep renderOrder >= 0), depth-writing,
  * pushed back slightly with a polygon offset so coastal relief at sea level
@@ -31,6 +35,7 @@
 import * as THREE from "three";
 import type { TerrainRect } from "../types";
 import { EffectTrails } from "./EffectTrails";
+import { NightLighting, nightModeOf } from "./NightLights";
 import { environmentUniforms } from "./SceneEnvironment";
 import { WATER_FRAG, WATER_VERT } from "./shaders/water";
 import {
@@ -61,12 +66,17 @@ export class WaterLayer {
   };
   private colorKey = "";
   private readonly trails: EffectTrails;
+  /** Lot 4: night and lights (null unless the night is on). */
+  private readonly night: NightLighting | null;
 
   constructor(private readonly ctx: ThreeLayerContext) {
     const W = ctx.mapWidth;
     const H = ctx.mapHeight;
     this.terrainBytes = TerrainByteTexture.acquire(ctx);
     this.trails = EffectTrails.acquire(ctx);
+    const nightMode = nightModeOf(ctx.settings);
+    this.night =
+      nightMode !== null ? NightLighting.acquire(ctx, nightMode) : null;
 
     this.u = {
       ...createWaterUniforms(),
@@ -96,7 +106,10 @@ export class WaterLayer {
         ...this.u,
         // Shared by reference with the terrain material.
         ...this.trails.uniforms,
+        // Lot 4: night and lights (TerrainLayer drives them).
+        ...this.night?.uniforms,
       },
+      ...(this.night !== null ? { defines: { NIGHT: "" } } : {}),
       transparent: true,
       depthWrite: true,
       fog: true,
@@ -139,6 +152,7 @@ export class WaterLayer {
     this.material.dispose();
     this.terrainBytes.release();
     this.trails.release();
+    this.night?.release();
   }
 
   private refreshColors(): void {

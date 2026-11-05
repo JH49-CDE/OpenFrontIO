@@ -11,6 +11,7 @@
  */
 
 import { EFFECT_TRAILS_GLSL } from "../EffectTrails";
+import { NIGHT_GLSL } from "./night";
 
 /** Fragment output for GLSL3 ShaderMaterials (three's chunks use gl_FragColor). */
 export const FRAG_OUTPUT = /* glsl */ `
@@ -315,6 +316,13 @@ uniform float uSeabedDepth; // world depth of the deepest seabed (tiles)
 ${EFFECT_TRAILS_GLSL}
 // ---- END effect trails uniforms
 
+// ---- BEGIN lot 4: night and lights (NIGHT; NightLights.ts), compiled in
+// only with the define (?three_night=1).
+#ifdef NIGHT
+${NIGHT_GLSL}
+#endif
+// ---- END lot 4: night uniforms
+
 varying vec3 vWorld;
 #include <fog_pars_fragment>
 
@@ -367,6 +375,10 @@ void main() {
   float composite = dOut > 0.0 ? 1.0 : smoothstep(-2.0, 0.0, max(sd.x, sd.y));
   col = mix(col, mix(seabedAlbedo(mag * shoreViewScale(tpp)) * diffuseLight(UP), wtr.rgb, wtr.a), composite);
   alpha = mix(alpha, 1.0, composite);
+#ifdef NIGHT
+  // Lot 4, night: city lights on the harbours, flashes on the sea.
+  col = nightWater(col, vWorld);
+#endif
   col *= mix(1.0, 0.6, uAltView);
 
   // ---- BEGIN effect trails composite (boat / nuke trails, EffectTrails.ts):

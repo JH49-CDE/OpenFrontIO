@@ -57,6 +57,7 @@ import {
   type PlayerStatic,
   type PlayerStatusData,
 } from "../types";
+import { nightModeOf } from "./NightLights";
 import type { FrameInfo, ProjectFn, ThreeLayerContext } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -405,6 +406,18 @@ export function ensureOverpassFont(): void {
   }
 }
 
+/**
+ * Lot 4, night (`?three_night=1` only; the class is never set otherwise):
+ * the names' dark grey text loses its contrast on the moonlit map, so it
+ * turns light with a dark outline (the inline per-label colours are
+ * overridden; traitors stay red, lighter).
+ */
+export const NIGHT_NAME_CSS = `
+.ofn-night .ofn-label{color:#e8e8e8 !important;
+  -webkit-text-stroke-color:rgba(10,12,18,.9) !important;}
+.ofn-night .ofn-traitor .ofn-name,.ofn-night .ofn-traitor .ofn-troops{color:#ff8a80 !important;}
+`;
+
 function layerCss(): string {
   const icon = ICON_PX.toFixed(2);
   return `
@@ -563,6 +576,11 @@ export class NameLayer {
     this.container.dataset.layer = "names";
     const style = document.createElement("style");
     style.textContent = layerCss();
+    // Lot 4, night (`?three_night=1` only): light names on the dark map.
+    if (nightModeOf(ctx.settings) !== null) {
+      style.textContent += NIGHT_NAME_CSS;
+      this.container.classList.add("ofn-night");
+    }
     this.container.appendChild(style);
     this.namesRoot = document.createElement("div");
     this.namesRoot.className = "ofn-layer";

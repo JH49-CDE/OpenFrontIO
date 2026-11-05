@@ -44,6 +44,9 @@ Fallbacks:
 | `three_bloom=0`/`1`          | Force bloom off or on (also on top of `three_quality=low`)                              |
 | `three_aa=msaa`/`fxaa`/`off` | Anti-aliasing technique (`1` = `msaa`, `0` = `off`; default `msaa`), see below          |
 | `three_perf=1`               | Performance panel and `window.__threePerf()`, see below                                 |
+| `three_wakes=1`              | Lot-4 prototype: ship wakes (foam V and stern wash behind moving ships)                 |
+| `three_front=1`              | Lot-4 prototype: the living front (capture wave, smoke and sparks, attack arrows)       |
+| `three_night=1`              | Lot-4 prototype: night and lights (moonlit map, lit cities, impact flashes)             |
 
 `three_quality=low` also draws railways as flat strips only, switches
 units and structures to their low-poly models from closer zooms and keeps
@@ -146,10 +149,13 @@ ClientGameRunner ──import()──► ThreeMapRenderer (facade, implements Ma
   | `StructureLayer.ts`                                        | Icons when zoomed out (`StructureIcons.ts`) fading into instanced models standing on pads fitted to the land and the relief; bars, level badges                               |
   | `UnitLayer.ts`                                             | Instanced ships, trains, nukes, shells and missiles (culled, low-poly when small); health bars; nuke / SAM ribbons (nuke contrails, or their owner's trail effect)            |
   | `RailTracks.ts` (owned by `UnitLayer`)                     | Railways: per-block ballast strips, sleepers and rails close up                                                                                                               |
+  | `WakeLayer.ts` (owned by `UnitLayer`)                      | Ship wakes (lot 4, `three_wakes=1`): foam V and stern wash behind moving ships, one instanced draw over the sea                                                               |
   | `OverlayLayer.ts`                                          | Build ghost and range ring, nuke arc, nuke target rings, attack rings, move and blocked markers                                                                               |
   | `SpawnOverlay.ts`, `SamRings.ts` (owned by `OverlayLayer`) | Spawn halos; SAM range rings                                                                                                                                                  |
   | `FxLayer.ts`                                               | Explosions, mushroom clouds, shockwaves, smoke, sparkles; smoke over fallout zones (`FalloutField.ts`, kept by `TerrainLayer`)                                                |
   | `NameLayer.ts`                                             | Player names, troop counts, flags, attack labels, gold popups (DOM)                                                                                                           |
+  | `FrontField.ts`, `LivingFront.ts` (lot 4, `three_front=1`) | Living front: capture stamps, border events and front segments (TerrainLayer's); smoke and sparks (FxLayer), attack arrows (OverlayLayer)                                     |
+  | `NightLights.ts`, `shaders/night.ts` (lot 4)               | Night (`three_night=1`): moonlit environment, city lightmap and impact flashes (terrain, water), lit windows (structures), light names                                        |
 
   The helpers are `ProceduralMeshes.ts` (all models, built in code),
   `StatusBars.ts`, `PaletteView.ts`, `TerrainCodec.ts`,
@@ -195,7 +201,7 @@ ones are documented in the code and below.
 | `addPlayers`, `updatePlayerCosmetics`, `initSkinAtlas`, `setPlayerSkin`, `setPlayerSpawn`                                                   | Names, flags, crowns (`NameLayer`); territory patterns and skins (`TerritoryCosmetics`); team mode from the players' teams                                                                                                            |
 | `uploadLiveTrailDelta`, `updateEffectPalette`                                                                                               | Boat / nuke trails and the effect palette (`EffectTrails`), nuke ribbons in effect colours (`UnitLayer`)                                                                                                                              |
 | `updateNames`, `refreshNames`, `setAttackTroopLabels`, `applyBonusEvents`                                                                   | Names, troop counts, attack labels, gold popups (`NameLayer`); `updateNames` also gives the SAM rings the local player's allies                                                                                                       |
-| `updateUnits`, `updateStructures`, `applyDeadUnits`, `applyConquestEvents`, `setSelectedUnits`, `uploadRailroadState`                       | Units, structures (icons ↔ models), bars, badges, SAM ring inputs, FX, railways                                                                                                                                                       |
+| `updateUnits`, `updateStructures`, `applyDeadUnits`, `applyConquestEvents`, `setSelectedUnits`, `uploadRailroadState`                       | Units, structures (icons ↔ models), bars, badges, SAM ring inputs, FX, railways; the night's city lights (lot 4)                                                                                                                      |
 | `setHighlightStructureTypes`, `updateGhostPreview`, `setSAMAllianceClusters`                                                                | Build-bar highlight (icons), build ghost (model + icon), range ring, SAM range rings                                                                                                                                                  |
 | `updateNukeTrajectory`, `updateNukeTelegraphs`, `updateAttackRings`, `showMoveIndicator`, `triggerBlockedFlash`                             | `OverlayLayer` overlays                                                                                                                                                                                                               |
 | `updateSpawnOverlay`, `updateSmallPlayerGlow`, `setGridView`                                                                                | Spawn halos, small-player glow, coordinate grid (see "Parity overlays")                                                                                                                                                               |
@@ -1161,6 +1167,387 @@ relief texture matches the mesh normals and heights; the fallout field
 fed from the tile path) and `FxLayer.test.ts` (smoke only over fallout in
 view and close enough, within its slots, halved at low quality).
 
+## Lot 4 prototypes
+
+The first three ideas of the lot-4 proposal, each behind its own URL flag
+(`ThreeSettings.prototypes`, read once with the other `three_*`
+parameters, so fixed for the page):
+
+| Flag            | Prototype        | Files                                                         |
+| --------------- | ---------------- | ------------------------------------------------------------- |
+| `three_wakes=1` | Ship wakes       | `WakeLayer.ts` (owned by `UnitLayer`)                         |
+| `three_front=1` | Living front     | `FrontField.ts`, `LivingFront.ts`, `shaders/terrain.ts`       |
+| `three_night=1` | Night and lights | `NightLights.ts`, `shaders/night.ts` (+ the layers it lights) |
+
+They combine freely (`?renderer=three&three_wakes=1&three_front=1&three_night=1`)
+and are off by default. Only the URL flag turns the night on: the default
+renderer's "Night" graphics preset (or a darker ambient setting) does not,
+so a player with that preset keeps the plain day programs; with the flag
+on, a darker ambient still deepens the night.
+
+### Off costs nothing
+
+- **By construction.** Without its flag a prototype creates no object,
+  texture, uniform, define, draw call or perfStats key. Its shader code
+  sits in `#ifdef FRONT_WAVE`, `#ifdef NIGHT` and `#ifdef NIGHT_WINDOWS`
+  blocks, and those defines are set in a material's `defines` only at
+  creation, so the preprocessor removes the code (never a uniform branch:
+  the lot-3 triage showed that SwiftShader pays for every line of the
+  terrain program and a GPU pays in register pressure). The wakes have no
+  shader code in any other program: their material is never created. What
+  is left per frame or event is a null check (`UnitLayer.update`,
+  `TerrainLayer.update` / `setTiles`, `FxLayer.update` and its impacts,
+  `OverlayLayer.update`, the facade's `updateNames`, `updateStructures`
+  and `updateRelations`).
+- **Checked headless against HEAD `dc644db`** (the commit before lot 4),
+  no `three_*` prototype flag, the same recorded states and fixed cameras
+  and clock: the canvas (`readPixels` right after `composer.render`) of
+  the late World state at 0.7, 1.8, 5, 11 and 20 CSS px per tile and of
+  the fallout state at 0.7, 5, 11 and 1.8 in the alt view: **0 differing
+  pixels in 9 of 9 views**. Every linked program's translated shader
+  (post-preprocessor, captured through `WEBGL_debug_shaders`) is
+  byte-identical to HEAD's (19 programs on the late state, 18 on the
+  fallout state), and none contains a lot-4 identifier. Two HEAD sessions
+  give the same pixels too, so the check is deterministic. The
+  `shaderDefines.ts` test helper resolves the `#ifdef` blocks the same
+  way, and the tests assert that nothing of a prototype is left without its
+  define.
+
+### Ship wakes (`three_wakes=1`, `WakeLayer.ts`, owned by `UnitLayer`)
+
+Every moving transport, trade ship and warship leaves foam on the sea: a
+Kelvin-like V (arms at ±19.5° from the bow, ending at 60% of the wake's
+length) and a streaky wash on the centre line behind the stern that
+outlasts the arms. Close up (a ship over ~25-60 device px) faint feathers
+run along the arms and the water inside the V is churned. The foam noise is
+stretched along the track and anchored to the water (the ship's odometer
+minus the distance behind its bow), so it stays put as the ship sails on.
+Lit like the water's own foam, fogged, clipped to water tiles (no foam on
+the shore), depth-tested, 55% in the alt view, 50% at night.
+
+- **Military first** (`WAKE_KINDS`, `wakeKindStrength`): zoomed out
+  (≤ 2.5 CSS px per tile) a trade ship's wake is faint (0.55), a
+  transport's (1.35) and a warship's (1.5, ×1.15 length, ×1.3 wash) strong;
+  trade wakes reach full strength from 6 px per tile.
+- **Look by zoom** (`wakeLook`, in drawn ship lengths, the model × its
+  min-size boost): full map (≤ 0.9) a short streak of 1.6 ship lengths, no
+  arms, opacity 0.4; the V grows in over 0.9-1.6; at the default 1.8, 2
+  ship lengths at 0.65; from 10 px per tile 2.6 at 0.85. Foam coverage is
+  capped at 0.85 (`WAKE_MAX_ALPHA`: never brighter than the coast's foam).
+- **Crowds** (lanes, port queues): wakes whose apex shares a ~32 CSS px
+  cell are each dimmed by 1/√n (`wakeCrowdDim`, a 4,096-slot hash per
+  frame, no allocation), so convoy lanes do not merge into white bands.
+- **Kinematics**: from UnitLayer's tracks (tick segment and drawn
+  position). The velocity is an exponential average (350 ms) of the tick
+  segments, a steady heading on 4-connected diagonal courses; strength is
+  smoothstep(0.08, 0.5) of the speed in tiles per tick, so a stopped or
+  docked ship's wake fades within ~0.4-1.2 s.
+- **Draw**: one instanced draw (a trapezoid of 2 triangles per wake at
+  Y = 0.03, renderOrder −8 between the sea and the contact shadows, no depth
+  write), 9 floats per instance in one interleaved buffer (1,024 × 36 B),
+  one ranged upload of n × 36 B per frame. Only wakes whose bounding sphere
+  is in the view, at most `WAKE_MAX_INSTANCES` (1,024); trade ships stop
+  `WAKE_MILITARY_RESERVE` (64) short of it, so the cap never drops a
+  transport or a warship.
+- **Per wake fragment** (static count): 1 `texelFetch` (the shared R8UI
+  terrain bytes, no new texture), 1 value noise (+1 close up), 2 `exp`, 2
+  `pow`, a `sin` close up, 1 `fwidth`.
+- **Counters** (`units`, flag on only): `wakeInstances`, `wakeCulled`,
+  `wakeCapped`, `wakeJsMs` / `wakeJsMsMax` (with `three_perf=1`),
+  `wakeUploadKB`.
+- **Limits**: a rigid V (no history ribbon), so on a sharp turn it swings
+  with the averaged heading instead of curving; clipped per tile at coasts
+  (stepped close up, like the sea plane); coastal relief can hide part of a
+  wake at the shore. Not done on purpose: a `MAX` blend (with premultiplied
+  foam over the sea it would only keep the brighter of foam and water, not
+  foam over water; the crowd dimming and the alpha cap handle overlaps) and
+  dropping arms by heading stability (a 4-connected diagonal course has
+  |mean velocity| / mean speed = 0.71, the same as a zig-zag).
+- **Testing**: `ShipWakes.test.ts`.
+
+### Living front (`three_front=1`, `FrontField.ts`, `LivingFront.ts`)
+
+The war reads on the map itself. Three parts, all fed by the tiles that
+change hands:
+
+- **Capture wave** (terrain shader, `#ifdef FRONT_WAVE`). A freshly
+  captured tile glows: light **added** to the lit, relief-shaded ground (the
+  fill and the hillshade read through it), white-hot for the freshest
+  captures (`FRONT_HOT_S`, 0.15 s), then the new owner's colour with its
+  chroma boosted (a grey or blue owner stays tinted, never washes out to
+  white or "water"). One fast rise and a sharp decay (`frontPulse`:
+  `FRONT_DECAY_S` 0.22 s plus a faint tail to `FRONT_PULSE_MS`, 1.3 s), no
+  ripple, so it is bright on the last ~3 ticks' captures only: the moving
+  front line, not a band 5-15 tiles deep. Tiles still on a border get it in
+  full, tiles inside the captured band a share (`frontWaveLook.interior`,
+  0.3 close up). Zoomed out it is a strong white-hot line with a touch of
+  bloom, close up a softer glow (`frontWaveLook`); ×0.6 at night;
+  affiliation colours in the alt view. Captures of unclaimed land at 35%.
+  The age is blended over the 4 tile centres around the sample point; the
+  glow never leaves the captured tile.
+- **Smoke and sparks** (FxLayer, `FrontParticles`). Where a tile taken
+  from another player is **still on the front when the puff spawns**
+  (`FrontField.onBorder`): a light warm-grey puff (linear 0.3 → 0.55,
+  opacity ≤ 0.38) rising 0.6 tile above the ground and dissolving as it
+  grows over 1.3-1.9 s, and close up a short pop and 2-3 sparks. At most
+  `FRONT_SPAWN_PER_FRAME` (8) events per frame, picked uniformly among the
+  events in view younger than 400 ms; two pools of FxLayer's materials
+  (no new program), `FRONT_SMOKE_CAPACITY` (160) puffs and
+  `FRONT_SPARK_CAPACITY` (240) sparks (halved at low quality); none at
+  and under 1.3 px per tile (`frontParticleLook`).
+- **Attack arrows** (OverlayLayer, `FrontArrows`). Three chevrons marching
+  from the attacker into the defender, in the attacker's colour (its
+  affiliation colour in the alt view) inside a dark outline, one per front
+  cluster (`FrontField.cluster`, cells ~150 CSS px apart:
+  `frontArrowCell`), only for pairs with an active, non-retreating attack
+  (`outgoingAttacks` through the facade's `updateNames`) whose front still
+  moves, the heaviest `FRONT_ARROW_CAP` (32) in view. When two players
+  attack each other in one cell, only the heavier side gets an arrow
+  (crossing chevrons read as "#"). A front that stops fades out **where it
+  is** in 200 ms (no ghost gliding behind the front). 32 CSS px long at full
+  map (the name labels stay readable), 64 from 5 px per tile, 84 from 12,
+  × 0.85-1.15 by troops. One instanced draw, no depth test, under the
+  structure icons and the DOM names.
+
+**Data path** (`FrontField`, pure; built by TerrainLayer only with the
+flag): a shadow copy of the tile state gives the previous owner of each
+changed tile (`applyChanges`, O(changed tiles) per tick); capture stamps
+(R16UI, 15 bits of time in 50 ms units + a "from a player" bit) go up with
+the tile state's own rectangles, but **only the rectangles where a stamp
+changed** (`takeDirty`): tiles lost to nobody (a nuke, fallout) or other
+bit changes cost no stamp upload; a full tile upload sends them in full; a
+sweep zeroes cells older than 8 min long before the stamps wrap (27 min),
+at most one rectangle per frame. Border events: ≤ 256 per tick in a ring
+of 2,048. Front segments: per 32-tile cell and (attacker, defender) pair,
+decaying sums (weight and direction 2.5 s, position 250 ms).
+
+**Counters** (flag on only): `terrain.frontUploadCalls`,
+`frontTexelsLastFrame`, `frontUploadCallsTotal`, `frontTexelsTotal`,
+`frontTextureMB`, `frontFieldMB`, `frontJsMs` / `frontJsMsMax` (the
+field's JS since the previous frame), `frontCaptures`,
+`frontPvpCaptures`, `frontSegments`, `frontAttacks`, `frontStampedCells`,
+`frontSweptCells`; `fx.frontParticles`, `frontSmoke`, `frontSparks`,
+`frontSpawnedLastFrame`, `frontSpawnedTotal`, `frontJsMs` (the front pools
+are in `fillScreens`); `overlay.frontArrows`, `frontArrowCandidates`,
+`frontJsMs`.
+
+**Per fragment** (static count): owned land outside fallout, 1 R16UI
+`texelFetch` and a `mod`; inside the glow (captures younger than 1.3 s),
+4 more R16UI fetches, 1 palette fetch, 2 `exp` and 3 `pow` (sRGB to
+linear), no noise. Arrows: 3 segment distances, no texture. Particles:
+FxLayer's sprite shaders.
+
+**A hydrogen bomb** (61,529 tiles to nobody in one tick, `FrontField` in
+node): `applyChanges` 5.0 ms the first (cold) call, 0.3 ms warm, 0 dirty
+stamp cells, so no stamp upload (tested: "sends no stamps for tiles lost
+to nobody"). 1,000 captures from players in one tick: 5.8 ms cold.
+
+**Limits**: arrows only follow moving fronts (a stalled attack shows
+none); they are not pushed out of the name labels (smaller at full map
+instead); expansion into unclaimed land gets a 35% glow and no smoke or
+arrows; during the spawn phase every tick's captures glow (neutral, 35%).
+
+**Testing**: `LivingFront.test.ts`.
+
+### Night and lights (`three_night=1`, `NightLights.ts`, `shaders/night.ts`)
+
+The idea of the default renderer's night (`NightCompositePass`: the scene
+× (ambient + a lightmap of point lights)) redone for a lit 3D scene: no
+extra pass or draw call, the lights are read by the programs that already
+draw the ground, the water, the models and the smoke.
+
+- **Moonlight**: `SceneEnvironment.setNightDepth` blends the sun, sky fill,
+  sky dome and fog towards a dim cool moon (`NIGHT_ENVIRONMENT`; exact
+  back at depth 0). Terrain, water, wakes and every lit model follow
+  through the shared uniforms. The ground is desaturated towards blue-grey
+  (65%), the sea 39% and then lifted over a moonlit navy floor, so the
+  shallow-water gradient, the shore foam and the ships still read.
+- **Territories and names stay readable** (`nightLook`): the fill keeps
+  30% of its day brightness at full map (16% close up), a little
+  desaturated, the borders 45% (35%). The DOM names turn light with a dark
+  outline (`NIGHT_NAME_CSS`, a class set at construction; traitors stay
+  red). Icons, badges, bars, the grid and spawn halos are unlit UI and stay
+  as they are.
+- **City lights** (`NightLightmap`): one light per structure
+  (`structureLight`): cities by level (radius 10 → 36 tiles, intensity
+  1.1 → 2.9 with log2 of the level), ports and factories smaller (factories
+  orange), defense posts and SAM launchers small cool points, silos red, a
+  quarter while under construction. Each light is a bright core (Gaussian,
+  σ = 0.16 R, 88%) and a faint halo (12%) out to R, splatted into a
+  lightmap of 1 texel per 4 tiles on World (502 × 252 RGBA8, 0.48 MB,
+  square-root encoded, a black margin), plus a wide glow in alpha shown
+  only zoomed out around the icons. The ground gets the **lamp's own warm
+  colour** modulated by the ground's brightness (not tinted by the
+  territory: no mint or red haze), with a soft knee so the biggest cores do
+  not clip, and a street-light grain (one value noise, 3 cells per tile)
+  between ~2.5 and ~5 px per tile.
+- **Rails** glow faintly in their own colour (`RAIL_NIGHT_GLOW`, the
+  strip material's emissive; no shader change), so they never turn into
+  black lines that read as borders.
+- **Lit windows** (`NIGHT_WINDOWS` in `createPartMaterial`,
+  `addWindowMask`, `windowShare`): panes on the vertical plastered walls
+  and glass bands, each lit or not by a hash, 30% of a level-1 city's up
+  to 61%, factories 55%, ports 35%; fading to their mean from ~4.5 to ~2.5
+  px per window cell (no sparkle on towers). Structures self-lit at 0.13 ×
+  albedo; units by zoom (`nightLook.units`: 0.35 zoomed out, where a ship
+  is a few pixels on the night sea, to 0.13 close up).
+- **Impact flashes** (`NightFlashes`, `nightFlashFor` in FxLayer): each
+  impact that flashes FxLayer's point lights also starts one of 4 ground
+  flashes (uniforms; an atom bomb lights 60 tiles for 1.5 s, a hydrogen
+  bomb ~140 tiles for ~2.3 s, white-hot then orange). On land the ground's
+  colour is mostly whitened under the flash (a nuke lights the land white,
+  not magenta or cyan); on the sea it is added as light on a pale surface,
+  so the water around ground zero lights up too.
+- **Fallout**: the burnt ash keeps its relief under the moon (the moonlit
+  shading lifted ×3.4 on the zone) and a faint glow of its own colour (no
+  green tint); embers ×1.5.
+- **Bloom** catches the lit windows close up, the embers and the flashes;
+  the lamp light stays mostly under it.
+
+**Data path** (`NightLighting`, one per scene, refcounted by TerrainLayer,
+WaterLayer, StructureLayer, UnitLayer and FxLayer; TerrainLayer drives its
+`update`): the facade's `updateStructures` diffs the lights by unit id
+(O(units)) and marks the 16 × 16-texel cells under a changed light dirty
+in a `TileUploadQueue`; per frame at most 4 rectangles / 8,192 texels /
+1 ms (`LIGHTMAP_BUDGET`, `LIGHTMAP_BUDGET_MS`; the first rectangle always
+goes) are rebuilt (squared distances and a kernel table, no sqrt or exp per
+texel) and each sent with one `texSubImage2D`; the 4 flash slots and the
+look go to uniforms.
+
+**Counters** (`terrain`, night only): `nightDepth`, `nightLights`,
+`nightLightmapBuilds`, `nightLightmapRectsLastFrame`,
+`nightLightmapTexelsLastFrame`, `nightLightmapPendingCells`,
+`nightLightmapMs`, `nightLightmapMsMax`, `nightLightmapMB`,
+`nightFlashLights`, `nightFlashesStarted`.
+
+**Per fragment** (static count): terrain land, 1 bilinear lightmap fetch,
+the desaturation, fill and border keep, the lamp term and its knee, a
+flash loop over the live slots (`uFlashN`, 0 most of the time; per slot a
+length, a normalize, a dot and the falloff), 1 value noise for the grain
+only in bright cores at ~2.5-5 px per tile (a branch); the terrain's water
+path and the sea plane, 1 fetch, the flash loop and the lift; structure
+fragments, the window grid (an integer hash, 6 smoothsteps, 1 `fwidth`)
+on marked walls and the self-light; unit fragments, the self-light; FX
+smoke, 1 dot and 1 smoothstep. No new texture fetch on models or FX.
+
+**Limits**: the lightmap is static per structure (ships, trains and bombs
+in flight cast no ground light; ships are self-lit, bombs keep their
+exhausts); flashes light the terrain and the water, models only through
+FxLayer's point lights (high quality); the moon shines from the sun's
+direction; the fallout's embers still read as dots on the dark zone; the
+structure icons are not dimmed (UI). The first lightmap build of a late
+game (394 lights) takes 13 frames and one cold 7-9 ms frame (the time
+budget is checked between rectangles, the first always goes).
+
+**Testing**: `NightLights.test.ts`.
+
+### Costs, measured headless (not a frame rate)
+
+The recorded late World state (2000 × 1000, tick 19,405: 394 structures,
+897 moving trade ships, 7 warships), 1920 × 1032, high quality, a fixed
+clock, the same four cameras for every configuration (full map 0.7, then
+the densest city area at 1.8, 5 and 11 CSS px per tile), one session per
+configuration. The render time is one synced render (median of 3: a 1 × 1
+`readPixels`, `composer.render`, a 1 × 1 `readPixels`) under SwiftShader,
+a proxy for program size and fill, never a GPU time; separate sessions
+spread by ±5-10%. The flag-off baseline: 23 / 25 / 35 / 34 draw calls,
+1,047k / 1,114k / 1,122k / 1,148k triangles, 16-19 programs, 26
+textures, 12,167 / 6,717 / 4,263 / 3,955 ms.
+
+**Wakes** (`three_wakes=1`):
+
+| View (px per tile) | Draw calls | Triangles | Wakes drawn (culled) | Wake JS per frame | Uploaded per frame | Render ms off / on |
+| ------------------ | ---------- | --------- | -------------------- | ----------------- | ------------------ | ------------------ |
+| 0.7                | +1         | +1,804    | 902 (0)              | 0.4 ms            | 31.7 KB            | 12,167 / 12,708    |
+| 1.8                | +1         | +812      | 406 (496)            | 0.2 ms            | 14.3 KB            | 6,717 / 6,833      |
+| 5                  | +1         | +208      | 104 (798)            | 0.1 ms            | 3.7 KB             | 4,263 / 4,257      |
+| 11                 | +1         | +130      | 65 (837)             | 0.2 ms            | 2.3 KB             | 3,955 / 3,978      |
+
++1 program, no texture, a 36 KB instance buffer. Per wake fragment: 1
+fetch, 1-2 value noises (see "Ship wakes").
+
+**Living front** (`three_front=1`). On the frozen late state nothing
+changes hands, so it shows the fixed cost: no draw call or triangle, the
+terrain program's FRONT_WAVE variant (same program count), +1 texture
+(the R16UI stamps, 3.81 MB; 7.63 MB of CPU memory for stamps and shadow),
+render 12,167 / 13,372, 6,717 / 7,391, 4,263 / 4,483 and 3,955 / 4,196 ms
+(+1 R16UI fetch on owned land). The moving parts, on the recorded war
+(tick 2,621, 51 players, 17 attacks; 30 recorded ticks replayed per view,
+6 update-only frames per tick, the busiest front in view):
+
+| View (px per tile) | Draw calls off → on | Front triangles | Arrows | Smoke + sparks | fillScreens | JS per frame (terrain + overlay + FX) | JS per tick (facade push) | Stamp uploads per frame |
+| ------------------ | ------------------- | --------------- | ------ | -------------- | ----------- | ------------------------------------- | ------------------------- | ----------------------- |
+| 0.7                | 21 → 22             | 32              | 16     | 0              | 0           | 0.09 → 0.30 ms                        | 0.12 → 0.53 ms            | 3.8 calls, 22.5k texels |
+| 1.8                | 22 → 24             | 346             | 16     | 157 + 0        | 0.03        | 0.08 → 0.23 ms                        | 0.04 → 0.26 ms            | 3.5 calls, 9.9k texels  |
+| 5                  | 23 → 26             | 698             | 10     | 160 + 240      | 0.04        | 0.08 → 0.22 ms                        | 0.09 → 0.20 ms            | 3.5 calls, 9.9k texels  |
+| 11                 | 23 → 26             | 708             | 4      | 160 + 240      | 0.20        | 0.06 → 0.13 ms                        | 0.06 → 0.20 ms            | 3.5 calls, 9.9k texels  |
+
+The stamp uploads ride on the tile state's own rectangles, within its
+budget (≤ 8 calls, ≤ 256k texels per frame), and only where a stamp
+changed.
+
+**Night** (`three_night=1`): no draw call, triangle or instance; the same
+program count (the terrain, water, part and smoke programs are their
+NIGHT variants); +1 texture (the lightmap, 0.48 MB); 0 texels uploaded per
+frame at rest (≤ 8,192 in ≤ 4 rectangles while rebuilding; the first
+build of the 394 lights, 18 rectangles over 13 frames, one cold 7.4 ms
+frame); render 12,167 / 14,280, 6,717 / 7,343, 4,263 / 4,869 and 3,955 /
+4,467 ms (+9-17%: the terrain program's lightmap fetch, lamp, grain and
+flash loop, the windows in the structure program).
+
+**All three on**:
+
+| View (px per tile) | Draw calls | Triangles | Programs | Textures      | Render ms off / on |
+| ------------------ | ---------- | --------- | -------- | ------------- | ------------------ |
+| 0.7                | 23 → 24    | +1,804    | +1       | +2 (+4.29 MB) | 12,167 / 14,756    |
+| 1.8                | 25 → 26    | +812      | +1       | +2            | 6,717 / 7,946      |
+| 5                  | 35 → 36    | +208      | +1       | +2            | 4,263 / 4,479      |
+| 11                 | 34 → 35    | +130      | +1       | +2            | 3,955 / 4,232      |
+
+On the replayed war with all three on: 23 / 25 / 27 / 27 draw calls
+(off: 21 / 22 / 23 / 23), the same front counters as above. JS per frame:
+the wakes 0.1-0.4 ms, the front 0.1-0.2 ms (+0.1-0.4 ms per tick), the
+night ~0 at rest (≤ 1 ms on lightmap-rebuild frames). The whole layers'
+update on the frozen state varies by ±1 ms between sessions, more than
+these.
+
+### To check on a real GPU
+
+SwiftShader gives no frame rate; these need a real machine (and the iGPU
+most of all). Open a solo World game with 50 bots, read
+`__threePerf().gpuMs.avg` (wait a few seconds after each camera move) and
+the counters below, once with the flags and once without, then once more
+with `three_quality=low`:
+
+1. **Wakes**: `?renderer=three&three_perf=1&three_wakes=1`, late game
+   (~12 min, hundreds of trade ships), over a busy shipping lane at 0.7,
+   1.8, 4 and 8 px per tile. Counters: `layers.units.stats.wake*`
+   (`wakeInstances`, `wakeCapped` should stay 0, `wakeJsMs`). In motion: the
+   wakes trail the ships smoothly at 60 FPS (no stutter or pop when a ship
+   turns, starts or docks), trade lanes stay calm at 1.8, transports and
+   warships stand out, the foam does not shimmer when panning.
+2. **Living front**: `?renderer=three&three_perf=1&three_front=1`, mid
+   game with wars (~4 min), the camera on an active front at 0.7, 1.8, 4, 8
+   and 14 px per tile. Counters: `layers.terrain.stats.front*`
+   (`frontUploadCalls`, `frontTexelsLastFrame`, `frontJsMs`),
+   `layers.fx.stats.front*` and `fillScreens`, `layers.overlay.stats.front*`.
+   In motion: the glow runs along the front as it advances (a line, not a
+   band; no flicker), smoke rises and dissolves at the front only, sparks
+   pop, arrows march into the defender and fade where a front stops (no
+   ghost behind it), nothing over the name labels. Also nuke a front with a
+   hydrogen bomb: `frontTexelsLastFrame` must stay 0 for the tiles lost.
+3. **Night**: `?renderer=three&three_perf=1&three_night=1`, late game,
+   a dense city area at 0.7, 1.8, 5 and 11 px per tile, and an atom bomb at
+   5 px per tile at night (`gpuMs` during its 0-1.5 s flash). Counters:
+   `layers.terrain.stats.night*` (`nightLightmapMs`, `nightLightmapMsMax`
+   after a burst of construction, `nightFlashLights`). Look at: city lights
+   growing with level, lit windows close up without sparkle while panning,
+   the flash lighting land and sea white then orange, rails, names and
+   ships readable, fallout keeping its relief. With the graphics "Night"
+   preset and no URL flag the 3D renderer must stay in day mode.
+4. **All three**: `?renderer=three&three_perf=1&three_wakes=1&three_front=1&three_night=1`
+   at the same views; compare `gpuMs` and `jsMs` with the flags off.
+
 ## Not drawn yet
 
 These facade methods are documented no-ops: railway construction dust and
@@ -1300,11 +1687,15 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
     counters (see "Cosmetic effects"); lot 3: `falloutTiles`,
     `falloutDenseCells` (smoke emitters), `falloutRebuilding` (0 / 1: a
     full re-read in progress), `falloutMsMax` (JS ms of the fallout field
-    per frame, max over 120 frames) and `reliefTextureMB`.
+    per frame, max over 120 frames) and `reliefTextureMB`; lot 4, with
+    `three_front=1` only: the `front*` counters of "Living front"; with
+    `three_night=1` only: the `night*` counters of "Night and lights".
   - `overlay`: `spawnHalos`, `spawnVertices`, `spawnTriangles`,
     `spawnRebuilds`; `samVisible`, `samCircles`, `samArcs`,
     `samRingSegments` (8 triangles each), `samPendingCircles` (heights
-    still being sampled), `samRebuilds`, `samBuildMs` / `samBuildMsMax`.
+    still being sampled), `samRebuilds`, `samBuildMs` / `samBuildMsMax`;
+    with `three_front=1`, `frontArrows`, `frontArrowCandidates`,
+    `frontJsMs`.
   - `structures`: `structureInstances` (= `modelInstancesDrawn`, 3D
     model instances drawn), `structureTriangles`, `modelDrawCalls`,
     `structureLod` (1 = low-poly models), `structureCulled` (outside the
@@ -1321,14 +1712,17 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
     `unitCulled`, `unitTriangles`, `unitJsMs`, `nukeEffectRibbons`
     (nuke ribbons drawn in their owner's effect colours), `nukesInFlight`,
     `nukesScreenCapped`, `trailRibbons`, `trailSamples` and
-    `warheadTrails`.
+    `warheadTrails`; lot 4, with `three_wakes=1` only: `wakeInstances`,
+    `wakeCulled`, `wakeCapped`, `wakeJsMs` / `wakeJsMsMax` (measured with
+    `three_perf=1` only) and `wakeUploadKB` (see "Ship wakes").
   - `fx`: `glowParticles`, `smokeParticles`, `fireballs`, `decals`,
     `pendingEffects`, `liveEffects`, and `fillScreens` /
     `fillScreensMax` (last frame / max over 120 frames): the screen area
     of the glow and smoke quads (fallout puffs included) and fireballs
     over the viewport area, an estimate of how many times each pixel is
     blended (decals left out); `falloutPuffs` (fallout smoke puffs drawn)
-    and `falloutSmokeMs` (their JS time, last frame).
+    and `falloutSmokeMs` (their JS time, last frame); with
+    `three_front=1`, the living front's particle counters.
 
 ## Performance notes
 
@@ -1719,6 +2113,10 @@ scene walks, no DOM, and the frame loop only adds a few null checks.
   whose weight is 0 behind branches, relief fetches at level 0, no local
   array in the tile B-spline, the water's glint share and sun disc only
   when used) and the skirt-free geometry in `TerrainLayers.test.ts`.
+  Lot 4: `ShipWakes.test.ts`, `LivingFront.test.ts` and
+  `NightLights.test.ts` (see "Lot 4 prototypes"); `shaderDefines.ts`
+  (a helper, not a test) resolves a shader's `#ifdef` blocks for the
+  "compiled out without the define" tests.
 - Headless checks in `.claude/skills/run-openfront/`:
   - `three-shots.mjs`: screenshots at four zoom levels plus a click test
     while tilted.

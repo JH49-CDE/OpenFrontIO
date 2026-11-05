@@ -106,6 +106,12 @@ float conformScaleY() {
  * ground at its anchor's (u, v), so buildings stay upright, each standing
  * where it is. Geometry from `createStructureGeometry` /
  * `createStructureLodGeometry` carries `aFooting`.
+ *
+ * `night` (lot 4, night): the `NIGHT_WINDOWS` define and the window GLSL:
+ * lit windows on the walls `addWindowMask` marked (structures), and every
+ * part faintly self-lit (its albedo × 0.08 × the uniform's value: the
+ * buildings in their city's light, the ships' deck lights), so models read
+ * on the moonlit map. Without it nothing of it is in the program.
  */
 export function createPartMaterial(opts: {
   roughness?: number;
@@ -114,22 +120,32 @@ export function createPartMaterial(opts: {
   glow: { value: number };
   /** Follow each instance's ground plane (structures). */
   conform?: boolean;
+  /** Lot 4 (night): night emission (lit windows of `addWindowMask`, self-light). */
+  night?: { value: number };
 }): THREE.MeshStandardMaterial {
   const conform = opts.conform === true;
+  const windows = opts.night;
   const mat = new THREE.MeshStandardMaterial({
     vertexColors: true,
     roughness: opts.roughness ?? 0.65,
     metalness: opts.metalness ?? 0.08,
   });
+  if (windows !== undefined) {
+    mat.defines = { ...mat.defines, NIGHT_WINDOWS: "" };
+  }
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uGlowStrength = opts.glow;
+    if (windows !== undefined) shader.uniforms.uNightWindows = windows;
     let vs = shader.vertexShader.replace(
       "#include <common>",
       `#include <common>
 attribute float aTint;
 attribute float aGlow;
 attribute float iShade;
-varying float vGlow;${
+varying float vGlow;
+#ifdef NIGHT_WINDOWS
+${WINDOWS_VERT_GLSL}
+#endif${
         conform
           ? `
 attribute vec3 iGround0;
@@ -177,26 +193,151 @@ transformed.y += conformGround(aFooting.xy) / conformScaleY();
   vColor.rgb *= mix(vec3(1.0), instanceColor.rgb, aTint);
 #endif
 vColor.rgb *= iShade;
-vGlow = aGlow;`,
+vGlow = aGlow;
+#ifdef NIGHT_WINDOWS
+// The window share rides on aGlow as a negative value (addWindowMask): an
+// instanced structure already uses all 16 vertex attributes.
+vWin = max(-aGlow, 0.0);
+vGlow = max(aGlow, 0.0);
+vWinP = position;
+vWinN = normal;
+#ifdef USE_INSTANCING
+vWinSeed = floor(instanceMatrix[3].xz);
+#else
+vWinSeed = vec2(0.0);
+#endif
+#endif`,
     );
     shader.fragmentShader = shader.fragmentShader
       .replace(
         "#include <common>",
         `#include <common>
 varying float vGlow;
-uniform float uGlowStrength;`,
+uniform float uGlowStrength;
+#ifdef NIGHT_WINDOWS
+${WINDOWS_FRAG_GLSL}
+#endif`,
       )
       .replace(
         "#include <emissivemap_fragment>",
         `#include <emissivemap_fragment>
 #ifdef USE_COLOR
   totalEmissiveRadiance += vColor.rgb * vGlow * uGlowStrength;
+#endif
+#ifdef NIGHT_WINDOWS
+  // Lit windows, and the buildings faintly lit by their own city's light.
+  totalEmissiveRadiance += nightWindows() + diffuseColor.rgb * (0.08 * uNightWindows);
 #endif`,
       );
   };
+  const key = conform
+    ? "openfront-three-parts-v1-conform"
+    : "openfront-three-parts-v1";
   mat.customProgramCacheKey = () =>
-    conform ? "openfront-three-parts-v1-conform" : "openfront-three-parts-v1";
+    windows !== undefined ? `${key}-night` : key;
   return mat;
+}
+
+// ---------------------------------------------------------------------------
+// Lot 4 (night): lit windows
+// ---------------------------------------------------------------------------
+
+/** Window grid on the walls: columns and floors per tile (model space). */
+export const WINDOW_COLUMNS_PER_TILE = 3;
+export const WINDOW_FLOORS_PER_TILE = 2.6;
+/** Lowest window sill above the model origin, tiles (over the pad top). */
+export const WINDOW_SILL = 0.55;
+
+const WINDOWS_VERT_GLSL = /* glsl */ `
+varying float vWin;
+varying vec3 vWinP;
+varying vec3 vWinN;
+varying vec2 vWinSeed;`;
+
+/**
+ * Lit windows (lot 4, night): a grid of panes on the walls `addWindowMask`
+ * marked (vWin = the share of lit windows), each lit or not by a hash of
+ * its cell, its wall and the instance's position (no two buildings alike),
+ * warm, a few cool; from ~4.5 to ~2.5 px per window cell the panes fade
+ * to their average so they never shimmer.
+ */
+export const WINDOWS_FRAG_GLSL = /* glsl */ `
+uniform float uNightWindows;
+varying float vWin;
+varying vec3 vWinP;
+varying vec3 vWinN;
+varying vec2 vWinSeed;
+float winHash(ivec2 p) {
+  uvec2 q = uvec2(p + 1048576);
+  uint h = q.x * 0x8da6b343u ^ q.y * 0xd8163841u;
+  h ^= h >> 13u;
+  h *= 0x5bd1e995u;
+  h ^= h >> 15u;
+  return float(h & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+vec3 nightWindows() {
+  vec3 an = abs(vWinN);
+  bool alongZ = an.x > an.z;
+  // Across the wall and up, in window cells (derivatives taken here, in
+  // uniform control flow).
+  vec2 g = vec2((alongZ ? vWinP.z : vWinP.x) * ${WINDOW_COLUMNS_PER_TILE.toFixed(1)},
+    (vWinP.y - ${WINDOW_SILL.toFixed(2)}) * ${WINDOW_FLOORS_PER_TILE.toFixed(1)});
+  vec2 fw = fwidth(g);
+  if (vWin <= 0.0 || g.y < 0.0 || an.y > 0.5) return vec3(0.0);
+  vec2 gi = floor(g);
+  vec2 gf = g - gi;
+  int face = alongZ ? (vWinN.x > 0.0 ? 1 : 2) : (vWinN.z > 0.0 ? 3 : 4);
+  float h = winHash(ivec2(gi) + ivec2(vWinSeed) * ivec2(7, 13) + ivec2(face * 101, face * 37));
+  float lit = step(h, vWin);
+  vec2 lo = smoothstep(vec2(0.22) - fw, vec2(0.22) + fw, gf);
+  vec2 hi = 1.0 - smoothstep(vec2(0.78, 0.72) - fw, vec2(0.78, 0.72) + fw, gf);
+  float pane = lo.x * lo.y * hi.x * hi.y;
+  // From ~4.5 px per window cell down to ~2.5 px (tall towers do not
+  // sparkle; the panes still show at 11 px per tile).
+  float far = smoothstep(0.22, 0.4, max(fw.x, fw.y));
+  // Far: the panes' mean (0.56 x 0.56 of a cell), a little brighter so the
+  // lit buildings still read once their windows merge.
+  float glow = mix(pane * lit, 0.45 * vWin, far);
+  vec3 c = fract(h * 13.7) > 0.85 ? vec3(0.75, 0.85, 1.0) : vec3(1.0, 0.7, 0.38);
+  return c * (glow * uNightWindows * (0.75 + 0.5 * fract(h * 31.1)));
+}`;
+
+/**
+ * Lot 4 (night): marks the walls of a structure model that get lit windows:
+ * vertical faces of the plastered walls (`C.wall`: city towers, warehouses,
+ * halls, bunkers) and the city towers' glass bands, with `aGlow` = −`share`
+ * (the share of lit windows; no structure part glows, and an instanced
+ * structure already uses all 16 vertex attributes, so no new one). Only
+ * called with the night on; the night part material reads it back
+ * (`NIGHT_WINDOWS`), the plain one never sees a negative glow.
+ */
+export function addWindowMask(
+  geo: THREE.BufferGeometry,
+  share: number,
+): THREE.BufferGeometry {
+  const pos = geo.getAttribute("position");
+  const nor = geo.getAttribute("normal");
+  const col = geo.getAttribute("color");
+  const glow = geo.getAttribute("aGlow") as THREE.BufferAttribute | undefined;
+  if (glow === undefined) return geo;
+  const n = pos.count;
+  const wall = new THREE.Color(C.wall);
+  const glass = new THREE.Color(C.glass);
+  const near = (r: number, g: number, b: number, c: THREE.Color) =>
+    Math.abs(r - c.r) + Math.abs(g - c.g) + Math.abs(b - c.b) < 1e-3;
+  for (let i = 0; i < n; i++) {
+    // Whole faces only (vWin must not vary across a face): the shader
+    // starts the windows at WINDOW_SILL.
+    if (nor !== undefined && Math.abs(nor.getY(i)) > 0.3) continue;
+    const r = col.getX(i);
+    const g = col.getY(i);
+    const b = col.getZ(i);
+    if (glow.getX(i) <= 0 && (near(r, g, b, wall) || near(r, g, b, glass))) {
+      glow.setX(i, -share);
+    }
+  }
+  glow.needsUpdate = true;
+  return geo;
 }
 
 // ---------------------------------------------------------------------------

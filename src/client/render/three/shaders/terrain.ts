@@ -26,11 +26,33 @@
  * flat apron TerrainLayer lays around the map, the land continues past the
  * border as its mirror image and breaks up into the sea along a noisy
  * virtual coast (no straight cut at the map edge).
+ *
+ * Lot 4 prototypes are compiled in only when their define is set on the
+ * material (`defines`, chosen once at creation from the URL flags), so a
+ * flag that is off costs nothing, not even program size:
+ * - `FRONT_WAVE` (`?three_front=1`, TerrainLayer / FrontField.ts): the
+ *   capture wave, a short pulse of the new owner's colour over freshly
+ *   captured tiles.
+ * - `NIGHT` (`?three_night=1`, NightLights.ts):
+ *   moonlit ground desaturated towards blue-grey, the territory fill and
+ *   borders keeping part of their day brightness, the city lightmap and
+ *   the impact flashes lighting the ground and the water, fallout glowing
+ *   brighter.
  */
 
 import { EFFECT_TRAILS_GLSL } from "../EffectTrails";
+import {
+  FRONT_DECAY_S,
+  FRONT_HOT_RGB,
+  FRONT_HOT_S,
+  FRONT_PULSE_MS,
+  FRONT_PVP_BIT,
+  FRONT_TIME_MOD,
+  FRONT_TIME_UNIT_MS,
+} from "../FrontField";
 import { SURFACE_OVERLAY_GLSL } from "../SurfaceOverlay";
 import { TERRITORY_COSMETICS_GLSL } from "../TerritoryCosmetics";
+import { NIGHT_GLSL } from "./night";
 import { ENV_COMMON, FRAG_OUTPUT, NOISE_COMMON, WATER_COMMON } from "./water";
 
 export const TERRAIN_VERT = /* glsl */ `
@@ -125,6 +147,13 @@ ${TERRITORY_COSMETICS_GLSL}
 // and nuke trails, effect palette). Keep this block self-contained.
 ${EFFECT_TRAILS_GLSL}
 // ---- END effect trails uniforms
+
+// ---- BEGIN lot 4: night and lights uniforms + helpers (NIGHT; NightLights.ts).
+// Compiled in only with the define (?three_night=1).
+#ifdef NIGHT
+${NIGHT_GLSL}
+#endif
+// ---- END lot 4: night uniforms
 
 varying vec3 vWorld;
 varying vec3 vNormal;
@@ -301,6 +330,75 @@ vec4 tileBspline(ivec2 b, vec2 w) {
   return r;
 }
 // ---- END lot 3: smooth relief functions
+
+// ---- BEGIN lot 4: living front, capture wave (FRONT_WAVE; FrontField.ts
+// holds the stamps and the TypeScript twins frontAgeMs / frontPulse /
+// frontHeat). Compiled in only with the define (?three_front=1).
+#ifdef FRONT_WAVE
+uniform highp usampler2D uFront; // R16UI W x H capture stamps (0 = never)
+uniform float uFrontNow;         // now, in stamp units (fractional)
+uniform vec4 uFrontLook;         // gain, heat, neutral-capture share, interior share (FrontField.frontWaveLook)
+const float FRONT_PULSE_S = ${(FRONT_PULSE_MS / 1000).toFixed(3)};
+const float FRONT_UNIT_S = ${(FRONT_TIME_UNIT_MS / 1000).toFixed(3)};
+const float FRONT_MOD = ${FRONT_TIME_MOD.toFixed(1)};
+const uint FRONT_TIME_MASK = ${FRONT_TIME_MOD}u;
+const uint FRONT_PVP = ${FRONT_PVP_BIT}u;
+const float FRONT_DECAY_S = ${FRONT_DECAY_S.toFixed(3)};
+const float FRONT_HOT_S = ${FRONT_HOT_S.toFixed(3)};
+// White-hot colour of the freshest captures (linear).
+const vec3 FRONT_HOT = vec3(${FRONT_HOT_RGB.map((v) => v.toFixed(2)).join(", ")});
+
+// Age (s) of a capture stamp, capped at the pulse length (also for a tile
+// never captured, or captured long ago: the stamps wrap, FrontField sweeps).
+float frontAgeS(uint s) {
+  uint t = s & FRONT_TIME_MASK;
+  if (t == 0u) return FRONT_PULSE_S;
+  return min(mod(uFrontNow - float(t), FRONT_MOD) * FRONT_UNIT_S, FRONT_PULSE_S);
+}
+
+// The wave at life fraction u: a fast rise, a sharp decay (bright on the
+// last ~3 ticks' captures: the leading edge) and a faint tail; no ripple.
+float frontPulse(float u) {
+  if (u < 0.0 || u >= 1.0) return 0.0;
+  float a = min(1.0, u / 0.06);
+  float age = u * FRONT_PULSE_S;
+  return a * a * (3.0 - 2.0 * a) * (0.75 * exp(-age / FRONT_DECAY_S) + 0.25 * (1.0 - u) * (1.0 - u));
+}
+
+// The capture wave over this tile while its capture is younger than the
+// pulse: light ADDED to the lit, relief-shaded ground (an emission, so the
+// relief and the fill still read through it), white-hot for the freshest
+// captures, then the new owner's colour with its chroma boosted (a grey or
+// blue owner stays tinted, never washes out to white). Strongest on the
+// tiles still on a border (edge = 1: the moving front line), weaker inside
+// (uFrontLook.w). The age is blended over the 4 tile centres around the
+// sample point, so successive ticks' bands blend smoothly; the pulse never
+// leaves the captured tile.
+vec3 frontWave(vec3 lit, int owner, ivec2 tile, ivec2 b, vec2 w, bool alt, float edge) {
+  uint s = texelFetch(uFront, tile, 0).r;
+  if (frontAgeS(s) >= FRONT_PULSE_S) return lit;
+  ivec2 hiT = uMapSize - 1;
+  vec4 a4 = vec4(
+    frontAgeS(texelFetch(uFront, clamp(b, ivec2(0), hiT), 0).r),
+    frontAgeS(texelFetch(uFront, clamp(b + ivec2(1, 0), ivec2(0), hiT), 0).r),
+    frontAgeS(texelFetch(uFront, clamp(b + ivec2(0, 1), ivec2(0), hiT), 0).r),
+    frontAgeS(texelFetch(uFront, clamp(b + ivec2(1, 1), ivec2(0), hiT), 0).r));
+  float age = mix(mix(a4.x, a4.y, w.x), mix(a4.z, a4.w, w.x), w.y);
+  float k = frontPulse(age / FRONT_PULSE_S) * ((s & FRONT_PVP) != 0u ? 1.0 : uFrontLook.z)
+    * mix(uFrontLook.w, 1.0, edge);
+  if (k <= 0.0) return lit;
+  vec3 fill = alt ? affiliation(owner) : texelFetch(uPalette, ivec2(owner, 0), 0).rgb;
+  vec3 c = fill / max(max(fill.r, fill.g), max(fill.b, 0.05));
+  c = clamp(mix(vec3(dot(c, vec3(0.2126, 0.7152, 0.0722))), c, 1.6), 0.0, 1.0);
+  vec3 col = mix(srgbToLinear(c), FRONT_HOT, exp(-age / FRONT_HOT_S) * uFrontLook.y);
+#ifdef NIGHT
+  // On the moonlit map an emission stands out more: dimmer.
+  k *= 0.6;
+#endif
+  return lit + col * (k * uFrontLook.x);
+}
+#endif
+// ---- END lot 4: living front functions
 
 // p: world xz; tile / f: the tile under p and the position in it; t4 / b /
 // w: the 4 tile centres around the (close up: domain-warped) sample point,
@@ -494,6 +592,12 @@ vec3 shadeLandTile(
       * (owner != 0 ? uAltGroundOwned : uAltGroundFree);
     // ---- END lot 3: alt-view ground
   }
+#ifdef NIGHT
+  // Lot 4, night: moonlight washes the ground's colours out (blue-grey).
+  albedo = mix(albedo, vec3(luma(albedo)), uNightLook.z);
+  // The territory fill's share kept at day brightness (set below).
+  vec3 nightFill = vec3(0.0);
+#endif
   vec3 ground = albedo;
   // Not where it would be thrown away: the fallout below replaces the
   // colour, and past the apron's fade its weight is 0 (perf triage).
@@ -519,6 +623,11 @@ vec3 shadeLandTile(
     }
     // Lot 3: the fill fades out across the map-edge apron's virtual land.
     albedo = mix(albedo, fill, a * (1.0 - apron));
+#ifdef NIGHT
+    // A little desaturated: the night is the lamps' colour, not the fill's.
+    nightFill = srgbToLinear(mix(vec3(luma(fill)), fill, 0.75))
+      * (a * (1.0 - apron) * uNightLook.x) * NIGHT_DAY_FLAT;
+#endif
   }
 
   // ---- BEGIN lot 3: fallout (item 5; TerrainShading.falloutLook /
@@ -637,6 +746,13 @@ vec3 shadeLandTile(
     }
   }
   // ---- END lot 3: fallout
+#ifdef NIGHT
+  // Lot 4, night: the zone keeps a faint glow of its own colour (the
+  // default renderer's fallout light, much dimmer), so it reads at night.
+  if (fallout) {
+    emissive += srgbToLinear(uFalloutColor) * (0.005 * uNightLook2.z);
+  }
+#endif
 
   vec3 dl = diffuseLight(n);
   vec3 shading = dl * ao;
@@ -647,6 +763,33 @@ vec3 shadeLandTile(
   }
   // ---- END lot 3: far flatten
   vec3 lit = srgbToLinear(albedo) * shading + emissive;
+#ifdef NIGHT
+  // Lot 4, night: the city lights and the impact flashes on the ground (at
+  // the real world point: on the apron p is mirrored), the kept share of
+  // the fill, the fallout glowing a little brighter and keeping its relief.
+  vec3 albedoLin = srgbToLinear(albedo);
+  vec3 nightL = nightCityLight(vWorld.xz);
+  // Street-light grain in the bright cores (one value noise, 3 cells per
+  // tile), from ~2.5 to ~5 px per tile (finer it would shimmer, closer it
+  // would read as blotches).
+  float grain = smoothstep(0.2, 0.8, luma(nightL)) * (1.0 - smoothstep(0.3, 0.45, tpp))
+    * smoothstep(0.15, 0.2, tpp);
+  if (grain > 0.0) {
+    nightL *= 1.0 + grain * (valueNoise(vWorld.xz * 3.3 + vec2(41.0, 7.0)) - 0.5) * 1.1;
+  }
+  // Lamp light keeps its own warm colour (sodium), modulated by how light
+  // the ground is, not tinted by the territory.
+  // A soft knee keeps the biggest cities' cores from clipping to white.
+  vec3 lamp = nightL * (0.24 + 0.56 * luma(albedoLin));
+  lamp /= 1.0 + 0.6 * luma(lamp);
+  lit += lamp + nightFill + emissive * (uNightLook2.x - 1.0);
+  // Flashes: white-hot / orange light, the ground's colour mostly whitened
+  // under it (a nuke lights the land white, not in the owner's colour).
+  lit += nightFlashLight(vWorld, n) * mix(albedoLin, vec3(0.45), 0.6);
+  // Fallout: the burnt ash keeps its relief under the moon (the moonlit
+  // shading lifted, so its hillshade still reads), not a flat black zone.
+  if (fallout) lit += albedoLin * shading * (2.4 * uNightLook2.z);
+#endif
 
   // --- Borders: a band along every edge whose 4-neighbour has another
   // owner (plus concave corners), width = uBorderPx pixels clamped to
@@ -654,6 +797,10 @@ vec3 shadeLandTile(
   // little contrast with the ground on either side (e.g. a light grey band
   // on snow), it gets thin dark edge lines close up (its outermost pixel
   // and one pixel inside the territory) and, zoomed out, a darker shade.
+#ifdef FRONT_WAVE
+  // Lot 4: whether this tile is on a border (the capture wave's front line).
+  float frontEdge = 0.0;
+#endif
   if (owner != 0 && apron <= 0.0) {
     vec2 wb = clamp(uBorderPx * fw, vec2(uMinBorder), vec2(1.0));
     if (hl) wb = min(vec2(1.0), wb * 1.7);
@@ -664,6 +811,9 @@ vec3 shadeLandTile(
     int oN = ownerAt(tile + ivec2(0, -1));
     int oS = ownerAt(tile + ivec2(0, 1));
     bvec4 edges = bvec4(oW != owner, oE != owner, oN != owner, oS != owner);
+#ifdef FRONT_WAVE
+    frontEdge = any(edges) ? 1.0 : 0.0;
+#endif
     // Concave corners: both edge neighbours match, the diagonal does not.
     bool nearW = f.x < wl.x + fw.x;
     bool nearE = 1.0 - f.x < wl.x + fw.x;
@@ -712,6 +862,11 @@ vec3 shadeLandTile(
       // shaded slopes; a little emission feeds the bloom glow.
       vec3 light = 0.5 * dl + 0.5 * diffuseLight(UP);
       vec3 borderLit = bl * light + bl * (hl ? 3.0 * uBorderGlow : uBorderGlow);
+#ifdef NIGHT
+      // Lot 4, night: borders keep their share of the day brightness, lit
+      // by the city lights and flashes too.
+      borderLit += bl * (uNightLook.y * NIGHT_DAY_FLAT) + nightL * (0.3 + 0.7 * luma(bl));
+#endif
       // Contrast need (0..1) against the territory inside and the ground
       // (or the neighbour's band) outside, in perceptual brightness.
       float lb = sqrt(luma(borderLit));
@@ -727,6 +882,13 @@ vec3 shadeLandTile(
       lit = mix(lit, borderLit * (1.0 - covOut * close * 0.7 * needOut), cov);
     }
   }
+  // ---- BEGIN lot 4: living front, capture wave (over fill and border).
+#ifdef FRONT_WAVE
+  if (owner != 0 && !fallout && apron <= 0.0) {
+    lit = frontWave(lit, owner, tile, b, w, alt, frontEdge);
+  }
+#endif
+  // ---- END lot 4: capture wave
   return lit;
 }
 
@@ -864,6 +1026,10 @@ void main() {
       vec4 wtr = shadeWater(p, mag, V, tpp, uTime);
       waterCol = mix(seabed, wtr.rgb, wtr.a);
     }
+#ifdef NIGHT
+    // Lot 4, night: city lights on the harbours, flashes on the sea.
+    waterCol = nightWater(waterCol, vWorld);
+#endif
     waterCol *= mix(1.0, 0.6, uAltView);
   }
   if (onApron) {

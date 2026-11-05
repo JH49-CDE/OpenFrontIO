@@ -56,6 +56,19 @@
  * `FalloutField`, set with `setFallout`), drawn with the smoke material in
  * one more draw call; nothing is drawn below ~1.2 px per tile or without
  * fallout in view.
+ *
+ * Lot 4 prototype, living front (`?three_front=1` only; nothing of it is
+ * created otherwise): smoke and sparks where territory changes hands
+ * (`FrontParticles`, LivingFront.ts), in two more capped pools of the same
+ * kind and materials (`FRONT_SMOKE_CAPACITY`, `FRONT_SPARK_CAPACITY`),
+ * fed by TerrainLayer's `FrontField` (`setFront`).
+ *
+ * Lot 4 prototype, night (`nightModeOf`: `?three_night=1`; nothing of it
+ * exists otherwise): every impact that
+ * flashes a point light also starts a flash of the scene's `NightLighting`
+ * (`nightFlashFor`), which lights the terrain and the water for ~1-2 s;
+ * the smoke material gets the NIGHT define, which dims its lit (below
+ * the bloom threshold) colours by the night depth while fire stays bright.
  */
 
 import * as THREE from "three";
@@ -86,6 +99,13 @@ import {
   falloutPuff,
   falloutSmokeZoomFade,
 } from "./FalloutField";
+import type { FrontField } from "./FrontField";
+import {
+  FRONT_SMOKE_CAPACITY,
+  FRONT_SPARK_CAPACITY,
+  FrontParticles,
+} from "./LivingFront";
+import { NightLighting, nightModeOf } from "./NightLights";
 import type { FrameInfo, ThreeLayerContext } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -146,6 +166,42 @@ const LITE_BACKLOG = 24;
 const MAX_LIVE_EFFECTS = 160;
 /** Queued effects that could not spawn within this long are dropped. */
 const MAX_QUEUE_WAIT_MS = 1000;
+
+/** Kinds of impact that flash the night's ground lights. */
+export type NightFlashKind = "nuke" | "intercept" | "explosion" | "sinking";
+
+/**
+ * Lot 4 (night): the ground flash of an impact, in NightLighting's terms
+ * (reach in tiles, peak irradiance right under it, life). A nuke lights ~2
+ * times its visual radius V for 1.5 s × √(V / 30) (an atom bomb: 60 tiles,
+ * 1.5 s; a hydrogen bomb: ~140 tiles, ~2.3 s) at up to 8 × `gain` (several
+ * nukes in one frame share it as their flashes do); an airborne intercept
+ * 40 tiles; a burning building ~6 × its fireball, a sinking warship 12.
+ */
+export function nightFlashFor(
+  kind: NightFlashKind,
+  size: number,
+  gain = 1,
+): { radius: number; height: number; peak: number; lifeMs: number } {
+  switch (kind) {
+    case "nuke": {
+      const V = Math.max(8, size);
+      const slow = clamp(Math.sqrt(V / 30), 0.75, 1.6);
+      return {
+        radius: 2 * V,
+        height: 0.2 * V,
+        peak: 8 * gain,
+        lifeMs: 1500 * slow,
+      };
+    }
+    case "intercept":
+      return { radius: 40, height: INTERCEPT_ALTITUDE, peak: 1.5, lifeMs: 700 };
+    case "explosion":
+      return { radius: 6 * size, height: size, peak: 1.2, lifeMs: 600 };
+    case "sinking":
+      return { radius: 12, height: 2, peak: 0.8, lifeMs: 500 };
+  }
+}
 
 const GLOW_CAPACITY = 2048;
 const SMOKE_CAPACITY = 2048;
@@ -529,11 +585,22 @@ const SMOKE_FRAG = /* glsl */ `
 uniform sampler2D uMap;
 varying vec2 vUv;
 varying vec4 vColor;
+#ifdef NIGHT
+// Lot 4, night: lit smoke (below the bloom threshold) dims by this; fire
+// and embers (luminance over ~1.6) keep their colour.
+uniform float uNightSmoke;
+#endif
 void main() {
   vec4 t = texture2D(uMap, vUv);
   float a = t.a * vColor.a;
   if (a < 0.003) discard;
+#ifdef NIGHT
+  vec3 c = vColor.rgb * t.r;
+  c *= mix(uNightSmoke, 1.0, smoothstep(0.9, 1.6, dot(c, vec3(0.2126, 0.7152, 0.0722))));
+  gl_FragColor = vec4(c, a);
+#else
   gl_FragColor = vec4(vColor.rgb * t.r, a);
+#endif
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -1619,6 +1686,13 @@ export class FxLayer {
     widthPx: number;
     heightPx: number;
   } | null;
+  // ---- Lot 4: living front (`?three_front=1`; null when off) ----
+  private readonly frontSmoke: ParticlePool | null = null;
+  private readonly frontSparks: ParticlePool | null = null;
+  private readonly frontFx: FrontParticles | null = null;
+  private frontField: FrontField | null = null;
+  // ---- Lot 4: night (null unless the night is on) ----
+  private readonly night: NightLighting | null;
 
   constructor(private readonly ctx: ThreeLayerContext) {
     const low = ctx.settings.quality === "low";
@@ -1628,6 +1702,10 @@ export class FxLayer {
     this.fillView = perf
       ? { view: new Float32Array(16), focalPx: 1, widthPx: 1, heightPx: 1 }
       : null;
+
+    const nightMode = nightModeOf(ctx.settings);
+    this.night =
+      nightMode !== null ? NightLighting.acquire(ctx, nightMode) : null;
 
     const glowTex = makeSpriteTexture(softCircleTexels(64), 64);
     const smokeTex = makeSpriteTexture(smokePuffTexels(64, 7), 64);
@@ -1646,7 +1724,14 @@ export class FxLayer {
       name: "fx-smoke",
       vertexShader: BILLBOARD_VERT,
       fragmentShader: SMOKE_FRAG,
-      uniforms: { uMap: { value: smokeTex } },
+      uniforms: {
+        uMap: { value: smokeTex },
+        // Lot 4: night (only when on).
+        ...(this.night !== null
+          ? { uNightSmoke: this.night.smokeUniform }
+          : {}),
+      },
+      ...(this.night !== null ? { defines: { NIGHT: "" } } : {}),
       transparent: true,
       depthWrite: false,
     });
@@ -1702,6 +1787,24 @@ export class FxLayer {
       this.fireballs.mesh,
       this.glow.mesh,
     );
+    // Lot 4: living front smoke and sparks (same materials: no new program).
+    if (ctx.settings.prototypes?.front === true) {
+      const div = low ? 2 : 1;
+      this.frontSmoke = new ParticlePool(
+        FRONT_SMOKE_CAPACITY / div,
+        smokeMat,
+        RENDER_ORDER_SMOKE,
+        "fx-front-smoke",
+      );
+      this.frontSparks = new ParticlePool(
+        FRONT_SPARK_CAPACITY / div,
+        glowMat,
+        RENDER_ORDER_GLOW,
+        "fx-front-sparks",
+      );
+      this.frontFx = new FrontParticles(this.frontSmoke, this.frontSparks);
+      this.root.add(this.frontSmoke.mesh, this.frontSparks.mesh);
+    }
     for (const s of this.lights.slots) this.root.add(s.light);
     ctx.scene.add(this.root);
   }
@@ -1744,6 +1847,11 @@ export class FxLayer {
     this.falloutField = field;
   }
 
+  /** Lot 4: the living front's border events (TerrainLayer's field). */
+  setFront(field: FrontField | null): void {
+    this.frontField = field;
+  }
+
   // ---- Per frame ----
 
   update(frame: FrameInfo): void {
@@ -1753,6 +1861,12 @@ export class FxLayer {
     this.glow.update(now);
     this.smoke.update(now);
     this.falloutSmoke.update(frame, this.falloutField, this.ctx.heightField);
+    // Lot 4: living front (only with ?three_front=1).
+    if (this.frontFx !== null) {
+      this.frontFx.update(frame, this.frontField, this.ctx.heightField);
+      this.frontSmoke?.update(now);
+      this.frontSparks?.update(now);
+    }
     this.fireballs.update(now);
     this.decals.update(now, this.ctx.heightField);
     this.lights.update(now);
@@ -1788,6 +1902,26 @@ export class FxLayer {
       fillScreensMax: Math.round(max * 100) / 100,
       falloutPuffs: this.falloutSmoke.visible,
       falloutSmokeMs: Math.round(this.falloutSmoke.lastMs * 1000) / 1000,
+      // Lot 4: living front (only with ?three_front=1).
+      ...this.frontPerfStats(),
+    };
+  }
+
+  /**
+   * Living-front counters (`?three_front=1` only, else none): live front
+   * particles (smoke + sparks), border events turned into particles last
+   * frame and in total, and the JS time of the spawning (last frame).
+   */
+  private frontPerfStats(): Record<string, number> {
+    const f = this.frontFx;
+    if (f === null) return {};
+    return {
+      frontParticles: f.size,
+      frontSmoke: this.frontSmoke?.size ?? 0,
+      frontSparks: this.frontSparks?.size ?? 0,
+      frontSpawnedLastFrame: f.spawnedLastFrame,
+      frontSpawnedTotal: f.spawnedTotal,
+      frontJsMs: Math.round(f.lastMs * 1000) / 1000,
     };
   }
 
@@ -1805,7 +1939,9 @@ export class FxLayer {
       this.glow.screenArea(v) +
       this.smoke.screenArea(v) +
       this.falloutSmoke.screenArea(v) +
-      this.fireballs.screenArea(v);
+      this.fireballs.screenArea(v) +
+      (this.frontSmoke?.screenArea(v) ?? 0) +
+      (this.frontSparks?.screenArea(v) ?? 0);
     return area / (v.widthPx * v.heightPx);
   }
 
@@ -1828,11 +1964,41 @@ export class FxLayer {
     };
   }
 
+  /** Lot 4 (night): the impact's ground flash, if the night is on. */
+  private nightFlash(
+    kind: NightFlashKind,
+    x: number,
+    ground: number,
+    z: number,
+    size: number,
+    startMs: number,
+    now: number,
+    gain = 1,
+  ): void {
+    if (this.night === null) return;
+    const f = nightFlashFor(kind, size, gain);
+    this.night.flash(
+      {
+        x,
+        y: ground + f.height,
+        z,
+        radius: f.radius,
+        peak: f.peak,
+        lifeMs: f.lifeMs,
+        startMs,
+      },
+      now,
+    );
+  }
+
   dispose(): void {
+    this.night?.release();
     this.ctx.scene.remove(this.root);
     this.glow.dispose();
     this.smoke.dispose();
     this.falloutSmoke.dispose();
+    this.frontSmoke?.dispose();
+    this.frontSparks?.dispose();
     this.fireballs.dispose();
     this.decals.dispose();
     this.lights.dispose();
@@ -2107,6 +2273,7 @@ export class FxLayer {
       },
       now,
     );
+    this.nightFlash("nuke", x, ground, z, V, t0, now, this.flashGain);
     // Band ~7 tiles wide (16% of an atom's ring), and dimmer on very
     // large rings (hydrogen: 150 tiles) so they do not wash out the view.
     this.decals.spawn({
@@ -2376,6 +2543,7 @@ export class FxLayer {
       { x, y, z, peak: 160, range: 36, lifeMs: 450, startMs: t0 },
       now,
     );
+    this.nightFlash("intercept", x, y - INTERCEPT_ALTITUDE, z, 0, t0, now);
     this.sparks({
       n: this.count(10),
       x,
@@ -2459,6 +2627,7 @@ export class FxLayer {
       },
       now,
     );
+    this.nightFlash("explosion", x, ground, z, radius, t0, now);
     this.sparks({
       n: this.count(Math.round(radius * 3)),
       x,
@@ -2539,6 +2708,7 @@ export class FxLayer {
       { x, y: ground + 2, z, peak: 40, range: 14, lifeMs: 350, startMs: t0 },
       now,
     );
+    this.nightFlash("sinking", x, ground, z, 0, t0, now);
     this.smokePuffs({
       n: this.count(6),
       x,
